@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relay-multiagent-cli"
+version = "1.1.0"
+description = "A terminal bridge that lets Claude Code and Codex CLI implement and review together."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "relay-multiagent-cli contributors" }]
+dependencies = []
+
+[project.scripts]
+multiagent = "multiagent_cli.cli:main"
+mutiagent = "multiagent_cli.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["multiagent_cli*"]

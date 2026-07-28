@@ -1,0 +1,6 @@
+#!/bin/sh
+
+PROJECT_DIR="/Users/baolu_ding/Desktop/multiagent1"
+
+export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python3 -m multiagent_cli "$@"

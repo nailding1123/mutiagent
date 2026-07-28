@@ -1,0 +1,68 @@
+# MutiAgent local configuration and state
+# These files may contain API keys, local executable paths, model names, or task data.
+/agents.json
+/bridge.json
+/.mutiagent.json
+/.mutiagent/
+/.agents/
+
+# Environment variables and private local overrides
+.env
+.env.*
+!.env.example
+*.local.json
+.claude/settings.local.json
+
+# Python bytecode and tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+.hypothesis/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test and coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+test-results/
+
+# Packaging and build output
+build/
+dist/
+*.egg-info/
+*.egg
+wheels/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*.swo
+*~
+
+# Editors
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Desktop.ini

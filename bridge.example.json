@@ -1,0 +1,29 @@
+{
+  "lead": "claude",
+  "requirement_review": true,
+  "consensus": false,
+  "max_consensus_rounds": 3,
+  "plan_approval": true,
+  "max_plan_revisions": 2,
+  "review_rounds": 1,
+  "final_review": true,
+  "worktree": false,
+  "identities": {
+    "lead": "你是本任务的主 Agent，负责理解需求、提出方案、实施并响应审查。",
+    "reviewer": "你是独立副 Agent，负责提出建议方案、检查风险并验收实现。"
+  },
+  "verification": {
+    "timeout": 300,
+    "commands": []
+  },
+  "claude": {
+    "model": null,
+    "timeout": 900,
+    "extra_args": []
+  },
+  "codex": {
+    "model": null,
+    "timeout": 900,
+    "extra_args": []
+  }
+}
