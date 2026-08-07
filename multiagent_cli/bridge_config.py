@@ -4,17 +4,30 @@ import json
 import os
 import shlex
 import shutil
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .bridge_models import (
-    DEFAULT_LEAD_IDENTITY,
-    DEFAULT_REVIEWER_IDENTITY,
+    DEFAULT_AGENT_A_IDENTITY,
+    DEFAULT_AGENT_B_IDENTITY,
+    DEFAULT_GROUP_CHAT_AGENT_A_IDENTITY,
+    DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY,
+    COLLABORATION_MODES,
     AgentCommandSettings,
     BridgeSettings,
     VerificationCommand,
 )
-from .config import ConfigError
+from .token_api import (
+    DEFAULT_TOKEN_API_BASE_URL,
+    TokenAPISettings,
+    known_incompatible_reason,
+)
+
+
+class ConfigError(ValueError):
+    """Invalid or incomplete bridge configuration."""
 
 
 def find_config_path(
@@ -25,14 +38,15 @@ def find_config_path(
 
     if explicit:
         return Path(explicit).expanduser().resolve()
-    from_env = os.getenv("MUTIAGENT_CONFIG")
+    from_env = os.getenv("MULTIAGENT_CONFIG") or os.getenv("MUTIAGENT_CONFIG")
     if from_env:
         return Path(from_env).expanduser().resolve()
 
     workspace_path = Path(workspace or ".").expanduser().resolve()
     candidates = (
+        workspace_path / ".multiagent.json",
         workspace_path / ".mutiagent.json",
-        Path.home() / ".config" / "mutiagent" / "config.json",
+        *_user_config_candidates(),
         Path(__file__).resolve().parent.parent / "bridge.json",
     )
     return next((path for path in candidates if path.is_file()), None)
@@ -58,17 +72,36 @@ def resolve_bridge_settings(
     *,
     workspace: str | Path,
     config_path: Path | None = None,
-    lead: str | None = None,
+    executor: str | None = None,
     review_rounds: int | None = None,
     consensus: bool | None = None,
+    collaboration_mode: str | None = None,
 ) -> BridgeSettings:
     workspace_path = Path(workspace).expanduser().resolve()
     if not workspace_path.is_dir():
         raise ConfigError(f"工作区不是有效目录：{workspace_path}")
 
-    resolved_lead = lead or data.get("lead", "claude")
-    if resolved_lead not in {"claude", "codex"}:
-        raise ConfigError("lead 必须是 claude 或 codex")
+    resolved_executor = executor or data.get("executor", "claude")
+    if resolved_executor not in {"claude", "codex"}:
+        raise ConfigError("executor 必须是 claude 或 codex")
+
+    raw_mode = collaboration_mode or data.get("collaboration_mode", "workflow")
+    resolved_mode = (
+        raw_mode.strip().lower().replace("-", "_")
+        if isinstance(raw_mode, str)
+        else ""
+    )
+    if resolved_mode not in COLLABORATION_MODES:
+        raise ConfigError("collaboration_mode 必须是 workflow 或 group_chat")
+
+    group_chat_default_agent = data.get("group_chat_default_agent", "both")
+    if group_chat_default_agent not in {"both", "claude", "codex"}:
+        raise ConfigError(
+            "group_chat_default_agent 必须是 both、claude 或 codex"
+        )
+    group_chat_execution = data.get("group_chat_execution", True)
+    if not isinstance(group_chat_execution, bool):
+        raise ConfigError("group_chat_execution 必须是布尔值")
 
     rounds = review_rounds if review_rounds is not None else data.get("review_rounds", 1)
     if isinstance(rounds, bool) or not isinstance(rounds, int) or rounds < 0:
@@ -78,15 +111,15 @@ def resolve_bridge_settings(
     if not isinstance(final_review, bool):
         raise ConfigError("final_review 必须是布尔值")
 
-    requirement_review = data.get("requirement_review", True)
-    if not isinstance(requirement_review, bool):
-        raise ConfigError("requirement_review 必须是布尔值")
+    planning_collaboration = data.get("planning_collaboration", True)
+    if not isinstance(planning_collaboration, bool):
+        raise ConfigError("planning_collaboration 必须是布尔值")
 
     resolved_consensus = data.get("consensus", False) if consensus is None else consensus
     if not isinstance(resolved_consensus, bool):
         raise ConfigError("consensus 必须是布尔值")
-    if resolved_consensus and not requirement_review:
-        raise ConfigError("consensus 需要启用 requirement_review")
+    if resolved_consensus and not planning_collaboration:
+        raise ConfigError("consensus 需要启用 planning_collaboration")
 
     max_consensus_rounds = data.get("max_consensus_rounds", 3)
     if (
@@ -109,18 +142,26 @@ def resolve_bridge_settings(
         raise ConfigError("max_plan_revisions 必须是大于或等于 0 的整数")
 
     verification_commands = _resolve_verification(data.get("verification", {}))
-    lead_identity, reviewer_identity = _resolve_identities(data.get("identities", {}))
-    worktree = data.get("worktree", False)
-    if not isinstance(worktree, bool):
-        raise ConfigError("worktree 必须是布尔值")
-
+    agent_a_identity, agent_b_identity = _resolve_identities(
+        data.get("identities", {}),
+        section="identities",
+        default_a=DEFAULT_AGENT_A_IDENTITY,
+        default_b=DEFAULT_AGENT_B_IDENTITY,
+    )
+    group_chat_agent_a_identity, group_chat_agent_b_identity = _resolve_identities(
+        data.get("group_chat_identities", {}),
+        section="group_chat_identities",
+        default_a=DEFAULT_GROUP_CHAT_AGENT_A_IDENTITY,
+        default_b=DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY,
+    )
     claude = _resolve_agent_settings("claude", data.get("claude", {}))
     codex = _resolve_agent_settings("codex", data.get("codex", {}))
+    token_api = _resolve_token_api_settings(data.get("token_api", {}))
     return BridgeSettings(
         workspace=workspace_path,
-        lead=resolved_lead,
+        executor=resolved_executor,
         review_rounds=rounds,
-        requirement_review=requirement_review,
+        planning_collaboration=planning_collaboration,
         consensus=resolved_consensus,
         max_consensus_rounds=max_consensus_rounds,
         plan_approval=plan_approval,
@@ -130,24 +171,35 @@ def resolve_bridge_settings(
         claude=claude,
         codex=codex,
         config_path=config_path,
-        lead_identity=lead_identity,
-        reviewer_identity=reviewer_identity,
-        worktree=worktree,
+        agent_a_identity=agent_a_identity,
+        agent_b_identity=agent_b_identity,
+        group_chat_agent_a_identity=group_chat_agent_a_identity,
+        group_chat_agent_b_identity=group_chat_agent_b_identity,
+        collaboration_mode=resolved_mode,
+        group_chat_default_agent=group_chat_default_agent,
+        group_chat_execution=group_chat_execution,
+        token_api=token_api,
     )
 
 
-def _resolve_identities(raw: Any) -> tuple[str, str]:
+def _resolve_identities(
+    raw: Any,
+    *,
+    section: str,
+    default_a: str,
+    default_b: str,
+) -> tuple[str, str]:
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
-        raise ConfigError("identities 必须是 JSON 对象")
-    lead = raw.get("lead", DEFAULT_LEAD_IDENTITY)
-    reviewer = raw.get("reviewer", DEFAULT_REVIEWER_IDENTITY)
-    if not isinstance(lead, str) or not lead.strip():
-        raise ConfigError("identities.lead 必须是非空字符串")
-    if not isinstance(reviewer, str) or not reviewer.strip():
-        raise ConfigError("identities.reviewer 必须是非空字符串")
-    return lead.strip(), reviewer.strip()
+        raise ConfigError(f"{section} 必须是 JSON 对象")
+    agent_a = raw.get("agent_a", default_a)
+    agent_b = raw.get("agent_b", default_b)
+    if not isinstance(agent_a, str) or not agent_a.strip():
+        raise ConfigError(f"{section}.agent_a 必须是非空字符串")
+    if not isinstance(agent_b, str) or not agent_b.strip():
+        raise ConfigError(f"{section}.agent_b 必须是非空字符串")
+    return agent_a.strip(), agent_b.strip()
 
 
 def _resolve_agent_settings(name: str, raw: Any) -> AgentCommandSettings:
@@ -161,6 +213,26 @@ def _resolve_agent_settings(name: str, raw: Any) -> AgentCommandSettings:
     model = raw.get("model")
     if model is not None and (not isinstance(model, str) or not model.strip()):
         raise ConfigError(f"{name}.model 必须是非空字符串或 null")
+
+    models_raw = raw.get("models")
+    if models_raw is None:
+        models = (model.strip(),) if isinstance(model, str) else ()
+    else:
+        if not isinstance(models_raw, list) or not all(
+            isinstance(value, str) and value.strip() for value in models_raw
+        ):
+            raise ConfigError(f"{name}.models 必须是非空字符串数组")
+        models = tuple(value.strip() for value in models_raw)
+        if len(set(models)) != len(models):
+            raise ConfigError(f"{name}.models 不能包含重复模型")
+    for candidate in models:
+        reason = known_incompatible_reason(name, candidate)
+        if reason:
+            raise ConfigError(f"{name}.models 中的 {candidate} 不兼容：{reason}")
+
+    fallback_on_timeout = raw.get("fallback_on_timeout", True)
+    if not isinstance(fallback_on_timeout, bool):
+        raise ConfigError(f"{name}.fallback_on_timeout 必须是布尔值")
 
     extra_args = raw.get("extra_args", [])
     if not isinstance(extra_args, list) or not all(
@@ -178,10 +250,37 @@ def _resolve_agent_settings(name: str, raw: Any) -> AgentCommandSettings:
 
     return AgentCommandSettings(
         command=command,
-        model=model.strip() if isinstance(model, str) else None,
+        model=models[0] if models else None,
+        models=models,
+        fallback_on_timeout=fallback_on_timeout,
         extra_args=tuple(extra_args),
         timeout=float(timeout),
     )
+
+
+def _resolve_token_api_settings(raw: Any) -> TokenAPISettings:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("token_api 必须是 JSON 对象")
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ConfigError("token_api.enabled 必须是布尔值")
+    base_url = raw.get("base_url", DEFAULT_TOKEN_API_BASE_URL)
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise ConfigError("token_api.base_url 必须是有效 URL")
+    normalized = base_url.strip().rstrip("/")
+    parsed = urlparse(normalized)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ConfigError("token_api.base_url 必须是无账号、查询参数和片段的 HTTP(S) URL")
+    return TokenAPISettings(enabled=enabled, base_url=normalized)
 
 
 def _resolve_verification(raw: Any) -> tuple[VerificationCommand, ...]:
@@ -234,12 +333,27 @@ def _parse_command(raw: Any) -> tuple[str, ...] | None:
     if raw is None:
         return None
     if isinstance(raw, str) and raw.strip():
-        values = tuple(shlex.split(raw))
+        values = _split_command_text(raw)
     elif isinstance(raw, list) and raw and all(isinstance(value, str) for value in raw):
         values = tuple(raw)
     else:
         raise ConfigError("command 必须是非空字符串或字符串数组")
     return values
+
+
+def _split_command_text(raw: str, *, os_name: str | None = None) -> tuple[str, ...]:
+    """Split a command without treating Windows path separators as escapes."""
+
+    if (os_name or os.name) != "nt":
+        return tuple(shlex.split(raw))
+    values = shlex.split(raw, posix=False)
+    return tuple(_strip_matching_quotes(value) for value in values)
+
+
+def _strip_matching_quotes(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
 
 
 def _discover_executable(name: str) -> str:
@@ -260,4 +374,33 @@ def _discover_executable(name: str) -> str:
             return str(candidate)
     raise ConfigError(
         f"找不到 {name} CLI；请先安装，或在桥接配置的 {name}.command 中填写路径"
+    )
+
+
+def _user_config_candidates(
+    *,
+    home: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+    os_name: str | None = None,
+) -> tuple[Path, Path]:
+    """Return correctly and historically spelled per-user config paths."""
+
+    resolved_home = home or Path.home()
+    resolved_environ = environ if environ is not None else os.environ
+    resolved_os_name = os_name or os.name
+    if resolved_os_name == "nt":
+        configured_base = (
+            resolved_environ.get("APPDATA")
+            or resolved_environ.get("LOCALAPPDATA")
+        )
+        base = (
+            Path(configured_base).expanduser()
+            if configured_base
+            else resolved_home / "AppData" / "Roaming"
+        )
+    else:
+        base = resolved_home / ".config"
+    return (
+        base / "multiagent" / "config.json",
+        base / "mutiagent" / "config.json",
     )

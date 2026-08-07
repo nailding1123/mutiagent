@@ -8,15 +8,35 @@ import sys
 import threading
 import time
 import unicodedata
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import TextIO
 
 from .bridge_models import AgentEvent, AgentRunResult, BridgeOutcome
 from .consensus import (
     CONSENSUS_CRITERIA,
-    EVIDENCE_CONSENSUS_PROTOCOL,
+    SUPPORTED_CONSENSUS_PROTOCOLS,
     parse_consensus_decision,
 )
 from .reviews import parse_review_decision
+
+
+_ACTIVE_AGENT_STATUSES = {
+    "queued",
+    "starting",
+    "waiting_model",
+    "working",
+    "in_progress",
+}
+
+
+@dataclass(frozen=True)
+class _AgentActivity:
+    status: str
+    detail: str
+    elapsed_seconds: float
+    updated_at: float
 
 
 class ConsoleRenderer:
@@ -27,6 +47,7 @@ class ConsoleRenderer:
         *,
         color: bool | None = None,
         verbose: bool = False,
+        progress: bool = True,
         tui: bool | None = None,
         stream: TextIO | None = None,
         width: int | None = None,
@@ -38,6 +59,7 @@ class ConsoleRenderer:
         self.width = max(48, min(width or terminal_width, 110))
         self.color = color
         self.verbose = verbose
+        self.progress = progress
         self.tui = self.stream.isatty() if tui is None else bool(tui)
         self.tui = self.tui and self.stream.isatty() and not verbose
         self.phase_index = 0
@@ -46,36 +68,54 @@ class ConsoleRenderer:
         self._activity_thread: threading.Thread | None = None
         self._activity_started = 0.0
         self._activity_label = ""
+        self._activity_detail = "等待模型响应"
+        self._activity_frame = ""
         self._activity_operations = 0
+        self._agent_activity: dict[str, _AgentActivity] = {}
         self._run_started = 0.0
         self._run_id = ""
         self._agent_calls: dict[str, int] = {}
+        self._agent_durations: dict[str, float] = {}
         self._input_tokens = 0
         self._output_tokens = 0
         self._consensus_revisions = 0
+        self._plan_was_rendered = False
         self._tui_active = False
         self._tui_suspended = False
         self._tui_phase = "正在准备任务"
         self._tui_notice = ""
         self._tui_last_reply = ""
         self._tui_collaboration: dict[str, object] = {}
+        self._tui_last_frame = ""
+        self._tui_dimensions = (self.width, 24)
+        self._tui_dimensions_checked = 0.0
 
     def begin_run(self, run_id: str | None = None) -> None:
         self._stop_activity()
         self.phase_index = 0
         self._run_started = time.monotonic()
         self._run_id = run_id or ""
+        self._activity_started = 0.0
+        self._activity_label = ""
+        self._activity_detail = "等待模型响应"
+        self._activity_frame = "◐"
+        self._activity_operations = 0
+        self._agent_activity = {}
         self._agent_calls = {}
+        self._agent_durations = {}
         self._input_tokens = 0
         self._output_tokens = 0
         self._consensus_revisions = 0
+        self._plan_was_rendered = False
         self._tui_suspended = False
         self._tui_phase = "正在准备任务"
         self._tui_notice = ""
         self._tui_last_reply = ""
         self._tui_collaboration = {}
+        self._tui_last_frame = ""
+        self._tui_dimensions_checked = 0.0
         if self.tui and not self._tui_active:
-            self.stream.write("\033[?1049h\033[?25l")
+            self.stream.write("\033[?1049h\033[2J\033[H\033[?25l")
             self.stream.flush()
             self._tui_active = True
             self._draw_tui()
@@ -85,6 +125,11 @@ class ConsoleRenderer:
         if enabled:
             self._stop_activity()
             self._leave_tui()
+
+    def set_progress(self, enabled: bool) -> None:
+        self.progress = enabled
+        if not enabled:
+            self._stop_activity()
 
     def clear_screen(self) -> None:
         """Clear an interactive terminal and move the cursor to the top-left."""
@@ -97,8 +142,7 @@ class ConsoleRenderer:
         *,
         version: str,
         workspace: str,
-        lead: str,
-        reviewer: str,
+        executor: str,
         review_rounds: int,
         consensus: bool,
     ) -> None:
@@ -113,18 +157,19 @@ class ConsoleRenderer:
             _center_display(line, inner_width) for line in bridge_mark
         )
         self._panel(
-            f">_  MutiAgent  v{version}",
+            f">_  MultiAgent  v{version}",
             (
                 f"{centered_mark}\n\n"
                 "Claude Code 与 Codex CLI 已连接\n"
                 "────────────────────────────────\n"
                 f"工作区      {workspace}\n"
-                f"主 Agent    {lead}\n"
-                f"副 Agent    {reviewer}\n"
+                "Agent A     Claude\n"
+                "Agent B     Codex\n"
+                f"执行协调    {executor}\n"
                 f"方案共识    {'开启' if consensus else '关闭'}\n"
                 f"审查轮数    {review_rounds}\n\n"
                 "› 输入开发需求开始协作\n"
-                "  /lead codex 可交换角色，/help 查看全部命令"
+                "  /executor codex 可切换写权限，/help 查看全部命令"
             ),
             "36",
         )
@@ -138,7 +183,7 @@ class ConsoleRenderer:
             and self.stream.isatty()
             and event.kind == "phase"
         ):
-            self.stream.write("\033[?1049h\033[?25l")
+            self.stream.write("\033[?1049h\033[2J\033[H\033[?25l")
             self.stream.flush()
             self._tui_active = True
             self._tui_suspended = False
@@ -148,35 +193,67 @@ class ConsoleRenderer:
         if event.kind == "phase":
             self._stop_activity()
             self.phase_index += 1
-            if "自动修订" in event.text and "复审" not in event.text:
+            if (
+                "自动修订" in event.text and "复审" not in event.text
+            ) or "接棒整合统一方案" in event.text:
                 self._consensus_revisions += 1
             self._section(f"{self.phase_index:02d}  {event.text}")
-            self._start_activity(event.text)
+            self._start_activity(event.text, "等待模型响应")
+            return
+        if event.kind == "lifecycle":
+            summary = event.safe_summary or event.text
+            self._update_agent_activity(event, summary)
+            if event.status in _ACTIVE_AGENT_STATUSES:
+                return
+            keep_animating = self._has_active_agents()
+            self._stop_activity()
+            elapsed = (
+                f" · {_format_duration(event.elapsed_seconds)}"
+                if event.elapsed_seconds is not None
+                else ""
+            )
+            if event.status == "completed":
+                self._compact_line("✓", f"{summary}{elapsed}", "32")
+            elif event.status == "failed":
+                self._compact_line("✗", f"{summary}{elapsed}", "31")
+            if keep_animating:
+                self._resume_activity()
+            return
+        if event.kind == "checkpoint":
+            if self.verbose:
+                self._compact_line("◇", event.safe_summary or event.text, "2")
             return
         if event.kind == "text":
+            keep_animating = self._has_active_agents()
             self._stop_activity()
             if self._render_consensus_review(event.source, event.text):
+                if keep_animating:
+                    self._resume_activity()
                 return
             if self._render_structured_review(event.source, event.text):
+                if keep_animating:
+                    self._resume_activity()
                 return
             color = "35" if event.source == "Claude" else "34"
             self._panel(f"{event.source} · 回复", event.text, color)
+            if keep_animating:
+                self._resume_activity()
             return
         if event.kind == "progress":
-            self._bump_activity()
+            self._update_agent_activity(event, _safe_progress_text(event))
             if self.verbose and event.text:
                 color = "35" if event.source == "Claude" else "34"
                 self._panel(f"{event.source} · 中间过程", event.text, color)
             return
         if event.kind == "tool":
-            self._bump_activity()
+            self._update_agent_activity(event, _safe_progress_text(event))
             if self.verbose:
                 self._compact_line(
                     "→", f"{event.source}  {self._format_tool(event.text)}", "36"
                 )
             return
         if event.kind == "tool_result":
-            self._bump_activity()
+            self._update_agent_activity(event, _safe_progress_text(event))
             if self.verbose:
                 status = event.text.strip()
                 symbol = (
@@ -188,19 +265,33 @@ class ConsoleRenderer:
             return
         if event.kind == "verification":
             self._stop_activity()
-            self._compact_line("▶", event.text, "36")
+            detail = event.text if self.verbose else event.safe_summary or "正在运行验证"
+            self._update_agent_activity(event, detail)
+            self._compact_line("▶", detail, "36")
+            self._resume_activity()
             return
         if event.kind == "verification_result":
-            passed = "PASS" in event.text
-            self._compact_line("✓" if passed else "✗", event.text, "32" if passed else "31")
+            self._update_agent_activity(event, event.safe_summary or event.text)
+            self._stop_activity()
+            passed = event.status == "completed" or "PASS" in event.text
+            detail = event.text if self.verbose else event.safe_summary or event.text
+            self._compact_line("✓" if passed else "✗", detail, "32" if passed else "31")
+            if self._has_active_agents():
+                self._resume_activity()
             return
         if event.kind == "warning":
             self._stop_activity()
             self._panel(f"{event.source} · 注意", event.text, "33")
             return
         if event.kind == "error":
+            self._update_agent_activity(
+                event, event.safe_summary or f"{event.source} · 本轮执行失败"
+            )
+            keep_animating = self._has_active_agents()
             self._stop_activity()
             self._panel(f"{event.source} · 错误", event.text, "31")
+            if keep_animating:
+                self._resume_activity()
             return
         if event.kind == "metric":
             self._capture_metric(event)
@@ -215,12 +306,52 @@ class ConsoleRenderer:
         self._stop_activity()
         self._leave_tui()
         if used_tui:
-            lead_source = "Claude" if outcome.lead == "claude" else "Codex"
-            lead_color = "35" if outcome.lead == "claude" else "34"
+            executor_source = "Claude" if outcome.executor == "claude" else "Codex"
+            executor_color = "35" if outcome.executor == "claude" else "34"
+            if outcome.agent_proposals and not self._plan_was_rendered:
+                for index, independent in enumerate(outcome.agent_proposals):
+                    label = chr(ord("A") + index)
+                    self._panel(
+                        f"Agent {label} · {independent.agent} · 独立方案",
+                        independent.final_text,
+                        "35" if independent.agent == "Claude" else "34",
+                    )
+            if not self._plan_was_rendered:
+                for index, review in enumerate(outcome.cross_reviews):
+                    if not self._render_consensus_review(
+                        review.agent,
+                        review.final_text,
+                        title=f"交叉审核 {index + 1}",
+                    ):
+                        self._panel(
+                            f"{review.agent} · 交叉审核",
+                            review.final_text,
+                            "35" if review.agent == "Claude" else "34",
+                        )
+            final_plan = outcome.unified_proposal
+            if final_plan and not self._plan_was_rendered:
+                self._panel(
+                    "双方统一方案",
+                    final_plan.final_text,
+                    "36",
+                )
+                if outcome.consensus_reviews:
+                    final_consensus_review = outcome.consensus_reviews[-1]
+                    rendered_review = self._render_consensus_review(
+                        final_consensus_review.agent,
+                        final_consensus_review.final_text,
+                        title="统一方案审核",
+                    )
+                    if not rendered_review:
+                        self._panel(
+                            f"{final_consensus_review.agent} · 统一方案审核",
+                            final_consensus_review.final_text,
+                            "34" if final_consensus_review.agent == "Codex" else "35",
+                        )
             self._panel(
-                f"{lead_source} · 最终回复",
-                outcome.lead_result.final_text,
-                lead_color,
+                f"{executor_source} · 执行结果",
+                outcome.execution_result.final_text,
+                executor_color,
             )
             if outcome.reviews:
                 final_review = outcome.reviews[-1]
@@ -244,8 +375,10 @@ class ConsoleRenderer:
 
         lines = [
             status,
-            f"主 Agent          {outcome.lead}",
-            f"需求与方案预审    {'完成' if outcome.requirement_analysis else '未启用'}",
+            "协作关系          Agent A / Agent B 对等",
+            f"执行协调 Agent    {outcome.executor}",
+            f"双方独立方案      {len(outcome.agent_proposals)} 份",
+            f"双向交叉审核      {len(outcome.cross_reviews)} 份",
             f"代码审查          {len(outcome.reviews)} 次",
         ]
         if self._run_started:
@@ -257,6 +390,12 @@ class ConsoleRenderer:
                 f"{name} {count} 次" for name, count in self._agent_calls.items()
             )
             lines.append(f"Agent 调用        {calls}")
+        if self._agent_durations:
+            durations = " / ".join(
+                f"{name} {_format_duration(seconds)}"
+                for name, seconds in self._agent_durations.items()
+            )
+            lines.append(f"Agent 累计耗时    {durations}")
         if self._consensus_revisions:
             lines.append(f"共识自动修订      {self._consensus_revisions} 次")
         if self._input_tokens or self._output_tokens:
@@ -289,6 +428,15 @@ class ConsoleRenderer:
                 f"{evidence_count} 条证据 / "
                 f"{len(collaboration.blocking_issues)} 项阻塞"
             )
+            if collaboration.proposal_version:
+                approval = (
+                    "双方已批准" if collaboration.accepted else "未启用或未达成共识"
+                )
+                digest = collaboration.proposal_digest[:12] or "未记录"
+                lines.append(
+                    f"统一方案          v{collaboration.proposal_version} · "
+                    f"{approval} · {digest}"
+                )
 
         if outcome.baseline and outcome.baseline.is_git_repo:
             before = _status_count(outcome.baseline.status)
@@ -314,40 +462,77 @@ class ConsoleRenderer:
         return {
             "elapsed_seconds": round(elapsed, 3),
             "agent_calls": dict(self._agent_calls),
+            "agent_durations": {
+                name: round(seconds, 3)
+                for name, seconds in self._agent_durations.items()
+            },
             "input_tokens": self._input_tokens,
             "output_tokens": self._output_tokens,
             "consensus_revisions": self._consensus_revisions,
         }
 
-    def plan_confirmation(
+    def collaboration_confirmation(
         self,
-        proposal: AgentRunResult,
-        review: AgentRunResult,
+        proposal_a: AgentRunResult,
+        proposal_b: AgentRunResult,
+        cross_reviews: tuple[AgentRunResult, ...],
+        unified_proposal: AgentRunResult,
+        consensus_review: AgentRunResult | None,
         revision_count: int,
     ) -> None:
         self._stop_activity()
         self._leave_tui(suspend=True)
-        files = _extract_file_candidates(proposal.final_text)
-        consensus = parse_consensus_decision(review.final_text)
-        verdict = "已达成" if consensus.valid and consensus.accepted else "待确认"
-        lines = [
-            f"方案状态      {verdict}",
-            f"人工修订      {revision_count} 次",
-        ]
-        if files:
-            lines.append(f"涉及文件      {len(files)} 个候选")
-            lines.extend(f"  · {path}" for path in files[:6])
-            if len(files) > 6:
-                lines.append(f"  · 另有 {len(files) - 6} 个")
-        else:
-            lines.append("涉及文件      未从方案中识别，请查看完整方案")
-        lines.extend(
-            (
-                "",
-                "[e] 执行当前方案    [r] 提出修订要求    [c] 取消任务",
+        self._plan_was_rendered = True
+        for label, proposal in (("A", proposal_a), ("B", proposal_b)):
+            self._panel(
+                f"Agent {label} · {proposal.agent} · 独立方案",
+                proposal.final_text,
+                "35" if proposal.agent == "Claude" else "34",
             )
-        )
+        for index, review in enumerate(cross_reviews, start=1):
+            if not self._render_consensus_review(
+                review.agent,
+                review.final_text,
+                title=f"交叉审核 {index}",
+            ):
+                self._panel(
+                    f"{review.agent} · 交叉审核 {index}",
+                    review.final_text,
+                    "35" if review.agent == "Claude" else "34",
+                )
+        self._panel("双方统一方案", unified_proposal.final_text, "36")
+        if consensus_review is not None:
+            self._render_consensus_review(
+                consensus_review.agent,
+                consensus_review.final_text,
+                title="统一方案审核",
+            )
+        files = _extract_file_candidates(unified_proposal.final_text)
+        lines = [
+            f"协作状态      {'双方已批准' if consensus_review else '快速协作已完成'}",
+            f"人工修订      {revision_count} 次",
+            f"涉及文件      {len(files)} 个候选" if files else "涉及文件      未识别",
+            "",
+            "[e] 执行统一方案    [r] 提出整体修订要求\n"
+            "[t] 单独给某个 Agent 提要求\n"
+            "[d] 导出最终技术文档    [c] 取消任务",
+        ]
         self._panel("实施确认", "\n".join(lines), "36")
+
+    def document_exported(
+        self,
+        path: Path,
+        *,
+        consensus_incomplete: bool = False,
+    ) -> None:
+        self._stop_activity()
+        self._leave_tui(suspend=True)
+        note = (
+            "共识轮次已达到上限；文档已标注未达成共识的内容和原因。"
+            if consensus_incomplete
+            else "文档已导出；你仍可继续执行、修订或取消当前方案。"
+        )
+        self._panel("技术文档", f"{path}\n{note}", "36")
 
     def failure_recovery(self, error: str) -> None:
         self._stop_activity()
@@ -356,7 +541,7 @@ class ConsoleRenderer:
             "任务暂停",
             (
                 f"{error}\n\n"
-                "[r] 重试当前任务    [l] 交换主副角色后重试\n"
+                "[r] 重试当前任务    [l] 切换执行协调 Agent 后重试\n"
                 "[d] 展开执行详情后重试    [q] 结束本次任务"
             ),
             "31",
@@ -368,6 +553,7 @@ class ConsoleRenderer:
             return
         symbols = {
             "complete": "✓",
+            "ready": "●",
             "running": "◐",
             "failed": "✗",
             "cancelled": "·",
@@ -384,7 +570,7 @@ class ConsoleRenderer:
                 f"{symbols.get(status, '·')} {run_id}  {status}{attempt_text}"
             )
             lines.append(f"    {task}")
-        lines.extend(("", "恢复任务：mutiagent resume <run-id>"))
+        lines.extend(("", "恢复任务：multiagent resume <run-id>"))
         self._panel("任务历史", "\n".join(lines), "36")
 
     def tasks(self, records: list[dict[str, object]]) -> None:
@@ -393,11 +579,11 @@ class ConsoleRenderer:
             return
         symbols = {
             "complete": "✓",
+            "ready": "●",
             "running": "◐",
             "failed": "✗",
             "cancelled": "·",
             "interrupted": "!",
-            "discarded": "×",
         }
         lines: list[str] = []
         for record in records:
@@ -405,17 +591,15 @@ class ConsoleRenderer:
             run_id = str(record.get("id", ""))
             phase = str(record.get("phase", "未开始"))
             workspace = str(record.get("workspace", ""))
-            isolated = "worktree" if isinstance(record.get("worktree"), dict) else "direct"
             lines.append(
-                f"{symbols.get(status, '·')} {run_id}  {status} · {phase} · {isolated}"
+                f"{symbols.get(status, '·')} {run_id}  {status} · {phase}"
             )
             lines.append(f"    {_truncate_display(str(record.get('task', '')), 58)}")
             lines.append(f"    {_truncate_display(workspace, 58)}")
         lines.extend(
             (
                 "",
-                "查看：mutiagent task <run-id>",
-                "差异：mutiagent task diff <run-id>",
+                "查看：multiagent task <run-id>",
             )
         )
         self._panel("任务中心", "\n".join(lines), "36")
@@ -425,18 +609,23 @@ class ConsoleRenderer:
             f"任务 ID       {record.get('id', '')}",
             f"状态          {record.get('status', 'unknown')}",
             f"阶段          {record.get('phase', '未记录')}",
-            f"主 Agent      {record.get('lead', '')}",
+            f"执行协调      {record.get('executor', '')}",
             f"工作区        {record.get('workspace', '')}",
             f"需求          {record.get('task', '')}",
         ]
-        worktree = record.get("worktree")
-        if isinstance(worktree, dict):
+        if record.get("collaboration_mode") == "group_chat":
+            group_chat = record.get("group_chat")
+            messages = group_chat.get("messages", []) if isinstance(group_chat, dict) else []
+            turns = group_chat.get("turn", 0) if isinstance(group_chat, dict) else 0
             lines.extend(
                 (
-                    f"隔离分支      {worktree.get('branch', '')}",
-                    f"基线提交      {worktree.get('base_head', '')}",
+                    "协作模式      群聊协作（讨论只读，单 Agent 写目标工作区）",
+                    f"群聊记录      {turns} 轮 · {len(messages) if isinstance(messages, list) else 0} 条消息",
                 )
             )
+        technical_document = record.get("technical_document")
+        if isinstance(technical_document, str) and technical_document:
+            lines.append(f"技术文档      {technical_document}")
         collaboration = record.get("collaboration")
         if isinstance(collaboration, dict):
             tasks = collaboration.get("tasks", [])
@@ -461,6 +650,27 @@ class ConsoleRenderer:
                 lines.append(f"争议          {len(issues)} 项，阻塞 {len(blockers)} 项")
             if isinstance(messages, list):
                 lines.append(f"结构化消息    {len(messages)} 条")
+        events = record.get("events")
+        if isinstance(events, list) and events:
+            lines.extend(("", "最近事件："))
+            for raw in events[-10:]:
+                if not isinstance(raw, dict):
+                    continue
+                clock = _event_clock(raw.get("timestamp"))
+                source = str(raw.get("source", ""))
+                status = str(raw.get("status", ""))
+                step = str(raw.get("step_id", ""))
+                summary = str(raw.get("safe_summary") or raw.get("text") or "")
+                elapsed = raw.get("elapsed_seconds")
+                elapsed_text = (
+                    f" · {_format_duration(float(elapsed))}"
+                    if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool)
+                    else ""
+                )
+                context = f"{step} · " if step else ""
+                lines.append(
+                    f"  {clock} {source} [{status}] {context}{summary}{elapsed_text}"
+                )
         self._panel("任务详情", "\n".join(lines), "36")
 
     def quality_report(self, report) -> None:
@@ -508,8 +718,14 @@ class ConsoleRenderer:
             "32" if passed_count == len(checks) else "33",
         )
 
-    def _render_consensus_review(self, source: str, text: str) -> bool:
-        if "mutiagent.consensus.v1" not in text and EVIDENCE_CONSENSUS_PROTOCOL not in text:
+    def _render_consensus_review(
+        self,
+        source: str,
+        text: str,
+        *,
+        title: str = "方案共识",
+    ) -> bool:
+        if not any(protocol in text for protocol in SUPPORTED_CONSENSUS_PROTOCOLS):
             return False
         decision = parse_consensus_decision(text)
         if not decision.valid or not decision.structured:
@@ -554,7 +770,7 @@ class ConsoleRenderer:
                 for issue in blockers[:5]
             )
         self._panel(
-            f"{source} · 方案共识",
+            f"{source} · {title}",
             "\n".join(lines),
             "32" if decision.accepted else "33",
         )
@@ -570,9 +786,11 @@ class ConsoleRenderer:
             self.phase_index += 1
             self._tui_phase = event.text
             self._tui_notice = ""
-            if "自动修订" in event.text and "复审" not in event.text:
+            if (
+                "自动修订" in event.text and "复审" not in event.text
+            ) or "接棒整合统一方案" in event.text:
                 self._consensus_revisions += 1
-            self._start_activity(event.text)
+            self._start_activity(event.text, "等待模型响应")
         elif event.kind == "collaboration":
             try:
                 data = json.loads(event.text)
@@ -581,17 +799,38 @@ class ConsoleRenderer:
             if isinstance(data, dict):
                 self._tui_collaboration = data
         elif event.kind == "text":
-            self._stop_activity()
+            if not self._has_active_agents():
+                self._stop_activity()
             compact = " ".join(event.text.split())
-            self._tui_last_reply = f"{event.source}: {compact}"
+            preview_width = max(120, self.width * 3)
+            self._tui_last_reply = (
+                f"→ {event.source} 已生成输出："
+                f"{_truncate_display(compact, preview_width)}"
+            )
+        elif event.kind == "lifecycle":
+            summary = event.safe_summary or event.text
+            self._update_agent_activity(event, summary)
+            if event.status not in _ACTIVE_AGENT_STATUSES:
+                if not self._has_active_agents():
+                    self._stop_activity()
+        elif event.kind == "checkpoint":
+            self._tui_notice = event.safe_summary or event.text
         elif event.kind in {"progress", "tool", "tool_result"}:
-            self._bump_activity()
-        elif event.kind in {"verification", "verification_result"}:
-            self._tui_notice = event.text
+            self._update_agent_activity(event, _safe_progress_text(event))
+        elif event.kind == "verification":
+            self._update_agent_activity(event, event.safe_summary or event.text)
+        elif event.kind == "verification_result":
+            self._update_agent_activity(event, event.safe_summary or event.text)
+            if not self._has_active_agents():
+                self._stop_activity()
         elif event.kind == "warning":
             self._tui_notice = f"注意：{event.text}"
         elif event.kind == "error":
-            self._stop_activity()
+            self._update_agent_activity(
+                event, event.safe_summary or f"{event.source} · 本轮执行失败"
+            )
+            if not self._has_active_agents():
+                self._stop_activity()
             self._tui_notice = f"错误：{event.text}"
         elif event.kind == "metric":
             self._capture_metric(event)
@@ -601,33 +840,46 @@ class ConsoleRenderer:
         if not self._tui_active:
             return
         elapsed = time.monotonic() - self._run_started if self._run_started else 0
-        terminal = shutil.get_terminal_size(fallback=(self.width, 24))
-        width = max(48, min(terminal.columns, 120))
-        height = max(16, terminal.lines)
+        width, height = self._terminal_dimensions()
         inner = width - 4
         tasks = self._tui_collaboration.get("tasks", [])
         issues = self._tui_collaboration.get("issues", [])
         messages = self._tui_collaboration.get("messages", [])
+        requirements = self._tui_collaboration.get("requirements", [])
         if not isinstance(tasks, list):
             tasks = []
         if not isinstance(issues, list):
             issues = []
         if not isinstance(messages, list):
             messages = []
+        if not isinstance(requirements, list):
+            requirements = []
 
-        title = f">_  MutiAgent  ·  {self._run_id or '当前任务'}"
+        title = f">_  MultiAgent  ·  {self._run_id or '当前任务'}"
         lines = [
             _tui_top(title, width),
             _tui_line(
-                f"阶段 {self.phase_index:02d}  {self._tui_phase}", inner
+                f"◆ 阶段 {self.phase_index:02d}  {self._tui_phase}", inner
             ),
             _tui_line(
-                f"耗时 {_format_duration(elapsed)}  Agent 调用 {sum(self._agent_calls.values())}  "
-                f"Token {self._input_tokens}/{self._output_tokens}",
+                f"总耗时 {_format_duration(elapsed)}  ·  调用 {sum(self._agent_calls.values())}  ·  "
+                f"Token ↑{self._input_tokens} ↓{self._output_tokens}",
                 inner,
             ),
-            _tui_divider("共享任务", width),
+            _tui_divider("实时 Agent", width),
         ]
+        activity_lines = self._agent_activity_lines()
+        if activity_lines:
+            lines.extend(_tui_line(line, inner) for line in activity_lines)
+            lines.append(
+                _tui_line(self._phase_activity_summary(messages=len(messages)), inner)
+            )
+            if self._tui_notice:
+                lines.append(_tui_line(f"◇ {self._tui_notice}", inner))
+        else:
+            notice = self._tui_notice or self._activity_status(messages=len(messages))
+            lines.append(_tui_line(notice, inner))
+
         symbols = {
             "pending": "○",
             "in_progress": "◐",
@@ -636,18 +888,6 @@ class ConsoleRenderer:
             "failed": "✗",
             "skipped": "·",
         }
-        available_tasks = max(3, min(len(tasks), height // 3))
-        for raw in tasks[:available_tasks]:
-            if not isinstance(raw, dict):
-                continue
-            status = str(raw.get("status", "pending"))
-            owner = str(raw.get("owner", ""))
-            title = str(raw.get("title", ""))
-            content = f"{symbols.get(status, '·')} {owner:<7} {title}"
-            lines.append(_tui_line(content, inner))
-        if not tasks:
-            lines.append(_tui_line("暂无共享任务", inner))
-
         blockers = [
             issue
             for issue in issues
@@ -655,40 +895,107 @@ class ConsoleRenderer:
             and issue.get("severity") in {"P0", "P1"}
             and issue.get("status") != "resolved"
         ]
-        lines.append(_tui_divider("争议与证据", width))
-        if blockers:
-            for issue in blockers[:3]:
-                content = (
-                    f"{issue.get('id', '')} [{issue.get('severity', '')}] "
-                    f"{issue.get('problem', '')}"
-                )
-                lines.append(_tui_line(content, inner))
-        else:
-            evidence_count = sum(
-                len(item.get("evidence", []))
-                for item in issues
-                if isinstance(item, dict) and isinstance(item.get("evidence", []), list)
-            )
-            lines.append(
-                _tui_line(
-                    f"✓ 当前无未解决 P0/P1 · {len(issues)} 项争议 · {evidence_count} 条证据",
-                    inner,
-                )
-            )
-        lines.append(_tui_divider("实时状态", width))
-        notice = self._tui_notice or (
-            f"已交换 {len(messages)} 条结构化消息 · 内部事件 {self._activity_operations}"
+        evidence_count = sum(
+            len(item.get("evidence", []))
+            for item in issues
+            if isinstance(item, dict) and isinstance(item.get("evidence", []), list)
         )
-        lines.append(_tui_line(notice, inner))
+        covered_requirements = sum(
+            item.get("covered") is True
+            for item in requirements
+            if isinstance(item, dict)
+        )
+        if blockers:
+            quality_lines = [
+                f"! 未通过质量门禁 · {len(blockers)} 个 P0/P1 阻塞"
+            ]
+            quality_lines.extend(
+                f"  {issue.get('id', '')} [{issue.get('severity', '')}] "
+                f"{issue.get('problem', '')}"
+                for issue in blockers[:2]
+            )
+        else:
+            requirement_progress = (
+                f"{covered_requirements}/{len(requirements)}"
+                if requirements
+                else "待生成"
+            )
+            quality_lines = [
+                f"✓ 当前无 P0/P1 阻塞 · 争议 {len(issues)} · "
+                f"证据 {evidence_count} · 需求 {requirement_progress}"
+            ]
+
+        lines.append(_tui_divider("任务进度", width))
+        finished_tasks = sum(
+            isinstance(item, dict) and item.get("status") in {"done", "skipped"}
+            for item in tasks
+        )
+        lines.append(
+            _tui_line(
+                f"{_progress_bar(finished_tasks, len(tasks))}  "
+                f"已完成 {finished_tasks}/{len(tasks)}",
+                inner,
+            )
+        )
+        task_priority = {
+            "in_progress": 0,
+            "blocked": 1,
+            "failed": 1,
+            "pending": 2,
+            "done": 3,
+            "skipped": 4,
+        }
+        ordered_tasks = sorted(
+            enumerate(tasks),
+            key=lambda item: (
+                task_priority.get(
+                    str(item[1].get("status", "pending"))
+                    if isinstance(item[1], dict)
+                    else "pending",
+                    9,
+                ),
+                item[0],
+            ),
+        )
+        fixed_tail = 1 + len(quality_lines) + 1
+        available_tasks = max(1, height - len(lines) - fixed_tail - 1)
+        for _, raw in ordered_tasks[:available_tasks]:
+            if not isinstance(raw, dict):
+                continue
+            status = str(raw.get("status", "pending"))
+            owner = _display_agent_name(str(raw.get("owner", "")))
+            task_title = str(raw.get("title", ""))
+            content = f"{symbols.get(status, '·')} {_pad_display(owner, 7)} {task_title}"
+            lines.append(_tui_line(content, inner))
+        if not tasks:
+            lines.append(_tui_line("暂无共享任务", inner))
+
+        lines.append(_tui_divider("质量门禁", width))
+        lines.extend(_tui_line(line, inner) for line in quality_lines)
         if self._tui_last_reply and len(lines) < height - 2:
             lines.append(_tui_line(self._tui_last_reply, inner))
         while len(lines) < height - 1:
             lines.append(_tui_line("", inner))
         lines = lines[: height - 1]
         lines.append("╰" + "─" * (width - 2) + "╯")
+        frame = "\n".join(lines)
         with self._activity_lock:
-            self.stream.write("\033[H\033[2J" + "\n".join(lines))
+            if frame == self._tui_last_frame:
+                return
+            self.stream.write("\033[H" + frame + "\033[J")
             self.stream.flush()
+            self._tui_last_frame = frame
+
+    def _terminal_dimensions(self) -> tuple[int, int]:
+        now = time.monotonic()
+        if now - self._tui_dimensions_checked >= 0.5:
+            terminal = shutil.get_terminal_size(fallback=(self.width, 24))
+            self._tui_dimensions = (
+                max(48, min(terminal.columns, 120)),
+                max(16, terminal.lines),
+            )
+            self._tui_dimensions_checked = now
+        return self._tui_dimensions
 
     def _leave_tui(self, *, suspend: bool = False) -> None:
         if not self._tui_active:
@@ -697,19 +1004,29 @@ class ConsoleRenderer:
             return
         self._tui_active = False
         self._tui_suspended = suspend
+        self._tui_last_frame = ""
         self.stream.write("\033[?25h\033[?1049l")
         self.stream.flush()
 
-    def _start_activity(self, label: str) -> None:
-        if self.verbose or not self.stream.isatty():
+    def _start_activity(self, label: str, detail: str) -> None:
+        with self._activity_lock:
+            self._activity_label = label
+            self._activity_detail = detail
+            self._activity_operations = 0
+            self._agent_activity = {}
+            self._activity_started = time.monotonic()
+            self._activity_frame = "◐"
+        self._resume_activity()
+
+    def _resume_activity(self) -> None:
+        if self.verbose or not self.progress or not self.stream.isatty():
             return
-        self._activity_label = label
-        self._activity_operations = 0
-        self._activity_started = time.monotonic()
+        if self._activity_thread is not None and self._activity_thread.is_alive():
+            return
         self._activity_stop = threading.Event()
         self._activity_thread = threading.Thread(
             target=self._activity_loop,
-            name="mutiagent-status",
+            name="multiagent-status",
             daemon=True,
         )
         self._activity_thread.start()
@@ -717,29 +1034,113 @@ class ConsoleRenderer:
     def _activity_loop(self) -> None:
         frames = "◐◓◑◒"
         index = 0
-        while not self._activity_stop.wait(0.12):
+        while not self._activity_stop.wait(0.2):
+            frame = frames[index % len(frames)]
+            with self._activity_lock:
+                self._activity_frame = frame
             if self._tui_active:
                 self._draw_tui()
                 index += 1
                 continue
-            elapsed = int(time.monotonic() - self._activity_started)
-            minutes, seconds = divmod(elapsed, 60)
-            operations = (
-                f" · 已处理 {self._activity_operations} 个内部事件"
-                if self._activity_operations
-                else ""
-            )
-            status = (
-                f"  {frames[index % len(frames)]} {self._activity_label}"
-                f" · {minutes:02d}:{seconds:02d}{operations}"
-            )
+            status = f"  {self._activity_status()}"
             with self._activity_lock:
                 self.stream.write(f"\r\033[2K{status}")
                 self.stream.flush()
             index += 1
 
-    def _bump_activity(self) -> None:
-        self._activity_operations += 1
+    def _bump_activity(self, detail: str = "") -> None:
+        with self._activity_lock:
+            self._activity_operations += 1
+            if detail:
+                self._activity_detail = detail
+
+    def _update_agent_activity(self, event: AgentEvent, detail: str) -> None:
+        source = event.source.strip()
+        if not source or source == "Bridge":
+            self._bump_activity(detail)
+            return
+        normalized = _strip_agent_prefix(source, detail) or "等待模型响应"
+        now = time.monotonic()
+        with self._activity_lock:
+            previous = self._agent_activity.get(source)
+            elapsed = event.elapsed_seconds
+            if elapsed is None:
+                elapsed = previous.elapsed_seconds if previous is not None else 0.0
+            self._agent_activity[source] = _AgentActivity(
+                status=event.status,
+                detail=normalized,
+                elapsed_seconds=max(0.0, float(elapsed)),
+                updated_at=now,
+            )
+            self._activity_operations += 1
+            self._activity_detail = detail
+
+    def _has_active_agents(self) -> bool:
+        with self._activity_lock:
+            return any(
+                activity.status in _ACTIVE_AGENT_STATUSES
+                for activity in self._agent_activity.values()
+            )
+
+    def _agent_activity_lines(self) -> list[str]:
+        now = time.monotonic()
+        with self._activity_lock:
+            frame = self._activity_frame or "◐"
+            activities = dict(self._agent_activity)
+        order = {"Claude": 0, "Codex": 1, "Verifier": 2}
+        lines: list[str] = []
+        for source, activity in sorted(
+            activities.items(), key=lambda item: (order.get(item[0], 99), item[0])
+        ):
+            active = activity.status in _ACTIVE_AGENT_STATUSES
+            elapsed = activity.elapsed_seconds
+            if active:
+                elapsed += max(0.0, now - activity.updated_at)
+            symbol = frame if active else "✓" if activity.status == "completed" else "✗"
+            lines.append(
+                f"{symbol} {source} · {activity.detail} · {_format_clock(elapsed)}"
+            )
+        return lines
+
+    def _phase_activity_summary(self, *, messages: int | None = None) -> str:
+        elapsed = (
+            max(0.0, time.monotonic() - self._activity_started)
+            if self._activity_started
+            else 0.0
+        )
+        with self._activity_lock:
+            operations = self._activity_operations
+        details = [f"阶段计时 {_format_clock(elapsed)}"]
+        if messages is not None:
+            details.append(f"已交换 {messages} 条结构化消息")
+        if operations:
+            details.append(f"已处理 {operations} 个内部事件")
+        return " · ".join(details)
+
+    def _activity_status(self, *, messages: int | None = None) -> str:
+        if not self.progress:
+            return "安全进度已关闭"
+        if not self._activity_started:
+            return "◐ 等待任务开始"
+        agent_lines = self._agent_activity_lines()
+        if agent_lines:
+            agents = " │ ".join(agent_lines)
+            return f"{agents} · {self._phase_activity_summary(messages=messages)}"
+        elapsed = int(time.monotonic() - self._activity_started)
+        minutes, seconds = divmod(elapsed, 60)
+        with self._activity_lock:
+            frame = self._activity_frame or "◐"
+            label = self._activity_label
+            detail = self._activity_detail
+            operations = self._activity_operations
+        extra = (
+            f" · 已处理 {operations} 个内部事件"
+            if operations
+            else ""
+        )
+        if messages is not None:
+            extra = f" · 已交换 {messages} 条结构化消息{extra}"
+        return f"{frame} {detail} · {minutes:02d}:{seconds:02d} · 阶段：{label}{extra}"
 
     def _stop_activity(self) -> None:
         thread = self._activity_thread
@@ -790,6 +1191,11 @@ class ConsoleRenderer:
         if not isinstance(data, dict):
             return
         self._agent_calls[event.source] = self._agent_calls.get(event.source, 0) + 1
+        duration = data.get("duration_seconds", 0)
+        if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+            self._agent_durations[event.source] = (
+                self._agent_durations.get(event.source, 0.0) + max(0.0, float(duration))
+            )
         input_tokens = data.get("input_tokens", 0)
         output_tokens = data.get("output_tokens", 0)
         if isinstance(input_tokens, int) and not isinstance(input_tokens, bool):
@@ -856,12 +1262,106 @@ def _status_count(status: str) -> int:
     return sum(1 for line in status.splitlines() if line.strip())
 
 
+def _safe_progress_text(event: AgentEvent) -> str:
+    source = event.source or "Agent"
+    if event.kind == "progress":
+        return f"{source} · 正在组织回复"
+    if event.kind == "tool_result":
+        status = event.text.strip().lower()
+        if status in {"failed", "error"}:
+            return f"{source} · 工具返回异常"
+        return f"{source} · 等待模型响应"
+    if event.kind != "tool":
+        return f"{source} · 等待模型响应"
+
+    tool_name, _, detail = event.text.partition(": ")
+    lower_name = tool_name.strip().lower()
+    lower_text = event.text.lower()
+    file_kind = _safe_file_kind(detail or event.text)
+
+    if file_kind == "pdf":
+        return f"{source} · 正在读取 PDF"
+    if lower_name in {"read", "notebookread"}:
+        return f"{source} · 正在读取文件"
+    if lower_name in {"grep", "glob", "ls", "list", "search"}:
+        return f"{source} · 正在检查文件"
+    if lower_name in {"edit", "write", "multiedit", "file_change"}:
+        return f"{source} · 正在更新文件"
+    if lower_name in {"bash", "command_execution", "shell"}:
+        return f"{source} · 正在执行检查"
+    if lower_name in {"todowrite", "update_plan"}:
+        return f"{source} · 正在更新任务状态"
+    if "mcp_tool_call" in lower_name:
+        return f"{source} · 正在调用外部工具"
+    if "web" in lower_name:
+        return f"{source} · 正在读取网页"
+    if file_kind:
+        return f"{source} · 正在处理文件"
+    if any(word in lower_text for word in ("grep", "glob", "find", "rg ")):
+        return f"{source} · 正在检查文件"
+    if any(word in lower_text for word in ("pytest", "test", "lint", "typecheck")):
+        return f"{source} · 正在执行检查"
+    return f"{source} · 正在调用工具"
+
+
+def _safe_file_kind(text: str) -> str:
+    if not text:
+        return ""
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        data = None
+    candidates: list[str] = []
+    if isinstance(data, dict):
+        for key in ("file_path", "path", "file", "url"):
+            value = data.get(key)
+            if isinstance(value, str):
+                candidates.append(value)
+    candidates.append(text)
+    lower = " ".join(candidates).lower()
+    if re.search(r"\.pdf(?:\b|[\"'`),}\]])", lower):
+        return "pdf"
+    if re.search(
+        r"\.(?:py|js|jsx|ts|tsx|json|toml|yaml|yml|md|go|rs|java|kt|swift|"
+        r"c|h|cpp|hpp|css|scss|html|sql|sh)(?:\b|[\"'`),}\]])",
+        lower,
+    ):
+        return "file"
+    return ""
+
+
 def _format_duration(seconds: float) -> str:
     total = max(0, int(round(seconds)))
     minutes, remaining = divmod(total, 60)
     if minutes:
         return f"{minutes}分{remaining:02d}秒"
     return f"{remaining}秒"
+
+
+def _format_clock(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, remaining = divmod(total, 60)
+    return f"{minutes:02d}:{remaining:02d}"
+
+
+def _strip_agent_prefix(source: str, text: str) -> str:
+    value = " ".join(text.split())
+    for separator in ("·", ":", "："):
+        prefix = f"{source} {separator}" if separator == "·" else f"{source}{separator}"
+        if value.startswith(prefix):
+            return value[len(prefix) :].strip()
+    return value
+
+
+def _event_clock(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        return "--:--:--"
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone().strftime(
+            "%H:%M:%S"
+        )
+    except ValueError:
+        return value[11:19] if len(value) >= 19 else value
 
 
 def _format_rate(value: float | None) -> str:
@@ -1093,6 +1593,17 @@ def _tui_divider(label: str, width: int) -> str:
     clipped = _truncate_display(label, max(1, width - 5))
     dashes = max(0, width - 5 - _display_width(clipped))
     return f"├─ {clipped} {'─' * dashes}┤"
+
+
+def _progress_bar(completed: int, total: int, width: int = 12) -> str:
+    ratio = min(1.0, max(0.0, completed / total)) if total else 0.0
+    filled = int(round(ratio * width))
+    return f"[{'█' * filled}{'░' * (width - filled)}]"
+
+
+def _display_agent_name(value: str) -> str:
+    names = {"claude": "Claude", "codex": "Codex", "bridge": "Bridge"}
+    return names.get(value.lower(), value or "未分配")
 
 
 def _wrap_display(text: str, width: int) -> list[str]:

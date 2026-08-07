@@ -13,9 +13,10 @@ from .bridge_models import (
     WorkspaceSnapshot,
 )
 from .collaboration import CollaborationState
+from .workspace_state import WorkspaceChangeBaseline
 
 
-CHECKPOINT_SCHEMA_VERSION = 1
+CHECKPOINT_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -24,9 +25,11 @@ class WorkflowCheckpoint:
 
     task: str
     workspace: str
-    lead: str
+    executor: str
     phase: str = "initialized"
     baseline: WorkspaceSnapshot | None = None
+    change_baseline: WorkspaceChangeBaseline | None = None
+    change_summary: dict[str, Any] | None = None
     artifacts: dict[str, AgentRunResult] = field(default_factory=dict)
     consensus_revisions: int = 0
     plan_revisions: int = 0
@@ -54,9 +57,13 @@ class WorkflowCheckpoint:
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
             "task": self.task,
             "workspace": self.workspace,
-            "lead": self.lead,
+            "executor": self.executor,
             "phase": self.phase,
             "baseline": _snapshot_to_dict(self.baseline),
+            "change_baseline": (
+                self.change_baseline.to_dict() if self.change_baseline else None
+            ),
+            "change_summary": self.change_summary,
             "artifacts": {
                 name: _agent_result_to_dict(result)
                 for name, result in self.artifacts.items()
@@ -91,26 +98,32 @@ class WorkflowCheckpoint:
         *,
         expected_task: str | None = None,
         expected_workspace: Path | None = None,
-        expected_lead: str | None = None,
+        expected_executor: str | None = None,
     ) -> "WorkflowCheckpoint | None":
         if not isinstance(data, dict) or data.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
             return None
         task = _text(data.get("task"))
         workspace = _text(data.get("workspace"))
-        lead = _text(data.get("lead"))
-        if not task or not workspace or lead not in {"claude", "codex"}:
+        executor = _text(data.get("executor"))
+        if not task or not workspace or executor not in {"claude", "codex"}:
             return None
         if expected_task is not None and task != expected_task.strip():
             return None
         if expected_workspace is not None and Path(workspace).resolve() != expected_workspace.resolve():
             return None
-        if expected_lead is not None and lead != expected_lead:
+        if expected_executor is not None and executor != expected_executor:
             return None
 
         collaboration = CollaborationState.from_dict(data.get("collaboration"))
         if collaboration is None:
             return None
         baseline = _snapshot_from_dict(data.get("baseline"))
+        change_baseline = WorkspaceChangeBaseline.from_dict(
+            data.get("change_baseline")
+        )
+        change_summary = data.get("change_summary")
+        if change_summary is not None and not isinstance(change_summary, dict):
+            return None
         artifacts_raw = data.get("artifacts", {})
         reviews_raw = data.get("reviews", [])
         decisions_raw = data.get("review_decisions", [])
@@ -146,9 +159,11 @@ class WorkflowCheckpoint:
         return cls(
             task=task,
             workspace=workspace,
-            lead=lead,
+            executor=executor,
             phase=_text(data.get("phase")) or "initialized",
             baseline=baseline,
+            change_baseline=change_baseline,
+            change_summary=change_summary,
             artifacts=artifacts,
             consensus_revisions=_integer(data.get("consensus_revisions")),
             plan_revisions=_integer(data.get("plan_revisions")),

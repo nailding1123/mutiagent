@@ -38,7 +38,7 @@ def parse_review_decision(text: str) -> ReviewDecision:
             file="",
             line=None,
             requirement="结构化审查协议",
-            problem="Reviewer 没有返回有效的结构化审查结果",
+            problem="验收 Agent 没有返回有效的结构化审查结果",
             evidence=str(exc),
             suggestion="按约定 JSON Schema 重新执行审查",
         )
@@ -54,7 +54,7 @@ def format_review_for_revision(decision: ReviewDecision, raw_text: str) -> str:
         return raw_text
     finding = decision.findings[0]
     return (
-        f"Reviewer 输出格式无效：{finding.evidence}\n"
+        f"验收 Agent 输出格式无效：{finding.evidence}\n"
         "请独立检查当前实现是否满足需求，并特别关注测试和边界条件。\n"
         f"原始输出：\n{raw_text}"
     )

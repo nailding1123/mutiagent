@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta id="color-scheme-meta" name="color-scheme" content="light" />
+    <meta id="theme-color-meta" name="theme-color" content="#faf5e6" />
+    <title>MultiAgent 工作台</title>
+    <link rel="stylesheet" href="./app.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body data-theme="paper">
+    <div id="app" class="app-shell">
+      <aside class="sidebar">
+        <button id="project-switcher" class="project-switcher" type="button" title="切换或配置项目">
+          <span>MultiAgent</span>
+          <span aria-hidden="true">▼</span>
+        </button>
+
+        <div class="sidebar-tabs" role="tablist" aria-label="侧边栏视图">
+          <button class="sidebar-tab active" data-sidebar-tab="chat" type="button" aria-label="协作">▢</button>
+          <button class="sidebar-tab" data-sidebar-tab="members" type="button" aria-label="成员">♧</button>
+        </div>
+
+        <div id="sidebar-chat" class="sidebar-scroll">
+          <nav class="tool-nav" aria-label="工作区导航">
+            <button class="tool-nav-item" id="search-button" type="button" aria-controls="run-search-panel" aria-expanded="false"><span>⌕</span><span>搜索任务</span><kbd>⌘K</kbd></button>
+            <button class="tool-nav-item" id="new-task-button" type="button"><span>＋</span><span>新建任务</span></button>
+            <button class="tool-nav-item" data-main-view="tasks" type="button"><span>☑</span><span>任务板</span></button>
+            <button class="tool-nav-item" id="open-details-button" type="button"><span>⌑</span><span>证据</span></button>
+          </nav>
+
+          <div id="run-search-panel" class="run-search-panel hidden">
+            <span aria-hidden="true">⌕</span>
+            <input id="run-search-input" type="search" autocomplete="off" placeholder="按标题、项目或状态搜索" aria-label="搜索任务" />
+            <button id="close-search-button" type="button" aria-label="关闭搜索" title="关闭搜索">×</button>
+          </div>
+
+          <div class="nav-section">
+            <div class="section-label"><span>▼ 频道 <em>1</em></span></div>
+            <button class="channel-item selected" data-main-view="chat" type="button"><span>#</span><strong>协作大厅</strong></button>
+          </div>
+
+          <div class="nav-section">
+            <div class="section-label"><span>▼ 智能体 <em>2</em></span></div>
+            <button class="dm-item" data-agent="claude" type="button">
+              <span class="avatar avatar-claude avatar-small">CL</span>
+              <span class="dm-copy"><strong>Claude Code</strong><small>独立方案与交叉审核</small></span>
+              <span id="claude-nav-dot" class="status-dot status-waiting"></span>
+            </button>
+            <button class="dm-item" data-agent="codex" type="button">
+              <span class="avatar avatar-codex avatar-small">CX</span>
+              <span class="dm-copy"><strong>Codex</strong><small>独立方案与交叉审核</small></span>
+              <span id="codex-nav-dot" class="status-dot status-waiting"></span>
+            </button>
+          </div>
+
+          <div class="nav-section recent-section">
+            <div class="section-label">
+              <span>项目</span>
+              <button id="refresh-button" class="section-add" type="button" title="刷新">↻</button>
+            </div>
+            <nav id="run-list" class="run-list" aria-label="按项目分组的任务"></nav>
+            <button id="archived-toggle" class="archived-toggle" type="button" aria-expanded="false">
+              <span><span class="archive-chevron" aria-hidden="true">›</span> 已归档</span>
+              <span id="archived-count" class="archive-count">0</span>
+            </button>
+            <nav id="archived-run-list" class="run-list archived-run-list hidden" aria-label="已归档任务"></nav>
+          </div>
+        </div>
+
+        <div id="sidebar-members" class="sidebar-scroll hidden">
+          <div class="member-heading">智能体</div>
+          <button class="member-card" data-agent="claude" type="button">
+            <span class="avatar avatar-claude">CL</span>
+            <span><strong>Claude Code</strong><small>对等协作者 · 方案与审核</small></span>
+          </button>
+          <button class="member-card" data-agent="codex" type="button">
+            <span class="avatar avatar-codex">CX</span>
+            <span><strong>Codex</strong><small>对等协作者 · 方案与审核</small></span>
+          </button>
+          <div class="member-heading">本地运行环境</div>
+          <div class="runtime-card"><span class="status-dot status-complete"></span><span>Claude Code + Codex CLI</span></div>
+        </div>
+
+        <footer class="sidebar-footer">
+          <span class="avatar avatar-user avatar-small">YO</span>
+          <span class="local-user"><strong>本地用户</strong><small id="sidebar-workspace">工作区</small></span>
+          <span id="connection-dot" class="status-dot status-waiting"></span>
+          <button id="settings-button" class="footer-settings" type="button" title="设置">⚙</button>
+        </footer>
+      </aside>
+
+      <main class="workspace-main">
+        <header class="channel-header">
+          <span class="channel-icon">#</span>
+          <div class="channel-heading">
+            <div><strong>协作大厅</strong><span>— Claude Code 与 Codex 对等协作</span></div>
+            <small id="workspace-chip">工作区加载中</small>
+          </div>
+          <div class="channel-actions">
+            <button id="stop-task-button" class="header-button stop-task-button hidden" type="button" title="停止当前任务">■ 停止</button>
+            <button id="resume-button" class="header-button hidden" type="button" title="从检查点恢复">↻ 恢复</button>
+            <button id="header-settings-button" class="header-button" type="button" title="设置">⚙</button>
+            <button id="header-details-button" class="header-button" type="button" title="运行详情">▣</button>
+            <button class="header-button" data-main-view="tasks" type="button" title="共享任务板">☑</button>
+            <span class="member-count">♧ 2</span>
+          </div>
+        </header>
+
+        <nav class="channel-tabs" role="tablist" aria-label="协作内容">
+          <button class="channel-tab active" data-main-view="chat" type="button">▢ 协作</button>
+          <button class="channel-tab" data-main-view="tasks" type="button">☑ 任务</button>
+          <span id="run-status-badge" class="status-badge">等待任务</span>
+        </nav>
+
+        <section id="empty-state" class="empty-state">
+          <div class="empty-agent-row" aria-hidden="true">
+            <span class="avatar avatar-claude avatar-large">CL</span>
+            <span class="empty-bridge">↔</span>
+            <span class="avatar avatar-codex avatar-large">CX</span>
+          </div>
+          <h1>在协作大厅发起一个任务</h1>
+          <p>选择共识实施完成开发任务，或进入群聊按 @ 点名讨论；写入时始终只有一个 Agent 直接修改目标工作区。</p>
+          <button id="empty-new-task-button" class="primary-button" type="button">＋ 新建任务</button>
+        </section>
+
+        <section id="run-view" class="run-view hidden">
+          <section id="chat-view" class="chat-view">
+            <div id="agent-banner" class="agent-banner" aria-live="polite">
+              <div id="claude-status" class="agent-status"></div>
+              <div id="codex-status" class="agent-status"></div>
+            </div>
+            <div id="error-banner" class="error-banner hidden" role="status" aria-live="polite"></div>
+            <details id="run-timeline" class="run-timeline hidden">
+              <summary><span>⌁ 运行时间线</span><small id="run-timeline-count">0 条事件</small></summary>
+              <div id="event-timeline" class="event-timeline"></div>
+            </details>
+            <div id="artifact-feed" class="message-list"></div>
+
+            <section id="plan-gate" class="approval-card hidden" aria-live="polite">
+              <div class="approval-mark">✓</div>
+              <div class="approval-copy">
+                <strong>统一方案已就绪，等待确认</strong>
+                <span id="plan-gate-note">可以执行、修订、定向要求、导出或取消。</span>
+              </div>
+              <div class="approval-actions">
+                <button class="action-execute" data-plan-action="execute" type="button">执行</button>
+                <button data-plan-action="revise" type="button">整体修订</button>
+                <button data-plan-action="targeted_revision" type="button">定向要求</button>
+                <button data-plan-action="export" type="button">导出 Markdown</button>
+                <button class="action-danger" data-plan-action="cancel" type="button">取消</button>
+              </div>
+            </section>
+
+            <form id="message-form" class="message-composer">
+              <textarea id="quick-task-input" rows="3" placeholder="在协作大厅输入新需求，让 Claude Code 与 Codex 开始协作" aria-autocomplete="list" aria-controls="composer-mention-menu" aria-expanded="false"></textarea>
+              <div id="composer-mention-menu" class="mention-menu hidden" role="listbox" aria-label="选择要点名的成员">
+                <button type="button" role="option" data-mention="@Claude"><span class="mention-avatar mention-avatar-claude">CL</span><span><strong>Claude Code</strong><small>使用 @Claude 点名 · 讨论、审核或执行</small></span></button>
+                <button type="button" role="option" data-mention="@Codex"><span class="mention-avatar mention-avatar-codex">CX</span><span><strong>Codex</strong><small>讨论、审核或执行</small></span></button>
+                <button type="button" role="option" data-mention="@all"><span class="mention-avatar mention-avatar-all">@</span><span><strong>所有成员</strong><small>同时邀请 Claude Code 与 Codex 讨论</small></span></button>
+              </div>
+              <div class="composer-toolbar">
+                <div class="composer-tools"><button id="quick-attach-button" type="button" title="创建带文档的任务" aria-label="创建带文档的任务">▧</button></div>
+                <button id="quick-settings-button" class="composer-settings" type="button">⚙ 任务设置</button>
+                <button id="quick-task-submit" class="send-button" type="submit">发送 ◁</button>
+              </div>
+            </form>
+          </section>
+
+          <section id="tasks-view" class="tasks-view hidden">
+            <header class="tasks-header">
+              <div><span class="channel-icon task-icon">☑</span><span><strong>任务板</strong><small id="task-count-label">本次协作共 0 项任务</small></span></div>
+              <button class="primary-button" id="tasks-new-button" type="button">＋ 新建任务</button>
+            </header>
+            <div id="kanban-board" class="kanban-board"></div>
+          </section>
+        </section>
+      </main>
+
+      <aside id="detail-panel" class="detail-panel hidden">
+        <header class="detail-header">
+          <div><strong id="detail-title">运行详情</strong><small id="detail-subtitle">证据与争议</small></div>
+          <button id="close-details-button" class="header-button" type="button" aria-label="关闭">×</button>
+        </header>
+        <div class="detail-tabs">
+          <button class="active" data-detail-view="overview" type="button">概览</button>
+          <button data-detail-view="evidence" type="button">证据</button>
+          <button data-detail-view="agent" type="button">智能体</button>
+        </div>
+        <div id="detail-overview" class="detail-content">
+          <section class="detail-section"><h2>运行信息</h2><div id="run-overview" class="info-list"></div></section>
+        </div>
+        <div id="detail-evidence" class="detail-content hidden">
+          <section class="detail-section"><h2>证据与争议</h2><div id="evidence-board" class="evidence-board"></div></section>
+        </div>
+        <div id="detail-agent" class="detail-content hidden">
+          <div id="agent-profile"></div>
+        </div>
+      </aside>
+    </div>
+
+    <div id="run-context-menu" class="context-menu hidden" role="menu" aria-label="对话操作">
+      <button type="button" role="menuitem" data-context-action="open"><span aria-hidden="true">↗</span><span>打开对话</span></button>
+      <button type="button" role="menuitem" data-context-action="rename"><span aria-hidden="true">✎</span><span>重命名</span></button>
+      <button type="button" role="menuitem" data-context-action="resume"><span aria-hidden="true">↻</span><span>从检查点恢复</span></button>
+      <button class="context-danger" type="button" role="menuitem" data-context-action="stop"><span aria-hidden="true">■</span><span>停止任务</span></button>
+      <div class="context-separator" role="separator"></div>
+      <button type="button" role="menuitem" data-context-action="copy-id"><span aria-hidden="true">#</span><span>复制任务 ID</span></button>
+      <button type="button" role="menuitem" data-context-action="copy-workspace"><span aria-hidden="true">⌘</span><span>复制项目路径</span></button>
+      <div class="context-separator" role="separator"></div>
+      <button type="button" role="menuitem" data-context-action="archive"><span aria-hidden="true">□</span><span>归档对话</span></button>
+      <button class="context-danger hidden" type="button" role="menuitem" data-context-action="delete"><span aria-hidden="true">×</span><span>永久删除</span></button>
+    </div>
+
+    <dialog id="rename-run-dialog" class="app-dialog compact-dialog">
+      <form id="rename-run-form" method="dialog">
+        <div class="dialog-header">
+          <div><span class="dialog-kicker">任务操作</span><h2>重命名任务</h2></div>
+          <button class="dialog-close" value="cancel" aria-label="关闭" type="submit" formnovalidate>×</button>
+        </div>
+        <label><span>任务名称</span><input id="rename-run-input" type="text" maxlength="200" required autocomplete="off" /></label>
+        <div id="rename-run-error" class="form-error hidden"></div>
+        <div class="dialog-actions"><button value="cancel" class="secondary-button" type="submit" formnovalidate>取消</button><button id="rename-run-submit" class="primary-button" value="default" type="submit">保存名称</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="new-task-dialog" class="app-dialog">
+      <form id="new-task-form" method="dialog">
+        <div class="dialog-header">
+          <div><span class="dialog-kicker">新建协作</span><h2>创建任务</h2></div>
+          <button class="dialog-close" value="cancel" aria-label="关闭" type="submit" formnovalidate>×</button>
+        </div>
+        <fieldset class="mode-selector">
+          <legend>协作模式</legend>
+          <label class="mode-option">
+            <input type="radio" name="task-mode" value="workflow" checked />
+            <span><strong>共识实施</strong><small>双方独立提案、交叉审核并形成统一方案，再由一个 Agent 实施。</small></span>
+          </label>
+          <label class="mode-option">
+            <input type="radio" name="task-mode" value="group_chat" />
+            <span><strong>群聊协作</strong><small>按 @ 决定响应者；使用“执行：”让一个指定 Agent 独占目标工作区写入，所有消息共享上下文。</small></span>
+          </label>
+        </fieldset>
+        <label id="task-input-field"><span id="task-input-label">目标与需求</span><textarea id="task-input" rows="6" required placeholder="描述需要 Claude Code 和 Codex 共同完成的任务…"></textarea></label>
+        <div id="document-drop-zone" class="document-drop-zone">
+          <input id="task-document-input" type="file" multiple accept=".pdf,.doc,.docx,.txt,.md,.rtf,.csv,.json,.html,.xml,.yaml,.yml,.odt,.xls,.xlsx,.ppt,.pptx" />
+          <label for="task-document-input">
+            <span class="document-upload-icon" aria-hidden="true">▧</span>
+            <span><strong>添加参考文档</strong><small>点击选择或拖放文件；最多 5 个，单个 10 MB，合计 20 MB</small></span>
+          </label>
+        </div>
+        <div id="selected-document-list" class="selected-document-list hidden" aria-live="polite"></div>
+        <div class="task-defaults">
+          <div><span>当前任务设置</span><strong id="task-defaults-summary">正在加载…</strong></div>
+          <button id="task-settings-button" class="secondary-button" type="button">调整设置</button>
+        </div>
+        <div id="form-error" class="form-error hidden"></div>
+        <div class="dialog-actions"><button value="cancel" class="secondary-button" type="submit" formnovalidate>取消</button><button id="task-submit" class="primary-button" value="default" type="submit">开始协作</button></div>
+      </form>
+    </dialog>
+
+    <dialog id="settings-dialog" class="app-dialog settings-dialog">
+      <form id="settings-form" method="dialog">
+        <div class="dialog-header settings-header">
+          <div><span class="dialog-kicker">项目配置</span><h2>设置</h2><small>保存到当前项目的 .multiagent.json；界面设置立即生效，任务流程设置影响之后启动的任务。</small></div>
+          <button class="dialog-close" value="cancel" aria-label="关闭" type="submit" formnovalidate>×</button>
+        </div>
+
+        <div class="settings-layout">
+          <nav class="settings-nav" aria-label="设置分类">
+            <button class="active" data-settings-tab="general" type="button">常规</button>
+            <button id="settings-workflow-tab" data-settings-tab="workflow" data-collaboration-only="workflow" type="button">协作流程</button>
+            <button data-settings-tab="agents" type="button">智能体</button>
+            <button id="settings-verification-tab" data-settings-tab="verification" data-collaboration-only="workflow" type="button">验证</button>
+            <button data-settings-tab="interface" type="button">界面</button>
+          </nav>
+
+          <div class="settings-content">
+            <section class="settings-panel" data-settings-panel="general">
+              <h3>常规</h3>
+              <p>选择任务工作区和默认协作方式；切换模式后只显示真正会生效的选项。</p>
+              <label>
+                <span>默认工作区</span>
+                <div class="workspace-picker-row"><input id="settings-workspace" type="text" required /><button id="settings-workspace-browse" class="secondary-button" type="button">选择…</button></div>
+              </label>
+              <div id="settings-workspace-browser" class="workspace-browser hidden">
+                <div class="workspace-browser-header">
+                  <button id="settings-workspace-parent" class="secondary-button" type="button">↑ 上一级</button>
+                  <strong id="settings-workspace-current"></strong>
+                </div>
+                <div id="settings-workspace-shortcuts" class="workspace-shortcuts"></div>
+                <div id="settings-workspace-list" class="workspace-directory-list" role="listbox" aria-label="目录"></div>
+                <small id="settings-workspace-browser-note"></small>
+                <div class="workspace-browser-actions"><button id="settings-workspace-close" class="secondary-button" type="button">关闭</button><button id="settings-workspace-select" class="primary-button" type="button">选择当前文件夹</button></div>
+              </div>
+              <label><span>默认协作模式</span><select id="settings-collaboration-mode"><option value="workflow">共识实施</option><option value="group_chat">群聊协作</option></select></label>
+              <div data-collaboration-only="workflow">
+                <label><span>执行协调者</span><select id="settings-executor"><option value="claude">Claude Code</option><option value="codex">Codex</option></select></label>
+                <div class="settings-switches">
+                  <label class="setting-switch"><input id="settings-planning-collaboration" type="checkbox" /><span><strong>双方方案协作</strong><small>双方独立提案、交叉审核并整合统一方案。</small></span></label>
+                  <label class="setting-switch"><input id="settings-consensus" type="checkbox" /><span><strong>证据化共识</strong><small>轮换修订与审核，直到双方批准同一版本或达到轮次上限。</small></span></label>
+                  <label class="setting-switch"><input id="settings-plan-approval" type="checkbox" /><span><strong>执行前人工确认</strong><small>统一方案完成后，等待你执行、修订、导出或取消。</small></span></label>
+                </div>
+              </div>
+              <div class="hidden" data-collaboration-only="group_chat">
+                <label><span>未点名时响应者</span><select id="settings-group-chat-default-agent"><option value="both">Claude Code + Codex</option><option value="claude">仅 Claude Code</option><option value="codex">仅 Codex</option></select></label>
+                <div class="settings-switches">
+                  <label class="setting-switch"><input id="settings-group-chat-execution" type="checkbox" /><span><strong>允许执行指令</strong><small>识别“执行：”或 /exec 指令，并把目标工作区写权限交给一个被点名的 Agent。</small></span></label>
+                  <div class="setting-switch setting-static"><span class="setting-static-icon">@</span><span><strong>点名路由</strong><small>@Claude（Claude Code）、@Codex 或 @all 会覆盖上面的默认响应者。</small></span></div>
+                  <div class="setting-switch setting-static"><span class="setting-static-icon">1</span><span><strong>单写入者</strong><small>普通消息只读；执行直接修改目标工作区，@all 执行会被拒绝。</small></span></div>
+                </div>
+              </div>
+            </section>
+
+            <section class="settings-panel hidden" data-settings-panel="workflow" data-collaboration-only="workflow">
+              <h3>协作流程</h3>
+              <p>控制方案协商、人工修订和代码审核的上限。</p>
+              <div class="settings-number-grid">
+                <label><span>最大共识审核轮次</span><input id="settings-max-consensus-rounds" type="number" min="1" step="1" required /></label>
+                <label><span>最大人工修订次数</span><input id="settings-max-plan-revisions" type="number" min="0" step="1" required /></label>
+                <label><span>代码审核轮次</span><input id="settings-review-rounds" type="number" min="0" step="1" required /></label>
+              </div>
+              <label class="setting-switch"><input id="settings-final-review" type="checkbox" /><span><strong>最终审核</strong><small>最后一次代码修订后，再执行一次结构化审核。</small></span></label>
+            </section>
+
+            <section class="settings-panel hidden" data-settings-panel="agents">
+              <h3>智能体</h3>
+              <p>一个 Token API Key 同时供 Claude Code 和 Codex CLI 使用；Key 只保存在本机私密状态目录。</p>
+              <article class="settings-card token-api-card">
+                <div class="token-api-heading">
+                  <div><h4>公司 Token API</h4><small id="settings-token-api-status">尚未配置 API Key</small></div>
+                  <label class="inline-switch"><input id="settings-token-api-enabled" type="checkbox" /><span>启用</span></label>
+                </div>
+                <div class="settings-number-grid">
+                  <label><span>服务地址</span><input id="settings-token-api-base-url" type="url" placeholder="https://tokencheap.io" /></label>
+                  <label><span>API Key</span><input id="settings-token-api-key" type="password" autocomplete="new-password" placeholder="输入新 Key；已保存时可留空" /></label>
+                </div>
+                <small>不会写入工作区的 .multiagent.json、任务快照或命令参数；也不会由设置接口回显。</small>
+              </article>
+              <div class="agent-settings-grid">
+                <article class="settings-card">
+                  <h4>Claude Code / Agent A</h4>
+                  <div class="model-picker">
+                    <span class="field-label">模型优先顺序</span>
+                    <div class="model-picker-row"><select id="settings-claude-model-add" aria-label="选择 Claude Code 模型"></select><button class="secondary-button" data-add-model="claude" type="button">添加</button></div>
+                    <div class="model-picker-row"><input id="settings-claude-custom-model" type="text" placeholder="自定义模型名" /><button class="secondary-button" data-add-custom-model="claude" type="button">添加自定义</button></div>
+                    <ol id="settings-claude-model-order" class="model-order-list" aria-label="Claude Code 模型优先顺序"></ol>
+                    <small>拖动模型或使用上移/下移调整顺序；第一个是首选，列表为空时使用 Claude Code 默认模型。</small>
+                  </div>
+                  <label class="setting-switch compact-setting-switch"><input id="settings-claude-fallback" type="checkbox" /><span><strong>超时自动切换</strong><small>每个候选模型使用下方的单次超时。</small></span></label>
+                  <label><span>单次调用超时（秒）</span><input id="settings-claude-timeout" type="number" min="1" step="1" required /></label>
+                  <label><span>CLI 命令</span><input id="settings-claude-command" type="text" placeholder="自动发现 claude" /></label>
+                  <label><span>附加参数（每行一个）</span><textarea id="settings-claude-extra-args" rows="3"></textarea></label>
+                </article>
+                <article class="settings-card">
+                  <h4>Codex / Agent B</h4>
+                  <div class="model-picker">
+                    <span class="field-label">模型优先顺序</span>
+                    <div class="model-picker-row"><select id="settings-codex-model-add" aria-label="选择 Codex 模型"></select><button class="secondary-button" data-add-model="codex" type="button">添加</button></div>
+                    <div class="model-picker-row"><input id="settings-codex-custom-model" type="text" placeholder="自定义模型名" /><button class="secondary-button" data-add-custom-model="codex" type="button">添加自定义</button></div>
+                    <ol id="settings-codex-model-order" class="model-order-list" aria-label="Codex 模型优先顺序"></ol>
+                    <small>拖动模型或使用上移/下移调整顺序；第一个是首选，列表为空时使用 Codex CLI 默认模型。</small>
+                  </div>
+                  <label class="setting-switch compact-setting-switch"><input id="settings-codex-fallback" type="checkbox" /><span><strong>超时自动切换</strong><small>每个候选模型使用下方的单次超时。</small></span></label>
+                  <label><span>单次调用超时（秒）</span><input id="settings-codex-timeout" type="number" min="1" step="1" required /></label>
+                  <label><span>CLI 命令</span><input id="settings-codex-command" type="text" placeholder="自动发现 codex" /></label>
+                  <label><span>附加参数（每行一个）</span><textarea id="settings-codex-extra-args" rows="3"></textarea></label>
+                </article>
+              </div>
+              <div class="agent-settings-grid identity-settings-grid">
+                <article class="settings-card">
+                  <h4>共识实施身份</h4>
+                  <p>只用于独立提案、交叉审核、统一方案和实施流程。</p>
+                  <label><span>Claude Code 身份提示词</span><textarea id="settings-agent-a-identity" rows="7" required></textarea></label>
+                  <label><span>Codex 身份提示词</span><textarea id="settings-agent-b-identity" rows="7" required></textarea></label>
+                </article>
+                <article class="settings-card">
+                  <h4>群聊身份</h4>
+                  <p>只用于群聊协作；@ 路由、只读讨论和单写入者执行规则保持独立生效。</p>
+                  <label><span>Claude Code 群聊身份提示词</span><textarea id="settings-group-chat-agent-a-identity" rows="7" required></textarea></label>
+                  <label><span>Codex 群聊身份提示词</span><textarea id="settings-group-chat-agent-b-identity" rows="7" required></textarea></label>
+                </article>
+              </div>
+              <div class="settings-security-note">安全说明：仅把 Key 作为子进程环境变量传给 Claude Code/Codex；界面只显示是否已配置和末四位。</div>
+            </section>
+
+            <section class="settings-panel hidden" data-settings-panel="verification" data-collaboration-only="workflow">
+              <h3>确定性验证</h3>
+              <p>命令不经过 shell；复杂验证请放到项目脚本中再调用。</p>
+              <label><span>默认超时（秒）</span><input id="settings-verification-timeout" type="number" min="1" step="1" required /></label>
+              <label><span>验证命令（JSON 数组）</span><textarea id="settings-verification-commands" class="mono-input" rows="14" spellcheck="false" placeholder='[{"name":"unit-tests","command":["python3","-m","unittest"]}]'></textarea></label>
+            </section>
+
+            <section class="settings-panel hidden" data-settings-panel="interface">
+              <h3>界面</h3>
+              <p>主题、归档显示和侧栏密度切换后立即应用并保存。</p>
+              <fieldset class="theme-selector">
+                <legend>视觉主题</legend>
+                <label class="theme-option theme-option-paper">
+                  <input type="radio" name="settings-theme" value="paper" />
+                  <span class="theme-preview" aria-hidden="true"><i></i><i></i><i></i></span>
+                  <span><strong>协作纸张</strong><small>暖黄纸面、硬边框与鲜明协作色</small></span>
+                </label>
+                <label class="theme-option theme-option-ocean">
+                  <input type="radio" name="settings-theme" value="ocean" />
+                  <span class="theme-preview" aria-hidden="true"><i></i><i></i><i></i></span>
+                  <span><strong>深海终端</strong><small>深蓝控制台、青绿信号与低光环境</small></span>
+                </label>
+                <label class="theme-option theme-option-graphite">
+                  <input type="radio" name="settings-theme" value="graphite" />
+                  <span class="theme-preview" aria-hidden="true"><i></i><i></i><i></i></span>
+                  <span><strong>石墨专业</strong><small>冷灰界面、蓝色焦点与轻量层级</small></span>
+                </label>
+                <label class="theme-option theme-option-botanical">
+                  <input type="radio" name="settings-theme" value="botanical" />
+                  <span class="theme-preview" aria-hidden="true"><i></i><i></i><i></i></span>
+                  <span><strong>植物工作室</strong><small>鼠尾草绿、自然纸色与柔和卡片</small></span>
+                </label>
+              </fieldset>
+              <div class="settings-switches">
+                <label class="setting-switch"><input id="settings-show-archived" type="checkbox" /><span><strong>默认展开已归档</strong><small>打开或刷新页面时展示归档任务。</small></span></label>
+                <label class="setting-switch"><input id="settings-compact-sidebar" type="checkbox" /><span><strong>紧凑侧栏</strong><small>缩小任务卡片间距，一屏显示更多任务。</small></span></label>
+              </div>
+              <div class="settings-service-control">
+                <span><strong>本地 Web 服务</strong><small>关闭后 Agent 任务记录仍会保留，下次使用桌面启动器即可重新打开。</small></span>
+                <button id="shutdown-ui-button" class="danger-button" type="button">关闭服务</button>
+              </div>
+              <div class="settings-license">界面参考 Slark（MIT）。<a href="./slark-license.txt" target="_blank" rel="noreferrer">查看署名与许可证</a></div>
+            </section>
+          </div>
+        </div>
+
+        <div id="settings-error" class="form-error hidden"></div>
+        <div class="settings-footer">
+          <small id="settings-save-path">尚未加载保存位置</small>
+          <div><button id="settings-reset-button" class="secondary-button" type="button">恢复默认值</button><button value="cancel" class="secondary-button" type="submit" formnovalidate>取消</button><button id="settings-submit" class="primary-button" value="default" type="submit">保存设置</button></div>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="feedback-dialog" class="app-dialog compact-dialog">
+      <form id="feedback-form" method="dialog">
+        <div class="dialog-header">
+          <div><span class="dialog-kicker">方案反馈</span><h2 id="feedback-title">提出修订要求</h2></div>
+          <button class="dialog-close" value="cancel" aria-label="关闭" type="submit" formnovalidate>×</button>
+        </div>
+        <label id="target-agent-field" class="hidden"><span>目标智能体</span><select id="target-agent-input"><option value="claude">Claude Code</option><option value="codex">Codex</option></select></label>
+        <label><span>修订要求</span><textarea id="feedback-input" rows="5" required placeholder="写清需要调整的内容和验收标准…"></textarea></label>
+        <div id="feedback-error" class="form-error hidden"></div>
+        <div class="dialog-actions"><button value="cancel" class="secondary-button" type="submit" formnovalidate>返回</button><button id="feedback-submit" class="primary-button" value="default" type="submit">发送要求</button></div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast hidden" role="status"></div>
+  </body>
+</html>

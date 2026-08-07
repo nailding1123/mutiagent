@@ -5,9 +5,20 @@ import re
 from dataclasses import dataclass, field
 
 
-CONSENSUS_PROTOCOL = "mutiagent.consensus.v1"
-EVIDENCE_CONSENSUS_PROTOCOL = "mutiagent.consensus.v2"
-SUPPORTED_CONSENSUS_PROTOCOLS = (EVIDENCE_CONSENSUS_PROTOCOL, CONSENSUS_PROTOCOL)
+CONSENSUS_PROTOCOL = "multiagent.consensus.v1"
+EVIDENCE_CONSENSUS_PROTOCOL = "multiagent.consensus.v2"
+LEGACY_CONSENSUS_PROTOCOL = "mutiagent.consensus.v1"
+LEGACY_EVIDENCE_CONSENSUS_PROTOCOL = "mutiagent.consensus.v2"
+EVIDENCE_CONSENSUS_PROTOCOLS = (
+    EVIDENCE_CONSENSUS_PROTOCOL,
+    LEGACY_EVIDENCE_CONSENSUS_PROTOCOL,
+)
+SUPPORTED_CONSENSUS_PROTOCOLS = (
+    EVIDENCE_CONSENSUS_PROTOCOL,
+    CONSENSUS_PROTOCOL,
+    LEGACY_EVIDENCE_CONSENSUS_PROTOCOL,
+    LEGACY_CONSENSUS_PROTOCOL,
+)
 CONSENSUS_CRITERIA = (
     "requirements",
     "architecture",
@@ -40,7 +51,7 @@ class ConsensusDecision:
                 self.criteria.get(name) is True for name in CONSENSUS_CRITERIA
             ):
                 return False
-            if self.protocol == EVIDENCE_CONSENSUS_PROTOCOL:
+            if self.protocol in EVIDENCE_CONSENSUS_PROTOCOLS:
                 if not self.requirements:
                     return False
                 if any(
@@ -123,7 +134,7 @@ def parse_consensus_decision(text: str) -> ConsensusDecision:
     proposal_version = data.get("proposal_version", 1)
     requirements: tuple[ConsensusRequirement, ...] = ()
     issues: tuple[ConsensusIssue, ...] = ()
-    if protocol == EVIDENCE_CONSENSUS_PROTOCOL:
+    if protocol in EVIDENCE_CONSENSUS_PROTOCOLS:
         if (
             isinstance(proposal_version, bool)
             or not isinstance(proposal_version, int)

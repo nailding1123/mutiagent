@@ -1,7 +1,10 @@
-# MutiAgent local configuration and state
+# MultiAgent local configuration and state
 # These files may contain API keys, local executable paths, model names, or task data.
 /agents.json
 /bridge.json
+/.multiagent.json
+/.multiagent/
+# Legacy misspelled paths remain ignored for compatibility.
 /.mutiagent.json
 /.mutiagent/
 /.agents/

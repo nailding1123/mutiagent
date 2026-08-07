@@ -162,8 +162,8 @@ def _mode(settings: dict[str, Any]) -> str:
     if settings.get("consensus") is True:
         return "consensus"
     review_rounds = settings.get("review_rounds")
-    requirement_review = settings.get("requirement_review") is True
-    if requirement_review or (
+    planning_collaboration = settings.get("planning_collaboration") is True
+    if planning_collaboration or (
         isinstance(review_rounds, int)
         and not isinstance(review_rounds, bool)
         and review_rounds > 0

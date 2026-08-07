@@ -10,7 +10,15 @@ from .consensus import ConsensusDecision
 
 
 TASK_STATUSES = {"pending", "in_progress", "blocked", "done", "failed", "skipped"}
-MESSAGE_KINDS = {"proposal", "analysis", "review", "revision", "evidence", "status"}
+MESSAGE_KINDS = {
+    "proposal",
+    "analysis",
+    "instruction",
+    "review",
+    "revision",
+    "evidence",
+    "status",
+}
 
 
 @dataclass
@@ -166,20 +174,69 @@ class CollaborationState:
     requirements: dict[str, RequirementRecord] = field(default_factory=dict)
     issues: dict[str, DisputeRecord] = field(default_factory=dict)
     accepted: bool = False
+    proposal_digest: str = ""
+    approvals: dict[str, str] = field(default_factory=dict)
 
     @classmethod
-    def create(cls, *, lead: str, reviewer: str, requirement_review: bool) -> "CollaborationState":
+    def create(
+        cls,
+        *,
+        agent_a: str,
+        agent_b: str,
+        planning_collaboration: bool,
+        executor: str,
+    ) -> "CollaborationState":
         state = cls()
-        if requirement_review:
-            state.add_task("plan", "提出只读实施方案", lead, phase="proposal")
+        if planning_collaboration:
+            state.add_task("plan", "Agent A 独立提出方案", agent_a, phase="proposal_a")
             state.add_task(
-                "requirements", "独立解析需求与风险", reviewer, phase="requirements"
+                "requirements", "Agent B 独立提出方案", agent_b, phase="proposal_b"
             )
-            state.add_task("plan-review", "比较并审查方案", reviewer, phase="plan_review")
-        state.add_task("implementation", "实施确认后的方案", lead, phase="implementation")
+            state.add_task(
+                "cross-review-a", "Agent A 审核 Agent B 方案", agent_a, phase="cross_review"
+            )
+            state.add_task(
+                "cross-review-b", "Agent B 审核 Agent A 方案", agent_b, phase="cross_review"
+            )
+            state.add_task(
+                "unified-plan", "整合双方统一方案", "both", phase="unified_plan"
+            )
+            state.add_task(
+                "plan-review", "双方确认同一方案版本", "both", phase="consensus"
+            )
+        state.add_task(
+            "implementation", "按统一方案实施", executor, phase="implementation"
+        )
         state.add_task("verification", "运行独立验证", "bridge", phase="verification")
-        state.add_task("code-review", "验收代码与验证证据", reviewer, phase="review")
+        validator = agent_b if executor == agent_a else agent_a
+        state.add_task("code-review", "对等 Agent 验收实现与证据", validator, phase="review")
         return state
+
+    def set_canonical_proposal(
+        self,
+        text: str,
+        *,
+        author: str,
+        version: int,
+    ) -> str:
+        digest = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+        self.proposal_version = version
+        self.proposal_digest = digest
+        self.approvals = {author: digest}
+        self.accepted = False
+        return digest
+
+    def approve_canonical(self, agent: str, text: str) -> bool:
+        digest = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+        if not self.proposal_digest or digest != self.proposal_digest:
+            return False
+        self.approvals[agent] = digest
+        return True
+
+    def has_unanimous_approval(self, agents: set[str]) -> bool:
+        return bool(self.proposal_digest) and all(
+            self.approvals.get(agent) == self.proposal_digest for agent in agents
+        )
 
     def add_task(
         self, task_id: str, title: str, owner: str, *, phase: str = ""
@@ -267,8 +324,8 @@ class CollaborationState:
                 if issue.id.startswith("CODE-") and issue.status == "open":
                     issue.status = "resolved"
                     issue.resolution = "后续结构化代码验收已通过"
-                    if "reviewer approval" not in issue.evidence:
-                        issue.evidence.append("reviewer approval")
+                    if "validator approval" not in issue.evidence:
+                        issue.evidence.append("validator approval")
                     issue.last_seen_round = round_index
             return
         for finding in decision.findings:
@@ -303,6 +360,8 @@ class CollaborationState:
         lines = [
             f"proposal_version: {self.proposal_version}",
             f"consensus_round: {self.consensus_round}",
+            f"proposal_digest: {self.proposal_digest[:12] or 'none'}",
+            f"approvals: {', '.join(sorted(self.approvals)) or 'none'}",
             "tasks:",
         ]
         for task in self.tasks.values():
@@ -338,6 +397,8 @@ class CollaborationState:
             "proposal_version": self.proposal_version,
             "consensus_round": self.consensus_round,
             "accepted": self.accepted,
+            "proposal_digest": self.proposal_digest,
+            "approvals": dict(self.approvals),
             "tasks": [task.to_dict() for task in self.tasks.values()],
             "messages": [message.to_dict() for message in self.messages],
             "requirements": [
@@ -354,7 +415,19 @@ class CollaborationState:
             proposal_version=_integer(data.get("proposal_version")),
             consensus_round=_integer(data.get("consensus_round")),
             accepted=data.get("accepted") is True,
+            proposal_digest=_text(data.get("proposal_digest")),
         )
+        approvals = data.get("approvals", {})
+        if not isinstance(approvals, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in approvals.items()
+        ):
+            return None
+        state.approvals = {
+            key.strip(): value.strip()
+            for key, value in approvals.items()
+            if key.strip() and value.strip()
+        }
         tasks = data.get("tasks", [])
         messages = data.get("messages", [])
         requirements = data.get("requirements", [])

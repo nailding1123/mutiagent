@@ -60,6 +60,63 @@ class ConsensusDecisionTests(unittest.TestCase):
         self.assertTrue(decision.accepted)
         self.assertFalse(decision.structured)
 
+    def test_legacy_misspelled_protocol_remains_compatible(self) -> None:
+        decision = parse_consensus_decision(
+            json.dumps(
+                {
+                    "protocol": "mutiagent.consensus.v1",
+                    "verdict": "accept",
+                    "criteria": {
+                        "requirements": True,
+                        "architecture": True,
+                        "failure_paths": True,
+                        "compatibility": True,
+                        "testing": True,
+                    },
+                    "agreements": [],
+                    "remaining_disagreements": [],
+                    "required_revisions": [],
+                }
+            )
+        )
+
+        self.assertTrue(decision.valid)
+        self.assertTrue(decision.accepted)
+
+    def test_legacy_evidence_protocol_keeps_evidence_semantics(self) -> None:
+        decision = parse_consensus_decision(
+            json.dumps(
+                {
+                    "protocol": "mutiagent.consensus.v2",
+                    "proposal_version": 1,
+                    "verdict": "accept",
+                    "criteria": {
+                        "requirements": True,
+                        "architecture": True,
+                        "failure_paths": True,
+                        "compatibility": True,
+                        "testing": True,
+                    },
+                    "requirements": [
+                        {
+                            "id": "REQ-001",
+                            "text": "保持兼容",
+                            "covered": True,
+                            "evidence": ["tests/test_api.py"],
+                        }
+                    ],
+                    "issues": [],
+                    "agreements": [],
+                    "remaining_disagreements": [],
+                    "required_revisions": [],
+                }
+            )
+        )
+
+        self.assertTrue(decision.valid)
+        self.assertTrue(decision.accepted)
+        self.assertEqual(decision.requirements[0].id, "REQ-001")
+
 
 if __name__ == "__main__":
     unittest.main()

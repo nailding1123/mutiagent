@@ -11,7 +11,7 @@ class QualityTests(unittest.TestCase):
             {
                 "status": "complete",
                 "approved": True,
-                "settings": {"review_rounds": 0, "requirement_review": False},
+                "settings": {"review_rounds": 0, "planning_collaboration": False},
                 "summary": {"input_tokens": 100, "output_tokens": 20, "elapsed_seconds": 10},
                 "quality": {"verification_passed": 1, "verification_total": 1},
             },

@@ -1,0 +1,17 @@
+#!/bin/sh
+
+SCRIPT_PATH=$0
+while [ -L "$SCRIPT_PATH" ]; do
+    LINK_DIR=$(CDPATH= cd -P -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+    LINK_TARGET=$(readlink "$SCRIPT_PATH")
+    case "$LINK_TARGET" in
+        /*) SCRIPT_PATH=$LINK_TARGET ;;
+        *) SCRIPT_PATH=$LINK_DIR/$LINK_TARGET ;;
+    esac
+done
+
+SCRIPT_DIR=$(CDPATH= cd -P -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+PROJECT_DIR=$(dirname -- "$SCRIPT_DIR")
+
+export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python3 -m multiagent_cli "$@"
