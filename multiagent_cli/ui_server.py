@@ -4,7 +4,6 @@ import base64
 import binascii
 import errno
 import hashlib
-import io
 import json
 import os
 import queue
@@ -23,7 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import URLError
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from . import __version__
@@ -34,15 +33,13 @@ from .bridge_config import (
     resolve_bridge_settings,
 )
 from .bridge_models import (
-    DEFAULT_AGENT_A_IDENTITY,
-    DEFAULT_AGENT_B_IDENTITY,
     DEFAULT_GROUP_CHAT_AGENT_A_IDENTITY,
     DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY,
     AgentEvent,
-    AgentRunResult,
-    PlanDecision,
+    BridgeError,
+    NativeInteractionRequest,
+    NativeInteractionResponse,
 )
-from .renderer import ConsoleRenderer
 from .group_chat import GroupChatEngine
 from .run_store import RUN_ID_RE, RunStore
 from .token_api import (
@@ -54,12 +51,37 @@ from .token_api import (
 
 MAX_REQUEST_BYTES = 30_000_000
 MAX_UPLOAD_FILES = 5
+# Per-message uploads stay capped at MAX_UPLOAD_FILES, but a group chat
+# accumulates attachments over many turns. Reading the record back must not
+# re-apply the per-message cap: an attachment missing from the record can no
+# longer be downloaded, so trimming to 5 would make an image you just sent
+# unreachable after your next message. Bound the run instead, keeping the most
+# recent uploads.
+MAX_RUN_ATTACHMENTS = 50
 MAX_UPLOAD_FILE_BYTES = 10_000_000
 MAX_UPLOAD_TOTAL_BYTES = 20_000_000
 MAX_RUN_TITLE_CHARS = 200
 MAX_SESSION_EVENTS = 240
 MAX_RETAINED_SESSIONS = 50
-ACTIVE_STATUSES = {"starting", "running", "awaiting_plan", "stopping"}
+# 持久化到 run record 的公开活动事件上限。
+MAX_RECORD_EVENTS = 500
+# 不持久化 progress 原文，避免把模型输出全文写进记录。
+TIMELINE_EVENT_KINDS = {
+    "lifecycle",
+    "tool",
+    "tool_result",
+    "warning",
+    "error",
+    "metric",
+    "interaction_request",
+    "interaction_response",
+}
+ACTIVE_STATUSES = {
+    "starting",
+    "running",
+    "awaiting_interaction",
+    "stopping",
+}
 UI_THEMES = {"paper", "ocean", "graphite", "botanical"}
 PROJECT_CONFIG_NAME = ".multiagent.json"
 DOCUMENT_EXTENSIONS = {
@@ -80,6 +102,27 @@ DOCUMENT_EXTENSIONS = {
     ".xml",
     ".yaml",
     ".yml",
+}
+# Raster images only. SVG is deliberately excluded: served inline it would be
+# an HTML/XML document under our origin, i.e. a stored-XSS vector.
+IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".webp",
+}
+UPLOAD_EXTENSIONS = DOCUMENT_EXTENSIONS | IMAGE_EXTENSIONS
+# Served inline only when the extension implies a safe raster type; the stored
+# content_type is uploader-controlled and must never be trusted for rendering.
+INLINE_IMAGE_TYPES = {
+    ".bmp": "image/bmp",
+    ".gif": "image/gif",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
 }
 
 
@@ -107,38 +150,47 @@ class UISession:
         run_id: str,
         task: str,
         workspace: Path,
-        executor: str,
-        consensus: bool,
-        notify: Callable[[str, str], None],
-        collaboration_mode: str = "workflow",
+        notify: Callable[..., None],
         agent_task: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
         group_chat: object = None,
+        stream_gate: Callable[[], bool] | None = None,
     ) -> None:
         self.id = run_id
         self.task = task
         self.agent_task = agent_task or task
         self.attachments = list(attachments or [])
         self.workspace = workspace
-        self.executor = executor
-        self.consensus = consensus
-        self.collaboration_mode = collaboration_mode
         self.status = "starting"
         self.error = ""
-        self.document = ""
         self.exit_code: int | None = None
         self.started_at = _timestamp()
         self.updated_at = self.started_at
         self.events: list[dict[str, Any]] = []
         self.agent_events: dict[str, dict[str, Any]] = {}
-        self.plan: dict[str, Any] | None = None
         self.group_chat = dict(group_chat) if isinstance(group_chat, dict) else None
         self._chat_engine: GroupChatEngine | None = None
-        self._pending_decision: PlanDecision | None = None
+        self._native_interactions: dict[str, dict[str, Any]] = {}
+        self._native_responses: dict[str, NativeInteractionResponse] = {}
         self._stop_requested = False
         self._stop_handler: Callable[[], None] | None = None
         self._condition = threading.Condition()
         self._notify = notify
+        self._record_events: Callable[[AgentEvent], None] | None = None
+        # 每个 agent 已经推送过的原文，用于把「全量重发」换算成增量
+        self._stream_sent: dict[str, str] = {}
+        self._stream_gate = stream_gate
+        self._active_chat_turns: set[str] = set()
+
+    def bind_record_persistence(self, persist: Callable[[AgentEvent], None]) -> None:
+        """Attach the store-backed timeline writer for this session.
+
+        Group-chat turns never pass through ``cli._handle_run_event``, so
+        without this hook their timeline lives only in memory and disappears
+        when the server restarts or the session is evicted.
+        """
+
+        self._record_events = persist
 
     def bind_stop_handler(self, handler: Callable[[], None]) -> None:
         with self._condition:
@@ -165,18 +217,24 @@ class UISession:
     def chat_requires_restore(self) -> bool:
         """Return whether stopped adapters must be recreated before another turn."""
         with self._condition:
-            return self.collaboration_mode == "group_chat" and self._stop_requested
+            return self._stop_requested
 
-    def begin_chat_turn(self) -> None:
+    def has_active_chat_turns(self) -> bool:
         with self._condition:
-            if self.collaboration_mode != "group_chat":
-                raise UIError("当前对话不是群聊协作模式")
-            if self.status in ACTIVE_STATUSES and self.status != "starting":
-                raise UIError("上一条群聊消息仍在处理中")
+            return bool(self._active_chat_turns)
+
+    def begin_chat_turn(self, token: str | None = None) -> str:
+        with self._condition:
+            if self._stop_requested:
+                raise UIError("当前群聊正在停止，暂时不能发送新消息")
+            token = token or f"chat-{len(self._active_chat_turns) + 1}-{time.monotonic_ns()}"
+            self._active_chat_turns.add(token)
             self.status = "running"
             self.error = ""
             self.updated_at = _timestamp()
+            self._stream_sent.clear()
         self._notify("chat_turn", self.id)
+        return token
 
     def finish_chat_turn(
         self,
@@ -184,13 +242,19 @@ class UISession:
         state: dict[str, Any],
         error: str = "",
         status: str = "ready",
+        token: str | None = None,
     ) -> None:
         with self._condition:
             self.group_chat = state
-            self.status = status
-            self.error = error
-            self.exit_code = 0 if status == "ready" else 1
+            if token is not None:
+                self._active_chat_turns.discard(token)
+            active = bool(self._active_chat_turns or self._native_interactions)
+            self.status = "running" if active else status
+            self.error = "" if active else error
+            self.exit_code = None if active else (0 if status == "ready" else 1)
             self.updated_at = _timestamp()
+            if not active:
+                self._stream_sent.clear()
         self._notify("chat_message", self.id)
 
     def request_stop(self) -> None:
@@ -202,130 +266,203 @@ class UISession:
             self._stop_requested = True
             self.status = "stopping"
             self.updated_at = _timestamp()
-            if self.plan is not None:
-                self._pending_decision = PlanDecision("interrupt")
-                self._condition.notify_all()
+            for interaction_id in self._native_interactions:
+                self._native_responses.setdefault(
+                    interaction_id,
+                    NativeInteractionResponse("cancel"),
+                )
+            self._condition.notify_all()
             handler = self._stop_handler
         if handler is not None:
             handler()
         self._notify("stopping", self.id)
 
     def on_event(self, event: AgentEvent) -> None:
-        safe = event.to_dict(safe=True)
+        safe = event.to_dict(safe=True, include_activity=True)
         with self._condition:
-            self.events.append(safe)
+            if (
+                event.kind == "progress"
+                and self.events
+                and self.events[-1].get("kind") == "progress"
+                and self.events[-1].get("source") == safe.get("source")
+                and self.events[-1].get("step_id") == safe.get("step_id")
+            ):
+                # Providers frequently resend the whole current response block.
+                # Keep one compact public progress row; raw deltas use the
+                # separate transient SSE channel below.
+                self.events[-1] = safe
+            else:
+                self.events.append(safe)
             del self.events[:-MAX_SESSION_EVENTS]
             key = _agent_key(event.source)
             if key:
                 self.agent_events[key] = safe
-            if self.status not in {"awaiting_plan", "stopping"}:
+            # Whitelist, not blacklist: adapter subprocesses may flush one last
+            # progress event after a turn has finished. A late event must not
+            # move a ready/failed/interrupted session back to running.
+            if self.status in {"starting", "running"}:
                 self.status = "running"
             self.updated_at = _timestamp()
+        persist = self._record_events
+        if persist is not None:
+            try:
+                persist(event)
+            except Exception:
+                # Persistence must never interrupt the active agent turn.
+                pass
+        delta = self._stream_delta(event, safe)
+        if delta:
+            self._notify(
+                "event",
+                self.id,
+                {
+                    "stream_text": delta,
+                    "source": event.source,
+                    "step_id": event.step_id,
+                },
+            )
+            return
         self._notify("event", self.id)
 
-    def wait_for_plan(
-        self,
-        proposal_a: AgentRunResult,
-        proposal_b: AgentRunResult,
-        cross_reviews: tuple[AgentRunResult, ...],
-        unified: AgentRunResult,
-        review: AgentRunResult | None,
-        revision_count: int,
-        *,
-        on_export: Callable[[], Path],
-    ) -> PlanDecision:
-        payload = {
-            "proposal_a": _result_payload(proposal_a),
-            "proposal_b": _result_payload(proposal_b),
-            "cross_reviews": [_result_payload(item) for item in cross_reviews],
-            "unified_proposal": _result_payload(unified),
-            "consensus_review": _result_payload(review) if review else None,
-            "revision_count": revision_count,
-        }
+    def _stream_delta(self, event: AgentEvent, safe: dict[str, Any]) -> str:
+        """Return the unsent tail of this event's raw model text.
+
+        Both CLI parsers re-emit the *whole* current block on every update
+        (Codex sends ``agent_message`` twice, on ``item.updated`` and again on
+        ``item.completed``), so forwarding the raw text would duplicate it in
+        the browser.  The session therefore tracks what each agent has already
+        streamed and publishes only the increment.  Raw text is transient: it
+        goes out over SSE but is never written to the run record.
+        """
+
+        gate = self._stream_gate
+        if gate is None:
+            return ""
+        try:
+            if not gate():
+                return ""
+        except Exception:
+            return ""
+        raw = event.to_dict(safe=True, allow_stream=True).get("text") or ""
+        # If opting into the stream channel changed nothing, this kind is not a
+        # streaming kind. Deriving it this way keeps the privacy policy in
+        # bridge_models instead of duplicating its kind list here.
+        if not raw or raw == (safe.get("text") or ""):
+            return ""
+        key = event.step_id or _agent_key(event.source) or event.source
         with self._condition:
-            self.plan = payload
-            self.status = "awaiting_plan"
+            previous = self._stream_sent.get(key, "")
+            if raw == previous:
+                return ""
+            if previous and raw.startswith(previous):
+                delta = raw[len(previous):]
+            else:
+                # A genuinely new block: keep it readable instead of glued to
+                # the previous one.
+                delta = f"\n\n{raw}" if previous else raw
+            if not delta:
+                return ""
+            self._stream_sent[key] = previous + delta
+            return delta
+
+    def wait_for_native_interaction(
+        self,
+        request: NativeInteractionRequest,
+    ) -> NativeInteractionResponse:
+        """Expose one native request and block only the Agent that issued it."""
+
+        interaction_id = secrets.token_urlsafe(12)
+        public_request = request.to_dict()
+        # Native request ids are provider-local and can collide across Agents.
+        # The browser receives a fresh opaque id; the adapter retains the
+        # provider id in its own stack when translating the response.
+        public_request["id"] = interaction_id
+        with self._condition:
+            if self._stop_requested:
+                return NativeInteractionResponse("cancel")
+            self._native_interactions[interaction_id] = public_request
+            if self.status != "stopping" and len(self._active_chat_turns) <= 1:
+                self.status = "awaiting_interaction"
             self.updated_at = _timestamp()
-            self._pending_decision = None
-        self._notify("plan", self.id)
+        self._notify("native_interaction", self.id, {"interaction_id": interaction_id})
 
-        while True:
-            with self._condition:
-                while self._pending_decision is None:
-                    self._condition.wait(timeout=15)
-                decision = self._pending_decision
-                self._pending_decision = None
-
-            if decision.action == "export":
-                try:
-                    path = on_export()
-                except OSError as exc:
-                    with self._condition:
-                        self.error = f"技术文档导出失败：{exc}"
-                        self.updated_at = _timestamp()
-                else:
-                    with self._condition:
-                        self.document = str(path)
-                        self.error = ""
-                        self.updated_at = _timestamp()
-                self._notify("document", self.id)
-                continue
-
-            with self._condition:
-                self.plan = None
-                self.status = (
-                    "stopping" if decision.action == "interrupt" else "running"
-                )
-                self.updated_at = _timestamp()
-            self._notify("plan_decision", self.id)
-            return decision
-
-    def submit_action(
-        self,
-        *,
-        action: str,
-        feedback: str = "",
-        target_agent: str = "",
-    ) -> None:
-        actions = {
-            "execute": "approve",
-            "approve": "approve",
-            "cancel": "cancel",
-            "revise": "revise",
-            "targeted_revision": "targeted_revision",
-            "export": "export",
-        }
-        resolved = actions.get(action)
-        if resolved is None:
-            raise UIError(f"未知方案操作：{action}")
         with self._condition:
-            if self.status != "awaiting_plan" or self.plan is None:
-                raise UIError("当前任务不在方案确认阶段")
-            if self._pending_decision is not None:
-                raise UIError("上一项方案操作仍在处理中")
-            if resolved in {"revise", "targeted_revision"} and not feedback.strip():
-                raise UIError("修订要求不能为空")
-            if resolved == "targeted_revision" and target_agent not in {
-                "claude",
-                "codex",
-            }:
-                raise UIError("定向修订必须选择 Agent A 或 Agent B")
-            self._pending_decision = PlanDecision(
-                resolved,
-                feedback.strip(),
-                target_agent,
+            while interaction_id not in self._native_responses:
+                self._condition.wait(timeout=15)
+            response = self._native_responses.pop(interaction_id)
+            self._native_interactions.pop(interaction_id, None)
+            if self.status != "stopping":
+                self.status = (
+                    "awaiting_interaction"
+                    if self._native_interactions and len(self._active_chat_turns) <= 1
+                    else "running"
+                )
+            self.updated_at = _timestamp()
+        self._notify(
+            "native_interaction_resolved",
+            self.id,
+            {"interaction_id": interaction_id},
+        )
+        return response
+
+    def submit_native_interaction(
+        self,
+        interaction_id: str,
+        payload: object,
+    ) -> None:
+        if not isinstance(payload, dict):
+            raise UIError("请求正文必须是 JSON 对象")
+        with self._condition:
+            request = self._native_interactions.get(interaction_id)
+            if request is None:
+                raise UIError("该原生交互请求已处理或不存在")
+            action = _required_text(payload.get("action"), "请选择如何处理此请求")
+            allowed = {
+                str(option.get("value") or "")
+                for option in request.get("options", [])
+                if isinstance(option, dict)
+            }
+            if action not in allowed:
+                raise UIError("不支持的原生交互操作")
+
+            answers: dict[str, tuple[str, ...]] = {}
+            raw_answers = payload.get("answers")
+            if isinstance(raw_answers, dict):
+                for key, raw_value in raw_answers.items():
+                    values = raw_value if isinstance(raw_value, list) else [raw_value]
+                    answers[str(key)] = tuple(
+                        str(value).strip()
+                        for value in values
+                        if str(value).strip()
+                    )
+            if action == "submit":
+                for question in request.get("questions", []):
+                    if not isinstance(question, dict):
+                        continue
+                    question_id = str(question.get("id") or "")
+                    if question_id and not answers.get(question_id):
+                        raise UIError("请回答所有问题后再提交")
+            self._native_responses[interaction_id] = NativeInteractionResponse(
+                action,
+                answers,
+                _optional_text(payload.get("text")),
             )
             self._condition.notify_all()
+
+    def _cancel_native_interactions_locked(self) -> None:
+        for interaction_id in self._native_interactions:
+            self._native_responses.setdefault(
+                interaction_id,
+                NativeInteractionResponse("cancel"),
+            )
+        self._condition.notify_all()
 
     def finish(self, exit_code: int, record: dict[str, Any] | None) -> None:
         with self._condition:
             self.exit_code = exit_code
             self.status = str(record.get("status", "failed")) if record else "failed"
             self.error = str(record.get("error", "")) if record else self.error
-            self.document = (
-                str(record.get("technical_document", "")) if record else self.document
-            )
-            self.plan = None
+            self._cancel_native_interactions_locked()
             self.updated_at = _timestamp()
         self._notify("finished", self.id)
 
@@ -334,7 +471,7 @@ class UISession:
             self.status = "failed"
             self.error = error
             self.exit_code = 1
-            self.plan = None
+            self._cancel_native_interactions_locked()
             self.updated_at = _timestamp()
         self._notify("finished", self.id)
 
@@ -345,22 +482,19 @@ class UISession:
                 "task": self.task,
                 "attachments": list(self.attachments),
                 "workspace": str(self.workspace),
-                "executor": self.executor,
-                "consensus": self.consensus,
-                "collaboration_mode": self.collaboration_mode,
                 "status": self.status,
                 "error": _safe_public_error(
                     self.error,
                     status=self.status,
-                    collaboration_mode=self.collaboration_mode,
                 ),
-                "document": self.document,
                 "exit_code": self.exit_code,
                 "started_at": self.started_at,
                 "updated_at": self.updated_at,
                 "events": list(self.events),
                 "agent_events": dict(self.agent_events),
-                "plan": dict(self.plan) if self.plan else None,
+                "native_interactions": [
+                    dict(request) for request in self._native_interactions.values()
+                ],
                 "group_chat": dict(self.group_chat) if self.group_chat else None,
             }
 
@@ -372,7 +506,9 @@ class UISessionManager:
         self.attachments_root = store.root / "_attachments"
         self._sessions: dict[str, UISession] = {}
         self._lock = threading.RLock()
-        self._subscribers: set[queue.Queue[dict[str, str]]] = set()
+        self._subscribers: set[queue.Queue[dict[str, Any]]] = set()
+        # 界面偏好「显示模型原文流」的内存镜像，避免每个事件都读配置文件
+        self._stream_model_text = _stream_preference(default_workspace)
 
     def ensure_shutdown_safe(self) -> None:
         """Refuse to exit while this server still owns running agent processes."""
@@ -527,6 +663,7 @@ class UISessionManager:
 
         with self._lock:
             self.default_workspace = workspace
+        self._refresh_stream_preference(workspace)
         self.publish("settings", "")
         return self.get_settings(str(workspace))
 
@@ -543,12 +680,12 @@ class UISessionManager:
         preferences = payload.get("ui")
         if not isinstance(preferences, dict) or not preferences:
             raise UIError("界面偏好必须是非空 JSON 对象")
-        allowed = {"theme", "show_archived", "compact_sidebar"}
+        allowed = {"theme", "show_archived", "compact_sidebar", "stream_model_text", "browser_notifications"}
         if not set(preferences).issubset(allowed):
             raise UIError("界面偏好包含未知字段")
         if "theme" in preferences and preferences["theme"] not in UI_THEMES:
             raise UIError("界面主题必须是 paper、ocean、graphite 或 botanical")
-        for key in ("show_archived", "compact_sidebar"):
+        for key in ("show_archived", "compact_sidebar", "stream_model_text", "browser_notifications"):
             if key in preferences and not isinstance(preferences[key], bool):
                 raise UIError("界面开关必须是布尔值")
 
@@ -582,6 +719,7 @@ class UISessionManager:
                 pass
             raise UIError(f"保存界面偏好失败：{exc}") from exc
 
+        self._refresh_stream_preference(workspace)
         self.publish("settings", "")
         return self.get_settings(str(workspace))
 
@@ -609,6 +747,7 @@ class UISessionManager:
             raise UIError(f"工作区不是有效目录：{workspace}")
         with self._lock:
             self.default_workspace = workspace
+        self._refresh_stream_preference(workspace)
         self.publish("workspace", "")
         return {"workspace": str(workspace)}
 
@@ -623,8 +762,6 @@ class UISessionManager:
             raise UIError(f"找不到可恢复的任务：{resume_id}")
 
         if previous:
-            if str(previous.get("collaboration_mode", "workflow")) == "group_chat":
-                raise UIError("群聊对话无需恢复，请直接在原对话中继续发送消息")
             if payload.get("attachments"):
                 raise UIError("恢复任务时不能追加新文档")
             agent_task = str(previous.get("task", "")).strip()
@@ -643,11 +780,11 @@ class UISessionManager:
         if not workspace.is_dir():
             raise UIError(f"工作区不是有效目录：{workspace}")
 
-        from .cli import (
-            _apply_resume_settings,
-            _make_adapters,
-            _resume_value,
-            _settings_snapshot,
+        from .runtime import (
+            apply_resume_settings,
+            make_adapters,
+            resume_value,
+            settings_snapshot,
         )
 
         config_value = _optional_text(payload.get("config"))
@@ -656,7 +793,7 @@ class UISessionManager:
             if isinstance(saved, dict):
                 config_value = _optional_text(saved.get("config_path"))
         try:
-            resolved = _resume_value(previous, "resolved_config")
+            resolved = resume_value(previous, "resolved_config")
             if isinstance(resolved, dict):
                 data = resolved
                 config_path = (
@@ -665,49 +802,19 @@ class UISessionManager:
             else:
                 config_path = find_config_path(config_value or None, workspace)
                 data = load_bridge_config(config_path)
-            executor = payload.get("executor")
-            if executor not in {None, "", "claude", "codex"}:
-                raise UIError("executor 必须是 claude 或 codex")
-            consensus = payload.get("consensus")
-            if consensus is not None and not isinstance(consensus, bool):
-                raise UIError("consensus 必须是布尔值")
-            collaboration_mode = payload.get("collaboration_mode")
-            if collaboration_mode is not None and collaboration_mode not in {
-                "workflow",
-                "group_chat",
-                "group-chat",
-            }:
-                raise UIError("collaboration_mode 必须是 workflow 或 group_chat")
             settings = resolve_bridge_settings(
                 data,
                 workspace=workspace,
                 config_path=config_path,
-                executor=(
-                    str(executor)
-                    if executor in {"claude", "codex"}
-                    else _resume_value(previous, "executor")
-                ),
-                consensus=(
-                    consensus
-                    if isinstance(consensus, bool)
-                    else _resume_value(previous, "consensus")
-                ),
-                collaboration_mode=(
-                    str(collaboration_mode)
-                    if collaboration_mode
-                    else _resume_value(previous, "collaboration_mode")
-                ),
             )
-            settings = _apply_resume_settings(settings, previous)
+            settings = apply_resume_settings(settings, previous)
         except ConfigError as exc:
             raise UIError(f"配置错误：{exc}") from exc
 
-        if not previous and not task and settings.collaboration_mode != "group_chat":
-            raise UIError("任务不能为空")
         if not previous and not task and payload.get("attachments"):
             raise UIError("添加参考文档时必须同时提供第一条群聊消息")
         try:
-            adapters = _make_adapters(settings, state_root=self.store.root)
+            adapters = make_adapters(settings, state_root=self.store.root)
         except ConfigError as exc:
             raise UIError(f"配置错误：{exc}") from exc
 
@@ -718,6 +825,10 @@ class UISessionManager:
                 run_id,
                 payload.get("attachments"),
             )
+            # Mirror into the workspace so workspace-sandboxed agents can
+            # actually read the files; the record keeps the original path for
+            # the download route.
+            _workspace_attachment_mirror(settings.workspace, run_id, attachments)
             agent_task = _task_with_attachments(task, attachments)
         display_task = task or "群聊协作"
         session = UISession(
@@ -726,69 +837,71 @@ class UISessionManager:
             agent_task=agent_task,
             attachments=attachments,
             workspace=settings.workspace,
-            executor=settings.executor,
-            consensus=settings.consensus,
             notify=self.publish,
-            collaboration_mode=settings.collaboration_mode,
+            stream_gate=self._stream_enabled,
         )
 
         def stop_adapters() -> None:
             for adapter in adapters.values():
                 adapter.request_stop()
 
+        for adapter in adapters.values():
+            bind_interaction = getattr(adapter, "bind_interaction_handler", None)
+            if callable(bind_interaction):
+                bind_interaction(session.wait_for_native_interaction)
         session.bind_stop_handler(stop_adapters)
-        if settings.collaboration_mode == "group_chat":
-            engine = GroupChatEngine(settings, adapters)
-            session.bind_chat_engine(engine)
+        session.bind_record_persistence(
+            self._record_timeline_persister(session.id)
+        )
+        engine = GroupChatEngine(settings, adapters)
+        session.bind_chat_engine(engine)
         try:
             self._reserve_session(session)
         except Exception:
             if not previous:
                 _remove_run_attachments(self.attachments_root, run_id)
             raise
-        if settings.collaboration_mode == "group_chat":
-            try:
-                self.store.start(
-                    task=agent_task,
-                    workspace=settings.workspace,
-                    executor=settings.executor,
-                    consensus=False,
-                    collaboration_mode="group_chat",
-                    run_id=run_id,
-                    settings_snapshot=_settings_snapshot(settings),
-                    display_task=display_task,
-                    attachments=attachments,
-                )
-                self.store.update(
-                    run_id,
-                    status="running" if task else "ready",
-                    group_chat=engine.to_dict(),
-                )
-            except OSError as exc:
-                with self._lock:
-                    self._sessions.pop(run_id, None)
-                if not previous:
-                    _remove_run_attachments(self.attachments_root, run_id)
-                raise UIError(f"无法保存群聊记录：{exc}") from exc
-            if not task:
-                session.finish_chat_turn(state=engine.to_dict())
-                self.publish("started", run_id)
-                return session.to_dict()
-            session.begin_chat_turn()
-            worker = threading.Thread(
-                target=self._run_group_chat_turn,
-                args=(session, task),
-                kwargs={"agent_text": agent_task, "attachments": attachments},
-                name=f"multiagent-ui-chat-{run_id}",
-                daemon=True,
+        try:
+            self.store.start(
+                task=agent_task,
+                workspace=settings.workspace,
+                run_id=run_id,
+                settings_snapshot=settings_snapshot(settings),
+                display_task=display_task,
+                attachments=attachments,
             )
-        else:
-            worker = threading.Thread(
-                target=self._run_session,
-                args=(session, settings, adapters),
-                name=f"multiagent-ui-{run_id}",
-                daemon=True,
+            self.store.update(
+                run_id,
+                status="running" if task else "ready",
+                group_chat=engine.to_dict(),
             )
+        except OSError as exc:
+            with self._lock:
+                self._sessions.pop(run_id, None)
+            if not previous:
+                _remove_run_attachments(self.attachments_root, run_id)
+            raise UIError(f"无法保存群聊记录：{exc}") from exc
+        if not task:
+            session.finish_chat_turn(state=engine.to_dict())
+            self.publish("started", run_id)
+            return session.to_dict()
+        reservation = engine.reserve(task)
+        try:
+            session.begin_chat_turn(reservation.token)
+        except Exception:
+            engine.release(reservation)
+            raise
+        worker = threading.Thread(
+            target=self._run_session,
+            args=(session, task),
+            kwargs={
+                "agent_text": agent_task,
+                "attachments": attachments,
+                "reservation": reservation,
+            },
+            name=f"multiagent-ui-chat-{run_id}",
+            daemon=True,
+        )
         worker.start()
         self.publish("started", run_id)
         return session.to_dict()
@@ -800,6 +913,12 @@ class UISessionManager:
         *,
         agent_text: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        reservation: object = None,
+        edited_from: str = "",
+        hidden_user: bool = False,
+        retry_of: str = "",
+        retry_mode: str = "",
+        reply_to: str = "",
     ) -> None:
         engine = session.chat_engine()
 
@@ -810,7 +929,6 @@ class UISessionManager:
                     status="running",
                     error="",
                     group_chat=state,
-                    collaboration_mode="group_chat",
                 )
             except (KeyError, OSError):
                 pass
@@ -822,6 +940,12 @@ class UISessionManager:
                 attachments=attachments,
                 on_event=session.on_event,
                 on_state=save_state,
+                reservation=reservation,
+                edited_from=edited_from,
+                hidden_user=hidden_user,
+                retry_of=retry_of,
+                retry_mode=retry_mode,
+                reply_to=reply_to,
             )
         except KeyboardInterrupt:
             state = engine.to_dict()
@@ -838,7 +962,9 @@ class UISessionManager:
                 state=state,
                 error="用户中断",
                 status="interrupted",
+                token=getattr(reservation, "token", None),
             )
+            self.store.update(session.id, status=session.status, group_chat=state)
             return
         except Exception:
             safe_error = "群聊处理失败"
@@ -856,7 +982,9 @@ class UISessionManager:
                 state=state,
                 error=safe_error,
                 status="failed",
+                token=getattr(reservation, "token", None),
             )
+            self.store.update(session.id, status=session.status, group_chat=state)
             return
 
         state = engine.to_dict()
@@ -866,51 +994,173 @@ class UISessionManager:
         )
         status = "ready" if turn.responses else "failed"
         summary = _group_chat_summary(state)
-        try:
-            self.store.update(
-                session.id,
-                status=status,
-                error=error,
-                group_chat=state,
-                summary=summary,
-            )
-        except (KeyError, OSError):
-            pass
         if turn.responses:
-            session.finish_chat_turn(state=state, error=error)
+            session.finish_chat_turn(
+                state=state,
+                error=error,
+                token=getattr(reservation, "token", None),
+            )
         else:
             session.finish_chat_turn(
                 state=state,
                 error=error or "所有 Agent 均未返回群聊回复",
                 status="failed",
+                token=getattr(reservation, "token", None),
             )
+        try:
+            self.store.update(
+                session.id,
+                status=session.status,
+                error=session.error,
+                group_chat=state,
+                summary=summary,
+            )
+        except (KeyError, OSError):
+            pass
+
+    def _run_session(self, *args: object, **kwargs: object) -> None:
+        """Run one group-chat turn in its worker thread."""
+
+        self._run_group_chat_turn(*args, **kwargs)
 
     def send_chat_message(self, run_id: str, payload: object) -> dict[str, Any]:
         if not isinstance(payload, dict):
             raise UIError("请求正文必须是 JSON 对象")
-        message = _required_text(payload.get("message"), "群聊消息不能为空")
+        message = _optional_text(payload.get("message"))
+        edited_from = _optional_text(payload.get("edited_from"))
+        retry_of = _optional_text(payload.get("retry_of"))
+        retry_mode = _optional_text(payload.get("retry_mode"))
+        if retry_mode and retry_mode not in {"regenerate", "continue"}:
+            raise UIError("retry_mode 必须是 regenerate 或 continue")
+        hidden_user = bool(payload.get("hidden_user", False))
+        forced_agent = _optional_text(payload.get("agent"))
+        raw_recipients = payload.get("recipients")
+        forced_recipients = None
+        if isinstance(raw_recipients, list):
+            forced_recipients = tuple(
+                value for value in raw_recipients
+                if isinstance(value, str) and value in {"claude", "codex"}
+            )
+            if not forced_recipients:
+                raise UIError("recipients 必须包含 claude 或 codex")
+        if forced_agent and forced_agent not in {"claude", "codex"}:
+            raise UIError("agent 必须是 claude 或 codex")
         record = self.store.get(run_id)
         if record is None:
             raise UIError("找不到群聊对话")
-        if str(record.get("collaboration_mode", "workflow")) != "group_chat":
-            raise UIError("当前对话不是群聊协作模式")
         if bool(record.get("archived")):
             raise UIError("已归档的群聊不能发送消息，请先取消归档")
-        session = self.session(run_id)
-        if session is not None and session.chat_requires_restore():
-            # request_stop() propagates a permanent stop flag into the native
-            # CLI adapters. Rebuild them from the persisted chat state instead
-            # of reusing an adapter that can never accept another turn.
-            with self._lock:
-                if self._sessions.get(run_id) is session:
-                    self._sessions.pop(run_id, None)
-            session = None
-        if session is None:
-            session = self._restore_group_chat_session(record)
-        session.begin_chat_turn()
+        uploaded_attachments = _save_uploaded_documents(
+            self.attachments_root,
+            run_id,
+            payload.get("attachments"),
+        )
+        attachments = list(uploaded_attachments)
+        if uploaded_attachments:
+            workspace = Path(str(record.get("workspace", ""))).expanduser().resolve()
+            if workspace.is_dir():
+                _workspace_attachment_mirror(workspace, run_id, uploaded_attachments)
+        try:
+            session = self.session(run_id)
+            if session is not None and session.chat_requires_restore():
+                # request_stop() propagates a permanent stop flag into the native
+                # CLI adapters. Rebuild them from the persisted chat state instead
+                # of reusing an adapter that can never accept another turn.
+                with self._lock:
+                    if self._sessions.get(run_id) is session:
+                        self._sessions.pop(run_id, None)
+                session = None
+            if session is None:
+                session = self._restore_group_chat_session(record)
+            engine = session.chat_engine()
+            try:
+                source_message = None
+                retry_source = None
+                if edited_from:
+                    source_message = engine.find_message(edited_from)
+                    if source_message is None or source_message.get("role") != "user":
+                        raise UIError("找不到可编辑的用户消息")
+                    if not attachments:
+                        attachments = [
+                            dict(item)
+                            for item in source_message.get("attachments", [])
+                            if isinstance(item, dict)
+                        ]
+                    if isinstance(source_message.get("recipients"), list) and not forced_recipients:
+                        forced_recipients = tuple(
+                            value for value in source_message["recipients"]
+                            if value in {"claude", "codex"}
+                        ) or None
+                if retry_of:
+                    retry_source = engine.find_message(retry_of)
+                    if retry_source is None or retry_source.get("role") != "assistant":
+                        raise UIError("找不到可重新生成的 Agent 消息")
+                    parent = engine.find_parent_user(retry_of)
+                    if parent is None:
+                        raise UIError("找不到 Agent 消息对应的用户问题")
+                    message = str(parent.get("content") or "").strip()
+                    hidden_user = True
+                    if not forced_agent:
+                        forced_agent = str(retry_source.get("sender") or "")
+                    forced_recipients = (forced_agent,)
+                if not message:
+                    raise UIError("群聊消息不能为空")
+                reservation = engine.reserve(
+                    message,
+                    forced_recipients=forced_recipients
+                    or ((forced_agent,) if forced_agent else None),
+                )
+            except BridgeError as exc:
+                raise UIError(str(exc)) from exc
+            try:
+                session.begin_chat_turn(reservation.token)
+            except Exception:
+                engine.release(reservation)
+                if uploaded_attachments:
+                    _remove_unreferenced_uploads(self.attachments_root, run_id, uploaded_attachments)
+                raise
+        except Exception:
+            if uploaded_attachments:
+                _remove_unreferenced_uploads(self.attachments_root, run_id, uploaded_attachments)
+            raise
+        # The upload lives in the same per-run directory as the task-level
+        # documents; the record must know about it so the download route can
+        # authorize serving it later.
+        if uploaded_attachments:
+            try:
+                self.store.mutate(
+                    run_id,
+                    lambda record: record.__setitem__(
+                        "attachments",
+                        _stored_attachments(record.get("attachments")) + uploaded_attachments,
+                    ),
+                )
+            except (KeyError, OSError):
+                _remove_unreferenced_uploads(self.attachments_root, run_id, uploaded_attachments)
+                engine.release(reservation)
+                session.finish_chat_turn(
+                    state=engine.to_dict(),
+                    status="ready",
+                    token=reservation.token,
+                )
+                raise UIError("无法保存随消息上传的附件")
         worker = threading.Thread(
-            target=self._run_group_chat_turn,
+            target=self._run_session,
             args=(session, message),
+            kwargs={
+                "agent_text": _task_with_attachments(
+                    message,
+                    attachments,
+                    mid_chat=True,
+                ),
+                "attachments": attachments,
+                "reservation": reservation,
+                "edited_from": edited_from,
+                "hidden_user": hidden_user,
+                "retry_of": retry_of,
+                "retry_mode": retry_mode,
+                "reply_to": str((engine.find_parent_user(retry_of) or {}).get("id") or "") if retry_of else "",
+            },
             name=f"multiagent-ui-chat-{run_id}",
             daemon=True,
         )
@@ -919,7 +1169,7 @@ class UISessionManager:
         return session.to_dict()
 
     def _restore_group_chat_session(self, record: dict[str, Any]) -> UISession:
-        from .cli import _apply_resume_settings, _make_adapters
+        from .runtime import apply_resume_settings, make_adapters
 
         workspace = Path(str(record.get("workspace", ""))).expanduser().resolve()
         if not workspace.is_dir():
@@ -932,10 +1182,9 @@ class UISessionManager:
             settings = resolve_bridge_settings(
                 resolved,
                 workspace=workspace,
-                collaboration_mode="group_chat",
             )
-            settings = _apply_resume_settings(settings, record)
-            adapters = _make_adapters(settings, state_root=self.store.root)
+            settings = apply_resume_settings(settings, record)
+            adapters = make_adapters(settings, state_root=self.store.root)
         except ConfigError as exc:
             raise UIError(f"配置错误：{exc}") from exc
         engine = GroupChatEngine(settings, adapters, record.get("group_chat"))
@@ -945,11 +1194,9 @@ class UISessionManager:
             agent_task=str(record.get("task") or ""),
             attachments=_stored_attachments(record.get("attachments")),
             workspace=settings.workspace,
-            executor=settings.executor,
-            consensus=False,
-            collaboration_mode="group_chat",
             group_chat=engine.to_dict(),
             notify=self.publish,
+            stream_gate=self._stream_enabled,
         )
         session.status = str(record.get("status", "ready"))
         session.error = str(record.get("error", ""))
@@ -959,63 +1206,38 @@ class UISessionManager:
             for adapter in adapters.values():
                 adapter.request_stop()
 
+        for adapter in adapters.values():
+            bind_interaction = getattr(adapter, "bind_interaction_handler", None)
+            if callable(bind_interaction):
+                bind_interaction(session.wait_for_native_interaction)
         session.bind_stop_handler(stop_adapters)
+        session.bind_record_persistence(
+            self._record_timeline_persister(session.id)
+        )
         self._reserve_session(session)
         return session
 
-    def _run_session(self, session: UISession, settings, adapters) -> None:
-        from .cli import _run_once
-
-        renderer = ConsoleRenderer(
-            color=False,
-            stream=io.StringIO(),
-            verbose=False,
-            progress=False,
-            tui=False,
-        )
-        try:
-            result = _run_once(
-                settings,
-                adapters,
-                session.agent_task,
-                renderer,
-                store=self.store,
-                run_id=session.id,
-                plan_confirmation=session.wait_for_plan,
-                event_listener=session.on_event,
-                display_task=session.task,
-                attachments=session.attachments,
-            )
-            session.finish(result, self.store.get(session.id))
-        except Exception:
-            safe_error = "任务执行失败"
-            try:
-                self.store.update(session.id, status="failed", error=safe_error)
-            except (KeyError, OSError):
-                pass
-            session.fail(safe_error)
-
-    def submit_action(self, run_id: str, payload: object) -> dict[str, Any]:
-        if not isinstance(payload, dict):
-            raise UIError("请求正文必须是 JSON 对象")
+    def submit_native_interaction(
+        self,
+        run_id: str,
+        interaction_id: str,
+        payload: object,
+    ) -> dict[str, Any]:
         session = self.session(run_id)
         if session is None:
             raise UIError(f"找不到活动 UI 任务：{run_id}")
-        session.submit_action(
-            action=_required_text(payload.get("action"), "缺少 action"),
-            feedback=_optional_text(payload.get("feedback")),
-            target_agent=_optional_text(payload.get("target_agent")),
+        session.submit_native_interaction(interaction_id, payload)
+        self.publish(
+            "native_interaction_submitted",
+            run_id,
+            {"interaction_id": interaction_id},
         )
-        self.publish("action", run_id)
         return session.to_dict()
 
     def stop_task(self, run_id: str) -> dict[str, Any]:
         session = self.session(run_id)
         if session is None:
-            raise UIError(
-                "该任务不属于当前 UI 服务的活动进程，已不能发送停止信号；"
-                "刷新后可从最近检查点恢复"
-            )
+            raise UIError("该任务不属于当前 UI 服务的活动进程，已不能发送停止信号")
         session.request_stop()
         return session.to_dict()
 
@@ -1049,6 +1271,44 @@ class UISessionManager:
         for run_id in removable[:overflow]:
             self._sessions.pop(run_id, None)
 
+    def _stream_enabled(self) -> bool:
+        """Whether sessions may publish raw model text over SSE."""
+
+        with self._lock:
+            return self._stream_model_text
+
+    def _refresh_stream_preference(self, workspace: Path) -> None:
+        """Re-read the streaming toggle so it applies without a restart."""
+
+        enabled = _stream_preference(workspace)
+        with self._lock:
+            self._stream_model_text = enabled
+
+    def _record_timeline_persister(
+        self,
+        run_id: str,
+    ) -> Callable[[AgentEvent], None]:
+        """Persist timeline-worthy events into the run record.
+
+        Only public activity is stored (never streaming ``progress`` text),
+        capped at ``MAX_RECORD_EVENTS``.
+        """
+
+        def persist(event: AgentEvent) -> None:
+            if event.kind not in TIMELINE_EVENT_KINDS:
+                return
+
+            def mutate(record: dict[str, Any]) -> None:
+                timeline = record.get("events")
+                if not isinstance(timeline, list):
+                    timeline = []
+                timeline.append(event.to_dict(safe=True, include_activity=True))
+                record["events"] = timeline[-MAX_RECORD_EVENTS:]
+
+            self.store.mutate(run_id, mutate)
+
+        return persist
+
     def list_runs(self) -> list[dict[str, Any]]:
         records = self.store.list(limit=100)
         by_id = {
@@ -1065,9 +1325,6 @@ class UISessionManager:
                     "id": session.id,
                     "task": session.task,
                     "workspace": str(session.workspace),
-                    "executor": session.executor,
-                    "consensus": session.consensus,
-                    "collaboration_mode": session.collaboration_mode,
                     "status": live["status"],
                     "updated_at": live["updated_at"],
                     "error": live["error"],
@@ -1155,21 +1412,45 @@ class UISessionManager:
         with self._lock:
             self._sessions.pop(run_id, None)
         _remove_run_attachments(self.attachments_root, run_id)
+        workspace_text = str(record.get("workspace", "")).strip()
+        if workspace_text:
+            _remove_workspace_attachment_mirror(
+                Path(workspace_text).expanduser(),
+                run_id,
+            )
         self.publish("delete", run_id)
         return _public_record(deleted)
 
-    def subscribe(self) -> queue.Queue[dict[str, str]]:
-        subscriber: queue.Queue[dict[str, str]] = queue.Queue(maxsize=64)
+    def subscribe(self) -> queue.Queue[dict[str, Any]]:
+        subscriber: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=64)
         with self._lock:
             self._subscribers.add(subscriber)
         return subscriber
 
-    def unsubscribe(self, subscriber: queue.Queue[dict[str, str]]) -> None:
+    def unsubscribe(self, subscriber: queue.Queue[dict[str, Any]]) -> None:
         with self._lock:
             self._subscribers.discard(subscriber)
 
-    def publish(self, kind: str, run_id: str) -> None:
-        message = {"type": kind, "run_id": run_id, "timestamp": _timestamp()}
+    def publish(
+        self,
+        kind: str,
+        run_id: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Broadcast one SSE notification.
+
+        ``extra`` carries transient payload (streaming deltas) that is never
+        stored in the run record; clients that do not understand the keys just
+        fall back to the normal refresh path.
+        """
+
+        message: dict[str, Any] = {
+            "type": kind,
+            "run_id": run_id,
+            "timestamp": _timestamp(),
+        }
+        if extra:
+            message.update(extra)
         with self._lock:
             subscribers = list(self._subscribers)
         for subscriber in subscribers:
@@ -1341,6 +1622,17 @@ def make_request_handler(manager: UISessionManager, static_root: Path):
             if path == "/api/events":
                 self._events()
                 return
+            match = re.fullmatch(
+                r"/api/runs/([A-Za-z0-9._-]+)/attachments/(.+)",
+                path,
+            )
+            if match:
+                if not self._same_origin():
+                    self._error(HTTPStatus.FORBIDDEN, "拒绝跨站请求")
+                    return
+                inline = parse_qs(parsed.query).get("inline", [""])[0] == "1"
+                self._attachment(match.group(1), match.group(2), inline=inline)
+                return
             match = re.fullmatch(r"/api/runs/([A-Za-z0-9._-]+)", path)
             if match:
                 detail = manager.run_detail(match.group(1))
@@ -1398,11 +1690,15 @@ def make_request_handler(manager: UISessionManager, static_root: Path):
                     self._json(session, status=HTTPStatus.ACCEPTED)
                     return
                 match = re.fullmatch(
-                    r"/api/sessions/([A-Za-z0-9._-]+)/actions",
+                    r"/api/sessions/([A-Za-z0-9._-]+)/interactions/([A-Za-z0-9_-]+)",
                     path,
                 )
                 if match:
-                    session = manager.submit_action(match.group(1), payload)
+                    session = manager.submit_native_interaction(
+                        match.group(1),
+                        match.group(2),
+                        payload,
+                    )
                     self._json(session, status=HTTPStatus.ACCEPTED)
                     return
                 match = re.fullmatch(
@@ -1480,6 +1776,81 @@ def make_request_handler(manager: UISessionManager, static_root: Path):
                 f"http://localhost:{self.server.server_port}",
             }
             return origin in expected
+
+        def _attachment(self, run_id: str, raw_name: str, *, inline: bool = False) -> None:
+            """Serve one stored upload. The run must exist so attachments of a
+            deleted task disappear with it, and the filename is validated the
+            same way as at upload time to rule out path traversal."""
+            record = manager.store.get(run_id)
+            if record is None:
+                self._error(HTTPStatus.NOT_FOUND, "找不到任务")
+                return
+            try:
+                name = _safe_document_name(unquote(raw_name))
+            except UIError:
+                self._error(HTTPStatus.NOT_FOUND, "附件不存在")
+                return
+            stored = next(
+                (
+                    item
+                    for item in _stored_attachments(record.get("attachments"))
+                    if item["name"] == name
+                ),
+                None,
+            )
+            if stored is None:
+                self._error(HTTPStatus.NOT_FOUND, "附件不存在")
+                return
+            base = manager.attachments_root.resolve()
+            try:
+                target = (base / run_id / name).resolve()
+            except OSError:
+                self._error(HTTPStatus.NOT_FOUND, "附件不存在")
+                return
+            if base not in target.parents:
+                self._error(HTTPStatus.NOT_FOUND, "附件不存在")
+                return
+            try:
+                content = target.read_bytes()
+            except OSError:
+                self._error(HTTPStatus.NOT_FOUND, "附件不存在")
+                return
+            suffix = Path(name).suffix.lower()
+            if inline:
+                # Inline rendering is allowed only for raster types derived
+                # from the validated extension — never from the uploader's
+                # declared content_type, which would let an HTML/JS payload
+                # ride into the page as a same-origin document.
+                inline_type = INLINE_IMAGE_TYPES.get(suffix)
+                if inline_type is None:
+                    self._error(HTTPStatus.NOT_FOUND, "附件不存在")
+                    return
+                content_type = inline_type
+                disposition = "inline; filename*=UTF-8''" + quote(name, encoding="utf-8")
+            else:
+                # Downloads never echo the uploader-declared content_type, and
+                # never claim a renderable type: .html and .xml are accepted
+                # uploads, so anything but a known raster image is handed back
+                # as an opaque byte stream instead of relying on
+                # Content-Disposition alone to stop the browser rendering it.
+                content_type = INLINE_IMAGE_TYPES.get(
+                    suffix,
+                    "application/octet-stream",
+                )
+                disposition = "attachment; filename*=UTF-8''" + quote(
+                    name,
+                    encoding="utf-8",
+                )
+            # Both branches above pick from a fixed table, so no
+            # uploader-controlled string can reach the response headers.
+            self.send_response(HTTPStatus.OK)
+            self._security_headers()
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Content-Disposition", disposition)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(content)
 
         def _static(self, path: str) -> None:
             requested = "index.html" if path in {"", "/"} else unquote(path.lstrip("/"))
@@ -1575,17 +1946,11 @@ def _record_summary(record: dict[str, Any]) -> dict[str, Any]:
             "display_task",
             "attachments",
             "workspace",
-            "executor",
-            "consensus",
-            "collaboration_mode",
             "status",
-            "phase",
             "created_at",
             "updated_at",
             "attempts",
             "error",
-            "approved",
-            "technical_document",
             "archived",
             "archived_at",
         )
@@ -1594,11 +1959,8 @@ def _record_summary(record: dict[str, Any]) -> dict[str, Any]:
     summary["error"] = _safe_public_error(
         summary.get("error"),
         status=str(summary.get("status", "")),
-        collaboration_mode=str(summary.get("collaboration_mode", "workflow")),
     )
-    summary["resumable"] = bool(record.get("checkpoint")) and str(
-        record.get("status", "")
-    ) in {"failed", "interrupted", "cancelled", *ACTIVE_STATUSES}
+    summary["resumable"] = False
     return summary
 
 
@@ -1610,10 +1972,7 @@ def _detached_record(record: dict[str, Any]) -> dict[str, Any]:
     record["status"] = "interrupted"
     record["detached"] = True
     if not str(record.get("error", "")).strip():
-        record["error"] = (
-            "任务已不在当前 UI 服务中运行；上次服务可能退出，"
-            "可从最近检查点恢复"
-        )
+        record["error"] = "任务已不在当前 UI 服务中运行；上次服务可能退出"
     return record
 
 
@@ -1627,21 +1986,38 @@ def _save_uploaded_documents(
     if not isinstance(payload, list):
         raise UIError("attachments 必须是数组")
     if len(payload) > MAX_UPLOAD_FILES:
-        raise UIError(f"每个任务最多上传 {MAX_UPLOAD_FILES} 个文档")
+        raise UIError(f"每条消息最多上传 {MAX_UPLOAD_FILES} 个附件")
     if not payload:
         return []
 
     run_directory = attachments_root / run_id
     saved: list[dict[str, Any]] = []
     total_size = 0
+    # Mid-chat uploads reuse the per-run directory created by the task-level
+    # documents, so by then it usually already exists. Remember whether we
+    # created it: on failure we may only remove a directory we own, never one
+    # that still holds attachments from earlier turns.
+    directory_existed = run_directory.exists()
     try:
-        run_directory.mkdir(parents=True, exist_ok=False, mode=0o700)
+        run_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             attachments_root.chmod(0o700)
             run_directory.chmod(0o700)
         except OSError:
             pass
+        # Seed the taken names from what is already on disk so a later upload
+        # cannot overwrite an earlier attachment the record still points at.
+        # Keys are casefolded to match _unique_document_name.
         used_names: set[str] = set()
+        if directory_existed:
+            try:
+                used_names = {
+                    entry.name.casefold()
+                    for entry in run_directory.iterdir()
+                    if entry.is_file()
+                }
+            except OSError:
+                used_names = set()
         for item in payload:
             if not isinstance(item, dict):
                 raise UIError("文档信息格式无效")
@@ -1687,7 +2063,20 @@ def _save_uploaded_documents(
                 }
             )
     except (OSError, UIError) as exc:
-        shutil.rmtree(run_directory, ignore_errors=True)
+        if directory_existed:
+            # Roll back only this call's files; the directory predates us.
+            for item in saved:
+                try:
+                    Path(item["path"]).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            try:
+                for leftover in list(run_directory.glob("*.tmp")):
+                    leftover.unlink(missing_ok=True)
+            except OSError:
+                pass
+        else:
+            shutil.rmtree(run_directory, ignore_errors=True)
         if isinstance(exc, UIError):
             raise
         raise UIError(f"保存上传文档失败：{exc}") from exc
@@ -1702,7 +2091,7 @@ def _safe_document_name(value: object) -> str:
         raise UIError("文档名称不安全")
     normalized = "".join(char for char in normalized if char.isprintable()).strip(" .")
     suffix = Path(normalized).suffix.lower()
-    if suffix not in DOCUMENT_EXTENSIONS:
+    if suffix not in UPLOAD_EXTENSIONS:
         raise UIError(f"不支持的文档格式：{suffix or '无扩展名'}")
     stem = Path(normalized).stem.strip(" .") or "document"
     maximum_stem = max(1, 150 - len(suffix))
@@ -1718,6 +2107,30 @@ def _unique_document_name(name: str, used: set[str]) -> str:
         index += 1
     used.add(candidate.casefold())
     return candidate
+
+
+def _stream_preference(workspace: Path) -> bool:
+    """Read ``ui.stream_model_text`` for one workspace, defaulting to off.
+
+    Streaming raw model text widens what the browser sees, so a missing or
+    unreadable config must fail closed.
+    """
+
+    try:
+        project_path = workspace / PROJECT_CONFIG_NAME
+        source = (
+            project_path
+            if project_path.is_file()
+            else find_config_path(None, workspace)
+        )
+        data = load_bridge_config(source)
+    except Exception:
+        # Any resolution or parse failure must leave streaming disabled.
+        return False
+    ui = data.get("ui")
+    if not isinstance(ui, dict):
+        return False
+    return ui.get("stream_model_text") is True
 
 
 def _stored_attachments(value: object) -> list[dict[str, Any]]:
@@ -1739,23 +2152,101 @@ def _stored_attachments(value: object) -> list[dict[str, Any]]:
                 "size": size,
                 "content_type": _optional_text(item.get("content_type"))
                 or "application/octet-stream",
+                **(
+                    {"workspace_path": item["workspace_path"]}
+                    if isinstance(item.get("workspace_path"), str)
+                    and item.get("workspace_path")
+                    else {}
+                ),
             }
         )
-    return stored[:MAX_UPLOAD_FILES]
+    return stored[-MAX_RUN_ATTACHMENTS:]
 
 
-def _task_with_attachments(task: str, attachments: list[dict[str, Any]]) -> str:
+def _task_with_attachments(
+    task: str,
+    attachments: list[dict[str, Any]],
+    *,
+    mid_chat: bool = False,
+) -> str:
     if not attachments:
         return task
-    lines = [
-        task,
-        "",
-        "附加文档（由用户随任务上传，请先读取并纳入需求分析；除非需求明确要求，否则不要修改这些原始文档）：",
-    ]
+    heading = (
+        "附加文档（由用户随本条消息上传，请先读取并纳入本轮判断；除非消息明确要求，否则不要修改这些原始文档）："
+        if mid_chat
+        else "附加文档（由用户随任务上传，请先读取并纳入需求分析；除非需求明确要求，否则不要修改这些原始文档）："
+    )
+    lines = [task, "", heading]
     lines.extend(
-        f"- {item['name']}：{item['path']}" for item in attachments
+        f"- {item['name']}：{_agent_attachment_path(item)}" for item in attachments
     )
     return "\n".join(lines)
+
+
+def _agent_attachment_path(item: dict[str, Any]) -> str:
+    """Path the agent should read. Uploads live outside the workspace (the
+    store's ``_attachments`` root), where an agent sandboxed to the workspace
+    cannot open them; when a workspace mirror exists we hand the agent that
+    path instead, falling back to the original when mirroring failed."""
+
+    mirror = item.get("workspace_path")
+    if isinstance(mirror, str) and mirror:
+        return mirror
+    return str(item.get("path", ""))
+
+
+def _workspace_attachment_mirror(
+    workspace: Path,
+    run_id: str,
+    attachments: list[dict[str, Any]],
+) -> None:
+    """Copy each upload into ``workspace/.multiagent/attachments/<run_id>/``.
+
+    Agents run sandboxed to the workspace, so the store's attachment root is
+    unreadable to them; the mirror gives them an in-workspace path. The
+    record keeps pointing at the original copy (the download route authorizes
+    against it), and the repo-level .gitignore already excludes .multiagent/
+    so mirrors never show up in diffs. Best-effort: a failed copy leaves the
+    entry without ``workspace_path`` and the prompt falls back to the
+    original path.
+    """
+
+    if not attachments or RUN_ID_RE.fullmatch(run_id) is None:
+        return
+    mirror_dir = workspace / ".multiagent" / "attachments" / run_id
+    try:
+        mirror_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    for item in attachments:
+        source = Path(str(item.get("path", "")))
+        name = str(item.get("name", ""))
+        if not name or not source.is_file():
+            continue
+        target = mirror_dir / name
+        try:
+            if target.resolve() == source.resolve():
+                continue
+            shutil.copyfile(source, target)
+            try:
+                target.chmod(0o600)
+            except OSError:
+                pass
+            item["workspace_path"] = str(target.resolve())
+        except OSError:
+            continue
+
+
+def _remove_workspace_attachment_mirror(workspace: Path, run_id: str) -> None:
+    """Drop a run's in-workspace mirror. Never raises: the mirror is a cache."""
+
+    if RUN_ID_RE.fullmatch(run_id) is None:
+        return
+    mirror_dir = workspace / ".multiagent" / "attachments" / run_id
+    try:
+        shutil.rmtree(mirror_dir, ignore_errors=True)
+    except OSError:
+        pass
 
 
 def _remove_run_attachments(attachments_root: Path, run_id: str) -> None:
@@ -1764,16 +2255,29 @@ def _remove_run_attachments(attachments_root: Path, run_id: str) -> None:
     shutil.rmtree(attachments_root / run_id, ignore_errors=True)
 
 
+def _remove_unreferenced_uploads(
+    attachments_root: Path,
+    run_id: str,
+    attachments: list[dict[str, Any]],
+) -> None:
+    """Best-effort cleanup for uploads saved but never attached to a turn."""
+
+    if RUN_ID_RE.fullmatch(run_id) is None:
+        return
+    for item in attachments:
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        try:
+            (attachments_root / run_id / name).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _config_for_ui(data: dict[str, Any]) -> dict[str, Any]:
-    identities = data.get("identities")
-    if not isinstance(identities, dict):
-        identities = {}
     group_chat_identities = data.get("group_chat_identities")
     if not isinstance(group_chat_identities, dict):
         group_chat_identities = {}
-    verification = data.get("verification")
-    if not isinstance(verification, dict):
-        verification = {}
     ui = data.get("ui")
     if not isinstance(ui, dict):
         ui = {}
@@ -1784,10 +2288,6 @@ def _config_for_ui(data: dict[str, Any]) -> dict[str, Any]:
     def boolean(name: str, default: bool) -> bool:
         value = data.get(name, default)
         return value if isinstance(value, bool) else default
-
-    def integer(name: str, default: int) -> int:
-        value = data.get(name, default)
-        return value if isinstance(value, int) and not isinstance(value, bool) else default
 
     def agent_values(name: str) -> dict[str, Any]:
         raw = data.get(name)
@@ -1832,43 +2332,14 @@ def _config_for_ui(data: dict[str, Any]) -> dict[str, Any]:
             ),
         }
 
-    executor = data.get("executor", "claude")
-    collaboration_mode = data.get("collaboration_mode", "workflow")
     group_chat_default_agent = data.get("group_chat_default_agent", "both")
-    commands = verification.get("commands", [])
-    verification_timeout = verification.get("timeout", 300)
     return {
-        "executor": executor if executor in {"claude", "codex"} else "claude",
-        "collaboration_mode": (
-            collaboration_mode
-            if collaboration_mode in {"workflow", "group_chat"}
-            else "workflow"
-        ),
         "group_chat_default_agent": (
             group_chat_default_agent
             if group_chat_default_agent in {"both", "claude", "codex"}
             else "both"
         ),
         "group_chat_execution": boolean("group_chat_execution", True),
-        "planning_collaboration": boolean("planning_collaboration", True),
-        "consensus": boolean("consensus", False),
-        "max_consensus_rounds": integer("max_consensus_rounds", 3),
-        "plan_approval": boolean("plan_approval", True),
-        "max_plan_revisions": integer("max_plan_revisions", 2),
-        "review_rounds": integer("review_rounds", 1),
-        "final_review": boolean("final_review", True),
-        "identities": {
-            "agent_a": (
-                identities.get("agent_a")
-                if isinstance(identities.get("agent_a"), str)
-                else DEFAULT_AGENT_A_IDENTITY
-            ),
-            "agent_b": (
-                identities.get("agent_b")
-                if isinstance(identities.get("agent_b"), str)
-                else DEFAULT_AGENT_B_IDENTITY
-            ),
-        },
         "group_chat_identities": {
             "agent_a": (
                 group_chat_identities.get("agent_a")
@@ -1880,15 +2351,6 @@ def _config_for_ui(data: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(group_chat_identities.get("agent_b"), str)
                 else DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY
             ),
-        },
-        "verification": {
-            "timeout": (
-                verification_timeout
-                if isinstance(verification_timeout, (int, float))
-                and not isinstance(verification_timeout, bool)
-                else 300
-            ),
-            "commands": commands if isinstance(commands, list) else [],
         },
         "claude": agent_values("claude"),
         "codex": agent_values("codex"),
@@ -1921,6 +2383,8 @@ def _config_for_ui(data: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(ui.get("compact_sidebar"), bool)
                 else False
             ),
+            "stream_model_text": ui.get("stream_model_text") is True,
+            "browser_notifications": ui.get("browser_notifications") is True,
         },
     }
 
@@ -1929,26 +2393,13 @@ def _config_from_ui(values: dict[str, Any]) -> dict[str, Any]:
     config = {
         key: values.get(key)
         for key in (
-            "executor",
-            "collaboration_mode",
             "group_chat_default_agent",
             "group_chat_execution",
-            "planning_collaboration",
-            "consensus",
-            "max_consensus_rounds",
-            "plan_approval",
-            "max_plan_revisions",
-            "review_rounds",
-            "final_review",
         )
     }
-    identities = values.get("identities")
     group_chat_identities = values.get("group_chat_identities")
-    verification = values.get("verification")
     ui = values.get("ui")
     token_api = values.get("token_api")
-    if not isinstance(identities, dict):
-        raise UIError("共识实施身份设置必须是 JSON 对象")
     if group_chat_identities is None:
         group_chat_identities = {
             "agent_a": DEFAULT_GROUP_CHAT_AGENT_A_IDENTITY,
@@ -1956,8 +2407,6 @@ def _config_from_ui(values: dict[str, Any]) -> dict[str, Any]:
         }
     if not isinstance(group_chat_identities, dict):
         raise UIError("群聊身份设置必须是 JSON 对象")
-    if not isinstance(verification, dict):
-        raise UIError("验证设置必须是 JSON 对象")
     if not isinstance(ui, dict):
         raise UIError("界面设置必须是 JSON 对象")
     if not isinstance(token_api, dict):
@@ -1969,22 +2418,21 @@ def _config_from_ui(values: dict[str, Any]) -> dict[str, Any]:
         raise UIError("界面开关必须是布尔值")
     if ui.get("theme") not in UI_THEMES:
         raise UIError("界面主题必须是 paper、ocean、graphite 或 botanical")
-    config["identities"] = {
-        "agent_a": identities.get("agent_a"),
-        "agent_b": identities.get("agent_b"),
-    }
     config["group_chat_identities"] = {
         "agent_a": group_chat_identities.get("agent_a"),
         "agent_b": group_chat_identities.get("agent_b"),
     }
-    config["verification"] = {
-        "timeout": verification.get("timeout"),
-        "commands": verification.get("commands"),
-    }
+    if "stream_model_text" in ui and not isinstance(ui["stream_model_text"], bool):
+        raise UIError("界面开关必须是布尔值")
+    if "browser_notifications" in ui and not isinstance(ui["browser_notifications"], bool):
+        raise UIError("浏览器通知开关必须是布尔值")
     config["ui"] = {
         "theme": ui["theme"],
         "show_archived": ui["show_archived"],
         "compact_sidebar": ui["compact_sidebar"],
+        # 旧客户端不发这个字段，缺省视为关闭而不是拒绝请求
+        "stream_model_text": ui.get("stream_model_text") is True,
+        "browser_notifications": ui.get("browser_notifications") is True,
     }
     config["token_api"] = {
         "enabled": token_api.get("enabled"),
@@ -2017,11 +2465,12 @@ def _merge_known_config(
     config: dict[str, Any],
 ) -> dict[str, Any]:
     merged = dict(existing)
-    for key in (
-        "executor",
+    # These fields belonged to the removed workflow/consensus/CLI verifier.
+    # Preserve genuinely unknown extension fields, but do not keep rewriting
+    # settings that this product can no longer execute.
+    for obsolete in (
         "collaboration_mode",
-        "group_chat_default_agent",
-        "group_chat_execution",
+        "executor",
         "planning_collaboration",
         "consensus",
         "max_consensus_rounds",
@@ -2029,12 +2478,17 @@ def _merge_known_config(
         "max_plan_revisions",
         "review_rounds",
         "final_review",
+        "identities",
+        "verification",
+    ):
+        merged.pop(obsolete, None)
+    for key in (
+        "group_chat_default_agent",
+        "group_chat_execution",
     ):
         merged[key] = config[key]
     for section, known_keys in (
-        ("identities", ("agent_a", "agent_b")),
         ("group_chat_identities", ("agent_a", "agent_b")),
-        ("verification", ("timeout", "commands")),
         ("token_api", ("enabled", "base_url")),
         (
             "claude",
@@ -2044,7 +2498,7 @@ def _merge_known_config(
             "codex",
             ("command", "model", "models", "fallback_on_timeout", "timeout", "extra_args"),
         ),
-        ("ui", ("theme", "show_archived", "compact_sidebar")),
+        ("ui", ("theme", "show_archived", "compact_sidebar", "stream_model_text", "browser_notifications")),
     ):
         current = merged.get(section)
         nested = dict(current) if isinstance(current, dict) else {}
@@ -2103,32 +2557,21 @@ def _public_record(record: dict[str, Any]) -> dict[str, Any]:
         "display_task",
         "attachments",
         "workspace",
-        "executor",
-        "consensus",
-        "collaboration_mode",
         "status",
-        "phase",
         "created_at",
         "updated_at",
         "attempts",
         "error",
-        "approved",
-        "review_count",
-        "technical_document",
         "archived",
         "archived_at",
-        "checkpoint",
-        "collaboration",
         "events",
         "summary",
-        "quality",
         "group_chat",
     }
     public = {key: value for key, value in record.items() if key in allowed}
     public["error"] = _safe_public_error(
         public.get("error"),
         status=str(public.get("status", "")),
-        collaboration_mode=str(public.get("collaboration_mode", "workflow")),
     )
     return public
 
@@ -2137,7 +2580,6 @@ def _safe_public_error(
     error: object,
     *,
     status: str,
-    collaboration_mode: str,
 ) -> str:
     """Map internal failures to stable UI text without exposing native details."""
 
@@ -2148,20 +2590,8 @@ def _safe_public_error(
     if status == "cancelled":
         return "任务已取消"
     if status == "failed":
-        return "群聊处理失败" if collaboration_mode == "group_chat" else "任务执行失败"
-    if collaboration_mode == "group_chat":
-        return "部分 Agent 本轮执行失败"
-    return "任务执行未完成"
-
-
-def _result_payload(result: AgentRunResult) -> dict[str, Any]:
-    return {
-        "agent": result.agent,
-        "final_text": result.final_text,
-        "duration_seconds": result.duration_seconds,
-        "input_tokens": result.input_tokens,
-        "output_tokens": result.output_tokens,
-    }
+        return "群聊处理失败"
+    return "部分 Agent 本轮执行失败"
 
 
 def _group_chat_summary(state: dict[str, Any]) -> dict[str, Any]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -9,11 +10,21 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .adapters import BaseCLIAdapter
-from .bridge_models import AgentEvent, AgentRunResult, BridgeError, BridgeSettings
+from .bridge_models import (
+    AgentEvent,
+    AgentRunResult,
+    AgentTimeoutError,
+    BridgeError,
+    BridgeSettings,
+)
 from .workspace_state import capture_change_baseline, summarize_workspace_changes
+from .workspace_coordinator import WorkspaceCoordinator, WorkspaceCoordinatorError
 GROUP_CHAT_PROTOCOL = "multiagent.group_chat.v2"
 GROUP_CHAT_AGENTS = ("claude", "codex")
 MAX_GROUP_CHAT_MESSAGE_CHARS = 50_000
+
+# 单调递增计数器，避免删除/编辑消息后出现位置派生 ID 碰撞
+_MESSAGE_ID_COUNTER = itertools.count(1)
 
 _MENTION_RE = re.compile(r"(?<![\w@])@([A-Za-z][A-Za-z0-9_-]*)")
 _MENTION_ALIASES = {
@@ -29,6 +40,14 @@ _MENTION_ALIASES = {
 _BROADCAST_MENTIONS = {"all", "both", "everyone"}
 _EXECUTION_PREFIX_RE = re.compile(
     r"^(?:/(?:exec|run)(?:\s|$)|(?:(?:请|让|现在)\s*)?[,，:：]?\s*执行(?:一下|任务)?(?:\s|[:：,，]|$))",
+    re.IGNORECASE,
+)
+_READ_INTENT_RE = re.compile(
+    r"(?:读取|读一下|阅读|查看|检查|看看|分析|解释|说明|审核|审阅|总结|比较|评估|为什么|怎么|是否|有哪些|告诉我|回答)",
+    re.IGNORECASE,
+)
+_WRITE_INTENT_RE = re.compile(
+    r"(?:修改|改动|改一下|修复|实现|添加|删除|创建|写入|重构|重命名|生成文件|落地|提交代码)",
     re.IGNORECASE,
 )
 
@@ -63,6 +82,16 @@ class GroupChatTurn:
     changes: dict[str, Any] | None = None
 
 
+@dataclass(frozen=True)
+class GroupChatReservation:
+    """An agent slot reserved for one in-flight group-chat turn."""
+
+    token: str
+    message: str
+    recipients: tuple[str, ...]
+    action: str
+
+
 class GroupChatEngine:
     """Persistent group chat with explicit single-writer execution turns."""
 
@@ -81,6 +110,9 @@ class GroupChatEngine:
         ) or tuple(self.adapters)
         self._state = _restore_state(state, self.agent_names)
         self._lock = threading.RLock()
+        self._busy_agents: dict[str, str] = {}
+        self._reservation_sequence = itertools.count(1)
+        self.workspace_coordinator = WorkspaceCoordinator()
 
     def to_dict(self) -> dict[str, Any]:
         with self._lock:
@@ -94,15 +126,12 @@ class GroupChatEngine:
                 "execution_cursors": dict(self._state["execution_cursors"]),
             }
 
-    def ask(
+    def reserve(
         self,
         text: str,
         *,
-        agent_text: str | None = None,
-        attachments: list[dict[str, Any]] | None = None,
-        on_event: Callable[[AgentEvent], None] | None = None,
-        on_state: Callable[[dict[str, Any]], None] | None = None,
-    ) -> GroupChatTurn:
+        forced_recipients: tuple[str, ...] | None = None,
+    ) -> GroupChatReservation:
         message = text.strip()
         if not message:
             raise BridgeError("群聊消息不能为空")
@@ -124,19 +153,129 @@ class GroupChatEngine:
             self.agent_names,
             default_agents=default_agents or self.agent_names,
         )
+        if forced_recipients is not None:
+            recipients = tuple(
+                agent for agent in self.agent_names if agent in forced_recipients
+            )
+            if not recipients:
+                raise BridgeError("没有可用的目标 Agent")
         if action == "execute" and not self.settings.group_chat_execution:
             raise BridgeError(
-                "群聊执行已在设置中关闭；请开启“允许执行指令”后再试"
+                "群聊执行已在设置中关闭；请开启“允许 Agent 自主写入工作区”后再试"
             )
         if action == "execute" and len(recipients) != 1:
             raise BridgeError(
                 "同一工作区一次只能由一个 Agent 执行；"
                 "请使用 @Claude 或 @Codex 明确指定写入者"
             )
-        change_baseline = (
-            capture_change_baseline(self.settings.workspace)
-            if action == "execute"
-            else None
+        with self._lock:
+            busy = [agent for agent in recipients if agent in self._busy_agents]
+            if busy:
+                labels = "、".join(self.adapters[agent].display_name for agent in busy)
+                raise BridgeError(
+                    f"{labels} 正在回复上一条消息；请先点名另一个空闲 Agent，"
+                    "避免同一个 Agent 的上下文并发交错"
+                )
+            token = f"chat-turn-{next(self._reservation_sequence)}"
+            for agent in recipients:
+                self._busy_agents[agent] = token
+        return GroupChatReservation(token, message, recipients, action)
+
+    def release(self, reservation: GroupChatReservation) -> None:
+        with self._lock:
+            for agent in reservation.recipients:
+                if self._busy_agents.get(agent) == reservation.token:
+                    self._busy_agents.pop(agent, None)
+
+    def active_agents(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(agent for agent in self.agent_names if agent in self._busy_agents)
+
+    def find_message(self, message_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            for message in self._state["messages"]:
+                if message.get("id") == message_id:
+                    return dict(message)
+        return None
+
+    def find_parent_user(self, message_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            target = next(
+                (item for item in self._state["messages"] if item.get("id") == message_id),
+                None,
+            )
+            if not target:
+                return None
+            parent_id = str(target.get("reply_to") or "")
+            if target.get("role") == "user":
+                return dict(target)
+            return next(
+                (dict(item) for item in self._state["messages"] if item.get("id") == parent_id),
+                None,
+            )
+
+    def ask(
+        self,
+        text: str,
+        *,
+        agent_text: str | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        on_event: Callable[[AgentEvent], None] | None = None,
+        on_state: Callable[[dict[str, Any]], None] | None = None,
+        reservation: GroupChatReservation | None = None,
+        edited_from: str = "",
+        hidden_user: bool = False,
+        reply_to: str = "",
+        retry_of: str = "",
+        retry_mode: str = "",
+    ) -> GroupChatTurn:
+        current = reservation or self.reserve(text)
+        try:
+            return self._ask_reserved(
+                text,
+                agent_text=agent_text,
+                attachments=attachments,
+                on_event=on_event,
+                on_state=on_state,
+                reservation=current,
+                edited_from=edited_from,
+                hidden_user=hidden_user,
+                reply_to=reply_to,
+                retry_of=retry_of,
+                retry_mode=retry_mode,
+            )
+        finally:
+            self.release(current)
+
+    def _ask_reserved(
+        self,
+        text: str,
+        *,
+        agent_text: str | None,
+        attachments: list[dict[str, Any]] | None,
+        on_event: Callable[[AgentEvent], None] | None,
+        on_state: Callable[[dict[str, Any]], None] | None,
+        reservation: GroupChatReservation,
+        edited_from: str,
+        hidden_user: bool,
+        reply_to: str,
+        retry_of: str,
+        retry_mode: str,
+    ) -> GroupChatTurn:
+        message = reservation.message
+        recipients = reservation.recipients
+        action = reservation.action
+        # Write access is decided per agent, not by the /exec gate alone:
+        # a single-mentioned recipient with the execution toggle on gets the
+        # workspace in write mode and decides from the message whether edits
+        # are warranted; multi-recipient turns stay read-only so two agents
+        # never write the same workspace concurrently.
+        write_recipients = frozenset(
+            recipients
+            if self.settings.group_chat_execution
+            and len(recipients) == 1
+            and _should_grant_write(message, action)
+            else ()
         )
         with self._lock:
             self._state["turn"] += 1
@@ -149,16 +288,23 @@ class GroupChatEngine:
                 agent_content=(agent_text or message).strip(),
                 attachments=attachments or [],
                 action=action,
+                edited_from=edited_from,
+                hidden=hidden_user,
+                retry_of=retry_of,
+                retry_mode=retry_mode,
             )
+            snapshot_length = len(self._state["messages"])
+            # Hidden retry messages are hidden only from the browser feed. They
+            # must remain in the prompt so a resumed Agent receives an explicit
+            # new-generation instruction instead of silently reusing the old
+            # turn without any new user input.
+            prompt_messages = list(self._state["messages"][:snapshot_length])
             state_after_user = self.to_dict()
         if on_state is not None:
             on_state(state_after_user)
 
-        workspaces: dict[str, Path] = {
-            agent: self.settings.workspace for agent in recipients
-        }
+        workspaces: dict[str, Path] = {agent: self.settings.workspace for agent in recipients}
         with self._lock:
-            snapshot_length = len(self._state["messages"])
             session_key, cursor_key = _channel_keys(action)
             for agent in recipients:
                 if not _session_resume_enabled(self.adapters[agent]):
@@ -179,23 +325,27 @@ class GroupChatEngine:
                     action,
                     has_session=bool(sessions[agent]),
                     workspace=workspaces[agent],
+                    can_write=agent in write_recipients,
+                    messages=prompt_messages,
                 )
                 for agent in recipients
             }
 
         results: dict[str, AgentRunResult] = {}
         errors: dict[str, str] = {}
+        failure_reasons: dict[str, str] = {}
+        changes_by_agent: dict[str, dict[str, Any] | None] = {}
         with ThreadPoolExecutor(
             max_workers=len(recipients),
             thread_name_prefix="multiagent-group-chat",
         ) as executor:
             futures = {
                 executor.submit(
-                    self.adapters[agent].run,
+                    self._run_agent,
+                    agent,
                     prompts[agent],
-                    workspace=workspaces[agent],
-                    mode="write" if action == "execute" else "read",
                     session_id=sessions[agent],
+                    write=agent in write_recipients,
                     on_event=on_event,
                     step_id=f"group_chat_turn_{turn}_{agent}",
                 ): agent
@@ -204,21 +354,38 @@ class GroupChatEngine:
             for future in as_completed(futures):
                 agent = futures[future]
                 try:
-                    results[agent] = future.result()
+                    result, changes = future.result()
+                    results[agent] = result
+                    changes_by_agent[agent] = changes
                 except Exception as exc:
                     errors[agent] = str(exc) or exc.__class__.__name__
-
-        changes = (
-            summarize_workspace_changes(self.settings.workspace, change_baseline)
-            if action == "execute"
-            else None
+                    failure_reasons[agent] = _agent_failure_reason(exc)
+        reportable_changes = next(
+            (changes_by_agent.get(agent) for agent in recipients if changes_by_agent.get(agent)),
+            None,
         )
         with self._lock:
-            if changes is not None and not results:
-                user_message["changes"] = changes
+            if reportable_changes is not None and not results:
+                user_message["changes"] = reportable_changes
             for agent in recipients:
                 result = results.get(agent)
                 if result is None:
+                    if agent in errors:
+                        failure_reason = failure_reasons.get(agent, "error")
+                        self._append_message(
+                            sender=agent,
+                            role="assistant",
+                            content=_agent_failure_content(
+                                self.adapters[agent].display_name,
+                                failure_reason,
+                            ),
+                            recipients=("user", *self.agent_names),
+                            reply_to=reply_to or user_message["id"],
+                            action=action,
+                            failure_reason=failure_reason,
+                            retry_of=retry_of,
+                            retry_mode=retry_mode,
+                        )
                     continue
                 if _session_resume_enabled(self.adapters[agent]) and result.session_id:
                     self._state[cursor_key][agent] = snapshot_length
@@ -228,18 +395,21 @@ class GroupChatEngine:
                 else:
                     self._state[cursor_key][agent] = 0
                     self._state[session_key][agent] = None
+                agent_can_write = agent in write_recipients
                 self._append_message(
                     sender=agent,
                     role="assistant",
                     content=result.final_text,
                     recipients=("user", *self.agent_names),
-                    reply_to=user_message["id"],
+                    reply_to=reply_to or user_message["id"],
                     duration_seconds=result.duration_seconds,
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
                     action=action,
-                    workspace=str(workspaces[agent]) if action == "execute" else "",
-                    changes=changes if action == "execute" else None,
+                    workspace=str(workspaces[agent]) if agent_can_write else "",
+                    changes=changes_by_agent.get(agent) if agent_can_write else None,
+                    retry_of=retry_of,
+                    retry_mode=retry_mode,
                 )
             final_state = self.to_dict()
         if on_state is not None:
@@ -253,10 +423,55 @@ class GroupChatEngine:
             workspaces={
                 agent: str(workspaces[agent])
                 for agent in recipients
-                if action == "execute"
+                if agent in write_recipients
             },
-            changes=changes,
+            changes=reportable_changes,
         )
+
+    def _run_agent(
+        self,
+        agent: str,
+        prompt: str,
+        *,
+        session_id: str | None,
+        write: bool,
+        on_event: Callable[[AgentEvent], None] | None,
+        step_id: str,
+    ) -> tuple[AgentRunResult, dict[str, Any] | None]:
+        try:
+            lease = self.workspace_coordinator.acquire(
+                self.settings.workspace,
+                owner=step_id,
+                access="write" if write else "read",
+            )
+        except WorkspaceCoordinatorError as exc:
+            raise BridgeError(str(exc)) from exc
+        baseline = capture_change_baseline(lease.workspace) if write else None
+        try:
+            result = self.adapters[agent].run(
+                prompt,
+                workspace=lease.workspace,
+                mode="write" if write else "read",
+                session_id=session_id,
+                on_event=on_event,
+                step_id=step_id,
+            )
+            if baseline is None:
+                changes = None
+            else:
+                raw_changes = summarize_workspace_changes(lease.workspace, baseline)
+                changes = (
+                    raw_changes
+                    if _has_file_changes(raw_changes) or raw_changes.get("available") is False
+                    else None
+                )
+            release = lease.release()
+            if not release.get("merged", True):
+                raise BridgeError(str(release.get("error") or "隔离 Worktree 合并失败"))
+            return result, changes
+        except BaseException:
+            lease.release()
+            raise
 
     def _prompt_for(
         self,
@@ -266,10 +481,12 @@ class GroupChatEngine:
         *,
         has_session: bool,
         workspace: Path,
+        can_write: bool = False,
+        messages: list[dict[str, Any]] | None = None,
     ) -> str:
         _session_key, cursor_key = _channel_keys(action)
         cursor = int(self._state[cursor_key].get(agent, 0)) if has_session else 0
-        messages = self._state["messages"][cursor:]
+        messages = (messages if messages is not None else self._state["messages"])[cursor:]
         visible = [
             message
             for message in messages
@@ -278,6 +495,7 @@ class GroupChatEngine:
                 and message.get("role") == "assistant"
                 and message.get("sender") == agent
                 and message.get("action", "discuss") == action
+                and bool(message.get("workspace")) == can_write
             )
         ]
         transcript = "\n\n".join(_format_message(item) for item in visible)
@@ -290,11 +508,28 @@ class GroupChatEngine:
             route = f"用户本轮只授权 {self.adapters[agent].display_name} 执行。"
             permission_note = (
                 "本轮用户已明确授权写操作，且你是此工作区唯一写入者。"
-                f"只能在目标工作区 `{workspace}` 中检查、修改和验证文件；"
+                "只能在本轮进程实际打开的工作区中检查、修改和验证文件；"
                 "不要提交 Git，也不要假设另一位 Agent 会同时修改代码。"
             )
             completion_note = (
                 "完成后说明修改文件、验证结果和尚存风险。"
+            )
+        elif can_write:
+            route = (
+                f"用户本轮只要求 {self.adapters[agent].display_name} 回答，"
+                "写权限已下放给你自主判断。"
+            )
+            permission_note = (
+                "本轮你持有目标工作区的写权限，且是唯一写入者。"
+                "根据用户消息自行判断是否需要修改文件："
+                "只是提问、讨论或审核就保持只读作答；"
+                "消息明确要求或隐含需要改动时才写入。"
+                "只能在本轮进程实际打开的工作区中检查、修改和验证文件；"
+                "不要提交 Git。"
+            )
+            completion_note = (
+                "若修改了文件，完成后说明修改文件、验证结果和尚存风险；"
+                "若判断无需修改，正常作答即可。"
             )
         else:
             route = (
@@ -336,9 +571,14 @@ class GroupChatEngine:
         action: str = "discuss",
         workspace: str = "",
         changes: dict[str, Any] | None = None,
+        edited_from: str = "",
+        hidden: bool = False,
+        retry_of: str = "",
+        retry_mode: str = "",
+        failure_reason: str = "",
     ) -> dict[str, Any]:
         item: dict[str, Any] = {
-            "id": f"m{len(self._state['messages']) + 1}",
+            "id": _next_message_id(),
             "sender": sender,
             "role": role,
             "content": content,
@@ -346,6 +586,17 @@ class GroupChatEngine:
             "created_at": _timestamp(),
             "action": action,
         }
+        if edited_from:
+            item["edited_from"] = edited_from
+        if hidden:
+            item["hidden"] = True
+        if retry_of:
+            item["retry_of"] = retry_of
+        if retry_mode:
+            item["retry_mode"] = retry_mode
+        if failure_reason:
+            item["status"] = "failed"
+            item["failure_reason"] = failure_reason
         if agent_content and agent_content != content:
             item["agent_content"] = agent_content
         if attachments:
@@ -364,6 +615,23 @@ class GroupChatEngine:
             item["changes"] = changes
         self._state["messages"].append(item)
         return item
+
+
+def _agent_failure_reason(error: object) -> str:
+    if isinstance(error, AgentTimeoutError):
+        return "timeout"
+    text = str(error or "").lower()
+    return (
+        "timeout"
+        if "timeout" in text or "timed out" in text or "超时" in text
+        else "error"
+    )
+
+
+def _agent_failure_content(agent_name: str, reason: str) -> str:
+    if reason == "timeout":
+        return f"响应超时。{agent_name} 未能在限定时间内完成本轮回复。"
+    return f"响应失败。{agent_name} 未能完成本轮回复。"
 
 
 def resolve_mentions(
@@ -424,6 +692,63 @@ def _session_resume_enabled(adapter: BaseCLIAdapter) -> bool:
     return getattr(adapter, "session_resume_enabled", True) is not False
 
 
+def _has_file_changes(changes: dict[str, Any] | None) -> bool:
+    """True only when Git actually reported changed files in the workspace.
+
+    ``summarize_workspace_changes`` always returns a dict -- including an
+    "unavailable" one for non-Git workspaces -- so truthiness alone would treat
+    every turn as if the agent had written something.
+    """
+
+    if not isinstance(changes, dict) or changes.get("available") is False:
+        return False
+    count = changes.get("file_count")
+    if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+        return True
+    files = changes.get("files")
+    return isinstance(files, list) and bool(files)
+
+
+def _should_grant_write(message: str, action: str) -> bool:
+    """Grant solo write access only when the wording implies implementation."""
+
+    if action == "execute" or _WRITE_INTENT_RE.search(message):
+        return True
+    return not bool(_READ_INTENT_RE.search(message))
+
+
+def _next_message_id() -> str:
+    """Monotonically-increasing message id, seeded from persisted state on restore."""
+
+    return f"m{next(_MESSAGE_ID_COUNTER)}"
+
+
+def _seed_message_id_counter(messages: list[dict[str, Any]]) -> None:
+    """Advance the global counter past any persisted ids to avoid collisions.
+
+    Older runs stored positional ids (m1, m2, ...); after restart or session
+    eviction, appending a new message must not reuse an id that already exists
+    in the persisted record.
+    """
+
+    highest = 0
+    for message in messages:
+        raw = message.get("id") if isinstance(message, dict) else None
+        if not isinstance(raw, str):
+            continue
+        match = re.fullmatch(r"m(\d+)", raw)
+        if not match:
+            continue
+        highest = max(highest, int(match.group(1)))
+    if highest <= 0:
+        return
+    # itertools.count has no public seek; advance by consuming values.
+    while True:
+        current = next(_MESSAGE_ID_COUNTER)
+        if current >= highest:
+            break
+
+
 def _format_message(message: dict[str, Any]) -> str:
     sender = {
         "user": "用户",
@@ -439,6 +764,9 @@ def _format_message(message: dict[str, Any]) -> str:
         for value in message.get("recipients", [])
     )
     content = str(message.get("agent_content") or message.get("content") or "")
+    if message.get("retry_of"):
+        mode = "继续生成" if message.get("retry_mode") == "continue" else "重新生成"
+        content = f"[系统：请对关联回复执行{mode}，不要把本条系统指令直接回复给用户。]\n{content}"
     action = "执行" if message.get("action") == "execute" else "讨论"
     return (
         f"[{message.get('id', '?')}] [{action}] "
@@ -464,6 +792,7 @@ def _restore_state(state: object, agents: tuple[str, ...]) -> dict[str, Any]:
             message = _restore_message(raw)
             if message is not None:
                 restored["messages"].append(message)
+    _seed_message_id_counter(restored["messages"])
     turn = state.get("turn")
     if isinstance(turn, int) and not isinstance(turn, bool) and turn >= 0:
         restored["turn"] = turn

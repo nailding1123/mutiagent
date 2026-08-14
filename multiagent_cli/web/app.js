@@ -3,7 +3,6 @@ const state = {
   runs: [],
   currentId: null,
   detail: null,
-  feedbackAction: null,
   mainView: 'chat',
   detailView: 'overview',
   detailAgent: 'claude',
@@ -16,7 +15,9 @@ const state = {
   renameRunId: null,
   searchQuery: '',
   searchArchivedOpen: true,
-  taskFiles: [],
+  newTaskFiles: [],
+  composerFiles: [],
+  previewUrls: new WeakMap(),
   returnToNewTaskAfterSettings: false,
   draftTaskMode: null,
   workspaceBrowserPath: '',
@@ -26,14 +27,31 @@ const state = {
   openChangeFiles: new Set(),
   pendingChatMessages: new Map(),
   pendingChatSequence: 0,
+  messageTexts: new Map(),
+  feedPinnedToBottom: true,
+  streamBuffers: new Map(),
+  streamModelText: false,
+  streamRefreshTimer: null,
+  streamRefreshAt: 0,
   interfaceSavePromise: Promise.resolve(),
   modelCatalog: null,
   modelOrders: { claude: [], codex: [] },
   draggedModel: null,
+  nativeInteractionId: null,
+  nativeInteractionRunId: null,
+  editingMessageId: null,
+  unreadRuns: new Set(),
+  notifiedEvents: new Set(),
+  notificationsEnabled: false,
+  draftSaveTimer: null,
+  draftLoadedRunId: null,
 };
 
-const ACTIVE_RUN_STATUSES = new Set(['starting', 'running', 'awaiting_plan', 'stopping']);
+const ACTIVE_RUN_STATUSES = new Set(['starting', 'running', 'awaiting_interaction', 'stopping']);
 const DOCUMENT_EXTENSIONS = new Set(['csv', 'doc', 'docx', 'html', 'json', 'md', 'odt', 'pdf', 'ppt', 'pptx', 'rtf', 'txt', 'xls', 'xlsx', 'xml', 'yaml', 'yml']);
+// Raster images only; svg is excluded server-side as a stored-XSS vector.
+const IMAGE_EXTENSIONS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp']);
+const UPLOAD_EXTENSIONS = new Set([...DOCUMENT_EXTENSIONS, ...IMAGE_EXTENSIONS]);
 const MAX_DOCUMENT_FILES = 5;
 const MAX_DOCUMENT_FILE_BYTES = 10_000_000;
 const MAX_DOCUMENT_TOTAL_BYTES = 20_000_000;
@@ -60,7 +78,6 @@ const el = {
   refresh: document.querySelector('#refresh-button'),
   newTask: document.querySelector('#new-task-button'),
   emptyNewTask: document.querySelector('#empty-new-task-button'),
-  tasksNew: document.querySelector('#tasks-new-button'),
   search: document.querySelector('#search-button'),
   searchPanel: document.querySelector('#run-search-panel'),
   searchInput: document.querySelector('#run-search-input'),
@@ -68,12 +85,10 @@ const el = {
   emptyState: document.querySelector('#empty-state'),
   runView: document.querySelector('#run-view'),
   chatView: document.querySelector('#chat-view'),
-  tasksView: document.querySelector('#tasks-view'),
   workspaceChip: document.querySelector('#workspace-chip'),
   sidebarWorkspace: document.querySelector('#sidebar-workspace'),
   connectionDot: document.querySelector('#connection-dot'),
   stopTaskButton: document.querySelector('#stop-task-button'),
-  resumeButton: document.querySelector('#resume-button'),
   claudeStatus: document.querySelector('#claude-status'),
   codexStatus: document.querySelector('#codex-status'),
   claudeNavDot: document.querySelector('#claude-nav-dot'),
@@ -81,15 +96,11 @@ const el = {
   statusBadge: document.querySelector('#run-status-badge'),
   errorBanner: document.querySelector('#error-banner'),
   artifactFeed: document.querySelector('#artifact-feed'),
+  feedJump: document.querySelector('#feed-jump-button'),
   overview: document.querySelector('#run-overview'),
   runTimeline: document.querySelector('#run-timeline'),
   runTimelineCount: document.querySelector('#run-timeline-count'),
   eventTimeline: document.querySelector('#event-timeline'),
-  evidenceBoard: document.querySelector('#evidence-board'),
-  kanban: document.querySelector('#kanban-board'),
-  taskCount: document.querySelector('#task-count-label'),
-  planGate: document.querySelector('#plan-gate'),
-  planGateNote: document.querySelector('#plan-gate-note'),
   messageForm: document.querySelector('#message-form'),
   quickTaskInput: document.querySelector('#quick-task-input'),
   quickTaskSubmit: document.querySelector('#quick-task-submit'),
@@ -100,7 +111,6 @@ const el = {
   detailTitle: document.querySelector('#detail-title'),
   detailSubtitle: document.querySelector('#detail-subtitle'),
   detailOverview: document.querySelector('#detail-overview'),
-  detailEvidence: document.querySelector('#detail-evidence'),
   detailAgentPanel: document.querySelector('#detail-agent'),
   agentProfile: document.querySelector('#agent-profile'),
   closeDetails: document.querySelector('#close-details-button'),
@@ -111,6 +121,8 @@ const el = {
   documentInput: document.querySelector('#task-document-input'),
   documentDropZone: document.querySelector('#document-drop-zone'),
   documentList: document.querySelector('#selected-document-list'),
+  composerFileInput: document.querySelector('#composer-file-input'),
+  composerAttachmentList: document.querySelector('#composer-attachment-list'),
   taskDefaultsSummary: document.querySelector('#task-defaults-summary'),
   taskSettings: document.querySelector('#task-settings-button'),
   taskSubmit: document.querySelector('#task-submit'),
@@ -131,14 +143,18 @@ const el = {
   workspaceBrowserClose: document.querySelector('#settings-workspace-close'),
   workspaceSelect: document.querySelector('#settings-workspace-select'),
   shutdownUi: document.querySelector('#shutdown-ui-button'),
-  feedbackDialog: document.querySelector('#feedback-dialog'),
-  feedbackForm: document.querySelector('#feedback-form'),
-  feedbackTitle: document.querySelector('#feedback-title'),
-  feedbackInput: document.querySelector('#feedback-input'),
-  targetAgentField: document.querySelector('#target-agent-field'),
-  targetAgentInput: document.querySelector('#target-agent-input'),
-  feedbackError: document.querySelector('#feedback-error'),
-  feedbackSubmit: document.querySelector('#feedback-submit'),
+  nativeInteractionDialog: document.querySelector('#native-interaction-dialog'),
+  nativeInteractionForm: document.querySelector('#native-interaction-form'),
+  nativeInteractionSource: document.querySelector('#native-interaction-source'),
+  nativeInteractionTitle: document.querySelector('#native-interaction-title'),
+  nativeInteractionQueue: document.querySelector('#native-interaction-queue'),
+  nativeInteractionMessage: document.querySelector('#native-interaction-message'),
+  nativeInteractionCommand: document.querySelector('#native-interaction-command'),
+  nativeInteractionCwd: document.querySelector('#native-interaction-cwd'),
+  nativeInteractionQuestions: document.querySelector('#native-interaction-questions'),
+  nativeInteractionError: document.querySelector('#native-interaction-error'),
+  nativeInteractionActions: document.querySelector('#native-interaction-actions'),
+  nativeInteractionClose: document.querySelector('#native-interaction-close'),
   toast: document.querySelector('#toast'),
 };
 
@@ -170,6 +186,7 @@ async function bootstrap() {
   bindEvents();
   try {
     state.health = await api('/api/health');
+    loadUnreadRuns(state.health.workspace);
     el.workspaceChip.textContent = state.health.workspace;
     el.sidebarWorkspace.textContent = workspaceFolderName(state.health.workspace);
     await loadSettings(state.health.workspace);
@@ -202,13 +219,12 @@ function renderDirectFileNotice() {
 }
 
 function bindEvents() {
-  [el.newTask, el.emptyNewTask, el.tasksNew].forEach((button) => {
+  [el.newTask, el.emptyNewTask].forEach((button) => {
     button.addEventListener('click', openNewTask);
   });
   el.refresh.addEventListener('click', () => void refreshAll());
   el.archivedToggle.addEventListener('click', toggleArchivedRuns);
   el.stopTaskButton.addEventListener('click', () => void stopCurrentTask());
-  el.resumeButton.addEventListener('click', () => void resumeCurrent());
   el.search.addEventListener('click', openRunSearch);
   el.closeSearch.addEventListener('click', closeRunSearch);
   el.searchInput.addEventListener('input', () => {
@@ -223,7 +239,7 @@ function bindEvents() {
     el.quickSettings,
   ].forEach((button) => button.addEventListener('click', () => void openSettings()));
   document.querySelector('#project-switcher').addEventListener('click', () => void openSettings());
-  document.querySelector('#open-details-button').addEventListener('click', () => openDetails('evidence'));
+  document.querySelector('#open-details-button').addEventListener('click', () => openDetails('overview'));
   document.querySelector('#header-details-button').addEventListener('click', () => openDetails('overview'));
   el.closeDetails.addEventListener('click', closeDetails);
 
@@ -241,17 +257,59 @@ function bindEvents() {
   });
 
   el.artifactFeed.addEventListener('click', (event) => {
-    const button = event.target.closest('[data-open-detail]');
-    if (button) openDetails(button.dataset.openDetail);
+    const detail = event.target.closest('[data-open-detail]');
+    if (detail) {
+      openDetails(detail.dataset.openDetail);
+      return;
+    }
+    const codeCopy = event.target.closest('[data-code-copy]');
+    if (codeCopy) {
+      const code = codeCopy.closest('.code-block')?.querySelector('code');
+      void copyText(code?.textContent || '', '代码');
+      return;
+    }
+    const copy = event.target.closest('[data-message-copy]');
+    if (copy) {
+      void copyText(state.messageTexts.get(copy.dataset.messageCopy) || '', '消息原文');
+      return;
+    }
+    const quote = event.target.closest('[data-message-quote]');
+    if (quote) {
+      quoteMessage(quote.dataset.messageQuote);
+      return;
+    }
+    const edit = event.target.closest('[data-message-edit]');
+    if (edit) {
+      editMessage(edit.dataset.messageEdit);
+      return;
+    }
+    const retry = event.target.closest('[data-message-retry]');
+    if (retry) void retryMessage(retry.dataset.messageRetry, retry.dataset.retryMode || 'regenerate');
   });
   el.artifactFeed.addEventListener('toggle', handleChangeToggle, true);
+  el.artifactFeed.addEventListener('scroll', () => {
+    state.feedPinnedToBottom = isFeedNearBottom();
+    updateFeedJumpButton();
+  }, { passive: true });
+  el.feedJump.addEventListener('click', () => {
+    state.feedPinnedToBottom = true;
+    scrollChatToBottom();
+    updateFeedJumpButton();
+  });
 
   el.messageForm.addEventListener('submit', (event) => {
     event.preventDefault();
     void submitQuickTask();
   });
   el.quickTaskInput.addEventListener('input', updateMentionMenu);
+  el.quickTaskInput.addEventListener('input', resizeComposer);
+  el.quickTaskInput.addEventListener('input', scheduleDraftSave);
   el.quickTaskInput.addEventListener('keydown', handleComposerKeydown);
+  // Pasted screenshots arrive as File objects with empty/generic names;
+  // synthesize a stable name so the upload passes extension validation.
+  el.quickTaskInput.addEventListener('paste', handleComposerPaste);
+  el.taskInput.addEventListener('paste', handleComposerPaste);
+  el.taskInput.addEventListener('input', scheduleNewTaskDraftSave);
   el.quickTaskInput.addEventListener('blur', () => {
     window.setTimeout(hideMentionMenu, 100);
   });
@@ -261,16 +319,14 @@ function bindEvents() {
     event.preventDefault();
     insertMention(option.dataset.mention);
   });
-  el.quickAttach.addEventListener('click', () => {
-    if (!el.taskInput.value.trim() && el.quickTaskInput.value.trim()) {
-      el.taskInput.value = el.quickTaskInput.value.trim();
-    }
-    openNewTask();
-    el.documentInput.click();
+  el.quickAttach.addEventListener('click', () => el.composerFileInput.click());
+  el.composerFileInput.addEventListener('change', () => {
+    addTaskFiles(el.composerFileInput.files, 'composer');
+    el.composerFileInput.value = '';
   });
 
   el.documentInput.addEventListener('change', () => {
-    addTaskFiles(el.documentInput.files);
+    addTaskFiles(el.documentInput.files, 'task');
     el.documentInput.value = '';
   });
   ['dragenter', 'dragover'].forEach((name) => {
@@ -285,14 +341,36 @@ function bindEvents() {
       el.documentDropZone.classList.remove('dragging');
     });
   });
-  el.documentDropZone.addEventListener('drop', (event) => addTaskFiles(event.dataTransfer?.files));
+  el.documentDropZone.addEventListener('drop', (event) => addTaskFiles(event.dataTransfer?.files, 'task'));
   el.documentList.addEventListener('click', (event) => {
     const button = event.target.closest('[data-remove-document]');
     if (!button) return;
-    state.taskFiles.splice(Number(button.dataset.removeDocument), 1);
+    const [removed] = state.newTaskFiles.splice(Number(button.dataset.removeDocument), 1);
+    releasePreviewUrl(removed);
     renderTaskFiles();
     hideFormError(el.formError);
   });
+  el.composerAttachmentList.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-remove-composer-document]');
+    if (!button) return;
+    const [removed] = state.composerFiles.splice(Number(button.dataset.removeComposerDocument), 1);
+    releasePreviewUrl(removed);
+    renderTaskFiles();
+  });
+  ['dragenter', 'dragover'].forEach((name) => {
+    el.messageForm.addEventListener(name, (event) => {
+      if (!event.dataTransfer?.types?.includes('Files')) return;
+      event.preventDefault();
+      el.messageForm.classList.add('composer-dragging');
+    });
+  });
+  ['dragleave', 'drop'].forEach((name) => {
+    el.messageForm.addEventListener(name, (event) => {
+      if (name === 'drop') event.preventDefault();
+      el.messageForm.classList.remove('composer-dragging');
+    });
+  });
+  el.messageForm.addEventListener('drop', (event) => addTaskFiles(event.dataTransfer?.files, 'composer'));
 
   el.newTaskForm.addEventListener('submit', (event) => {
     event.preventDefault();
@@ -332,8 +410,6 @@ function bindEvents() {
   document.querySelectorAll('[data-settings-tab]').forEach((button) => {
     button.addEventListener('click', () => setSettingsTab(button.dataset.settingsTab));
   });
-  document.querySelector('#settings-planning-collaboration').addEventListener('change', updateSettingsDependencies);
-  document.querySelector('#settings-collaboration-mode').addEventListener('change', updateSettingsDependencies);
   document.querySelector('#settings-token-api-enabled').addEventListener('change', (event) => {
     if (!event.currentTarget.checked || !state.modelCatalog?.defaults) return;
     ['claude', 'codex'].forEach((agent) => {
@@ -359,17 +435,26 @@ function bindEvents() {
   document.querySelector('#settings-compact-sidebar').addEventListener('change', (event) => {
     void saveInterfacePreferences({ compact_sidebar: event.currentTarget.checked });
   });
+  document.querySelector('#settings-stream-model-text').addEventListener('change', (event) => {
+    void saveInterfacePreferences({ stream_model_text: event.currentTarget.checked });
+  });
+  document.querySelector('#settings-browser-notifications').addEventListener('change', (event) => {
+    void saveInterfacePreferences({ browser_notifications: event.currentTarget.checked });
+  });
   document.querySelectorAll('input[name="task-mode"]').forEach((input) => {
     input.addEventListener('change', updateNewTaskMode);
   });
 
-  el.feedbackForm.addEventListener('submit', (event) => {
+  el.nativeInteractionForm.addEventListener('submit', (event) => event.preventDefault());
+  el.nativeInteractionDialog.addEventListener('cancel', (event) => {
     event.preventDefault();
-    if (event.submitter?.value === 'cancel') {
-      el.feedbackDialog.close();
-      return;
-    }
-    void submitFeedback();
+    void declineNativeInteraction();
+  });
+  el.nativeInteractionClose.addEventListener('click', () => void declineNativeInteraction());
+  el.nativeInteractionActions.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-native-action]');
+    if (!button) return;
+    void submitNativeInteraction(button.dataset.nativeAction, button);
   });
 
   el.contextMenu.addEventListener('click', (event) => {
@@ -397,17 +482,6 @@ function bindEvents() {
   window.addEventListener('resize', closeRunContextMenu);
   document.querySelector('#sidebar-chat').addEventListener('scroll', closeRunContextMenu);
 
-  document.querySelectorAll('[data-plan-action]').forEach((button) => {
-    button.addEventListener('click', () => {
-      const action = button.dataset.planAction;
-      if (action === 'revise' || action === 'targeted_revision') {
-        openFeedback(action);
-        return;
-      }
-      if (action === 'cancel' && !window.confirm('确定取消当前任务吗？代码尚未执行。')) return;
-      void sendPlanAction({ action });
-    });
-  });
 
   window.addEventListener('keydown', (event) => {
     const openDialog = document.querySelector('dialog[open]');
@@ -421,6 +495,10 @@ function bindEvents() {
     if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
       event.preventDefault();
       openRunSearch();
+    }
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'n') {
+      event.preventDefault();
+      openNewTask();
     }
     if (event.key === 'Escape') {
       if (!el.contextMenu.classList.contains('hidden')) closeRunContextMenu();
@@ -456,15 +534,38 @@ function handleComposerKeydown(event) {
     hideMentionMenu();
     if (el.quickTaskInput.value.trim() && !el.quickTaskSubmit.disabled) {
       el.messageForm.requestSubmit(el.quickTaskSubmit);
+    } else if (state.composerFiles.length && !el.quickTaskSubmit.disabled) {
+      // Screenshot + Enter with no text still sends; submitQuickTask fills the prompt.
+      el.messageForm.requestSubmit(el.quickTaskSubmit);
     }
   }
 }
 
+function handleComposerPaste(event) {
+  const items = Array.from(event.clipboardData?.items || []);
+  const files = items
+    .filter((item) => item.kind === 'file')
+    .map((item) => item.getAsFile())
+    .filter(Boolean)
+    .map((file) => {
+      if (file.name && file.name.includes('.')) return file;
+      const extension = (file.type.split('/')[1] || 'png').toLowerCase().replace(/[^a-z0-9]/g, '') || 'png';
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      return new File([file], `paste-${stamp}.${extension}`, { type: file.type || 'image/png' });
+    });
+  if (!files.length) return;
+  event.preventDefault();
+  const target = event.currentTarget === el.taskInput ? 'task' : 'composer';
+  addTaskFiles(files, target);
+  showToast(`已粘贴 ${files.length} 个图片附件。`);
+}
+
+function resizeComposer() {
+  el.quickTaskInput.style.height = 'auto';
+  el.quickTaskInput.style.height = `${Math.min(el.quickTaskInput.scrollHeight, 180)}px`;
+}
+
 function updateMentionMenu() {
-  if (currentCollaborationMode() !== 'group_chat') {
-    hideMentionMenu();
-    return;
-  }
   const caret = el.quickTaskInput.selectionStart;
   const beforeCaret = el.quickTaskInput.value.slice(0, caret);
   const match = beforeCaret.match(/@([A-Za-z]*)$/);
@@ -561,23 +662,16 @@ function restoreNewTaskAfterSettings() {
 function populateSettingsForm(settings) {
   const values = settings.values || {};
   const setValue = (id, value) => {
-    document.querySelector(`#${id}`).value = value ?? '';
+    const element = document.querySelector(`#${id}`);
+    if (element) element.value = value ?? '';
   };
   const setChecked = (id, value) => {
-    document.querySelector(`#${id}`).checked = Boolean(value);
+    const element = document.querySelector(`#${id}`);
+    if (element) element.checked = Boolean(value);
   };
   setValue('settings-workspace', settings.workspace);
-  setValue('settings-collaboration-mode', values.collaboration_mode || 'workflow');
   setValue('settings-group-chat-default-agent', values.group_chat_default_agent || 'both');
   setChecked('settings-group-chat-execution', values.group_chat_execution !== false);
-  setValue('settings-executor', values.executor || 'claude');
-  setChecked('settings-planning-collaboration', values.planning_collaboration);
-  setChecked('settings-consensus', values.consensus);
-  setChecked('settings-plan-approval', values.plan_approval);
-  setValue('settings-max-consensus-rounds', values.max_consensus_rounds ?? 3);
-  setValue('settings-max-plan-revisions', values.max_plan_revisions ?? 2);
-  setValue('settings-review-rounds', values.review_rounds ?? 1);
-  setChecked('settings-final-review', values.final_review);
   state.modelCatalog = settings.model_catalog || { claude: [], codex: [], defaults: {} };
   const credentials = settings.token_api_credentials || {};
   setChecked('settings-token-api-enabled', values.token_api?.enabled);
@@ -598,17 +692,16 @@ function populateSettingsForm(settings) {
     setValue(`settings-${agent}-extra-args`, Array.isArray(agentValues.extra_args) ? agentValues.extra_args.join('\n') : '');
   });
   renderModelCatalog();
-  setValue('settings-agent-a-identity', values.identities?.agent_a || '');
-  setValue('settings-agent-b-identity', values.identities?.agent_b || '');
   setValue('settings-group-chat-agent-a-identity', values.group_chat_identities?.agent_a || '');
   setValue('settings-group-chat-agent-b-identity', values.group_chat_identities?.agent_b || '');
-  setValue('settings-verification-timeout', values.verification?.timeout ?? 300);
-  setValue('settings-verification-commands', JSON.stringify(values.verification?.commands || [], null, 2));
   const theme = normalizeTheme(values.ui?.theme);
   const themeInput = document.querySelector(`input[name="settings-theme"][value="${theme}"]`);
   if (themeInput) themeInput.checked = true;
   setChecked('settings-show-archived', values.ui?.show_archived);
   setChecked('settings-compact-sidebar', values.ui?.compact_sidebar);
+  setChecked('settings-stream-model-text', values.ui?.stream_model_text);
+  setChecked('settings-browser-notifications', values.ui?.browser_notifications);
+  state.notificationsEnabled = values.ui?.browser_notifications === true;
   el.settingsSavePath.textContent = `保存位置：${settings.save_path}`;
   el.settingsSavePath.title = settings.save_path;
   el.settingsForm.dataset.workspace = settings.workspace;
@@ -757,44 +850,22 @@ function formatCommandSetting(command) {
 }
 
 function setSettingsTab(tab) {
-  const requested = ['general', 'workflow', 'agents', 'verification', 'interface'].includes(tab) ? tab : 'general';
-  const mode = document.querySelector('#settings-collaboration-mode').value;
+  const requested = ['general', 'agents', 'interface'].includes(tab) ? tab : 'general';
   const requestedPanel = document.querySelector(`[data-settings-panel="${requested}"]`);
-  const selected = requestedPanel?.dataset.collaborationOnly && requestedPanel.dataset.collaborationOnly !== mode
-    ? 'general'
-    : requested;
+  const selected = requestedPanel ? requested : 'general';
   document.querySelectorAll('[data-settings-tab]').forEach((button) => {
     button.classList.toggle('active', button.dataset.settingsTab === selected);
   });
   document.querySelectorAll('[data-settings-panel]').forEach((panel) => {
-    const applies = !panel.dataset.collaborationOnly || panel.dataset.collaborationOnly === mode;
+    const applies = !panel.dataset.collaborationOnly || panel.dataset.collaborationOnly === 'group_chat';
     panel.classList.toggle('hidden', panel.dataset.settingsPanel !== selected || !applies);
   });
 }
 
 function updateSettingsDependencies() {
-  const mode = document.querySelector('#settings-collaboration-mode').value;
-  const workflow = mode === 'workflow';
-  const planning = document.querySelector('#settings-planning-collaboration').checked;
-  const consensus = document.querySelector('#settings-consensus');
-  const workflowOnly = [
-    'settings-executor',
-    'settings-planning-collaboration',
-    'settings-consensus',
-    'settings-plan-approval',
-    'settings-max-consensus-rounds',
-    'settings-max-plan-revisions',
-    'settings-review-rounds',
-    'settings-final-review',
-  ];
-  workflowOnly.forEach((id) => { document.querySelector(`#${id}`).disabled = !workflow; });
-  consensus.disabled = !workflow || !planning;
-  ['settings-group-chat-default-agent', 'settings-group-chat-execution'].forEach((id) => {
-    document.querySelector(`#${id}`).disabled = workflow;
-  });
   document.querySelectorAll('[data-collaboration-only]').forEach((item) => {
     if (item.dataset.settingsPanel) return;
-    item.classList.toggle('hidden', item.dataset.collaborationOnly !== mode);
+    item.classList.toggle('hidden', item.dataset.collaborationOnly !== 'group_chat');
   });
   const activeTab = document.querySelector('[data-settings-tab].active')?.dataset.settingsTab || 'general';
   setSettingsTab(activeTab);
@@ -929,6 +1000,8 @@ function saveInterfacePreferences(values) {
   if (Object.hasOwn(values, 'theme')) preferences.theme = normalizeTheme(values.theme);
   if (Object.hasOwn(values, 'show_archived')) preferences.show_archived = Boolean(values.show_archived);
   if (Object.hasOwn(values, 'compact_sidebar')) preferences.compact_sidebar = Boolean(values.compact_sidebar);
+  if (Object.hasOwn(values, 'stream_model_text')) preferences.stream_model_text = Boolean(values.stream_model_text);
+  if (Object.hasOwn(values, 'browser_notifications')) preferences.browser_notifications = Boolean(values.browser_notifications);
   applyInterfaceSettings(preferences, { partial: true });
   if (!workspace || !Object.keys(preferences).length) return Promise.resolve(false);
 
@@ -990,23 +1063,11 @@ async function shutdownUiService() {
 
 function collectSettingsValues() {
   const get = (id) => document.querySelector(`#${id}`);
-  const integer = (id, label, minimum) => {
-    const value = Number(get(id).value);
-    if (!Number.isInteger(value) || value < minimum) throw new Error(`${label}必须是大于或等于 ${minimum} 的整数。`);
-    return value;
-  };
   const positive = (id, label) => {
     const value = Number(get(id).value);
     if (!Number.isFinite(value) || value <= 0) throw new Error(`${label}必须是正数。`);
     return value;
   };
-  let commands;
-  try {
-    commands = JSON.parse(get('settings-verification-commands').value || '[]');
-  } catch {
-    throw new Error('验证命令必须是有效的 JSON 数组。');
-  }
-  if (!Array.isArray(commands)) throw new Error('验证命令必须是 JSON 数组。');
   const agent = (name) => ({
     command: parseCommandSetting(get(`settings-${name}-command`).value, name),
     model: state.modelOrders[name][0] || '',
@@ -1016,28 +1077,11 @@ function collectSettingsValues() {
     extra_args: get(`settings-${name}-extra-args`).value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
   });
   return {
-    executor: get('settings-executor').value,
-    collaboration_mode: get('settings-collaboration-mode').value,
     group_chat_default_agent: get('settings-group-chat-default-agent').value,
     group_chat_execution: get('settings-group-chat-execution').checked,
-    planning_collaboration: get('settings-planning-collaboration').checked,
-    consensus: get('settings-consensus').checked,
-    max_consensus_rounds: integer('settings-max-consensus-rounds', '最大共识审核轮次', 1),
-    plan_approval: get('settings-plan-approval').checked,
-    max_plan_revisions: integer('settings-max-plan-revisions', '最大人工修订次数', 0),
-    review_rounds: integer('settings-review-rounds', '代码审核轮次', 0),
-    final_review: get('settings-final-review').checked,
-    identities: {
-      agent_a: get('settings-agent-a-identity').value.trim(),
-      agent_b: get('settings-agent-b-identity').value.trim(),
-    },
     group_chat_identities: {
       agent_a: get('settings-group-chat-agent-a-identity').value.trim(),
       agent_b: get('settings-group-chat-agent-b-identity').value.trim(),
-    },
-    verification: {
-      timeout: positive('settings-verification-timeout', '验证超时'),
-      commands,
     },
     token_api: {
       enabled: get('settings-token-api-enabled').checked,
@@ -1049,6 +1093,8 @@ function collectSettingsValues() {
       theme: document.querySelector('input[name="settings-theme"]:checked')?.value || 'paper',
       show_archived: get('settings-show-archived').checked,
       compact_sidebar: get('settings-compact-sidebar').checked,
+      stream_model_text: get('settings-stream-model-text').checked,
+      browser_notifications: get('settings-browser-notifications').checked,
     },
   };
 }
@@ -1075,6 +1121,20 @@ function applyInterfaceSettings(ui, { partial = false } = {}) {
   if (!partial || Object.hasOwn(ui, 'compact_sidebar')) {
     document.body.classList.toggle('compact-sidebar', Boolean(ui.compact_sidebar));
   }
+  if (!partial || Object.hasOwn(ui, 'stream_model_text')) {
+    state.streamModelText = Boolean(ui.stream_model_text);
+    // Turning streaming off should drop any half-rendered preview immediately.
+    if (!state.streamModelText && state.streamBuffers.size) {
+      state.streamBuffers.clear();
+      if (state.currentId) void loadDetail(state.currentId);
+    }
+  }
+  if (!partial || Object.hasOwn(ui, 'browser_notifications')) {
+    state.notificationsEnabled = Boolean(ui.browser_notifications);
+    if (state.notificationsEnabled && 'Notification' in window && Notification.permission === 'default') {
+      void Notification.requestPermission();
+    }
+  }
 }
 
 function currentInterfaceSettings() {
@@ -1082,6 +1142,8 @@ function currentInterfaceSettings() {
     theme: normalizeTheme(document.body.dataset.theme),
     show_archived: state.showArchived,
     compact_sidebar: document.body.classList.contains('compact-sidebar'),
+    stream_model_text: Boolean(state.streamModelText),
+    browser_notifications: Boolean(state.notificationsEnabled),
   };
 }
 
@@ -1102,25 +1164,14 @@ function renderTaskDefaults() {
   if (!el.taskDefaultsSummary) return;
   const values = state.settings?.values || {};
   const workspace = workspaceFolderName(state.settings?.workspace || state.health?.workspace || '');
-  const executor = agentName(values.executor || 'claude');
-  const selected = document.querySelector('input[name="task-mode"]:checked')?.value;
-  const collaborationMode = selected || values.collaboration_mode || 'workflow';
-  const mode = collaborationMode === 'group_chat'
-    ? '群聊协作 · 可定向执行'
-    : values.consensus ? '共识实施 · 证据化共识' : values.planning_collaboration === false ? '单智能体执行' : '共识实施 · 快速协作';
-  el.taskDefaultsSummary.textContent = collaborationMode === 'group_chat'
-    ? `${workspace} · Claude Code + Codex · ${mode}`
-    : `${workspace} · ${executor} 执行 · ${mode}`;
+  el.taskDefaultsSummary.textContent = `${workspace} · Claude Code + Codex · 群聊协作 · 可定向执行`;
 }
 
 function updateNewTaskMode() {
-  const groupChat = selectedTaskMode() === 'group_chat';
-  el.taskInput.required = !groupChat;
-  el.taskInputLabel.textContent = groupChat ? '第一条消息（可选）' : '目标与需求';
-  el.taskInput.placeholder = groupChat
-    ? '可以留空，创建群聊后再从底部发送第一条消息…'
-    : '描述需要 Claude Code 和 Codex 共同完成的任务…';
-  el.taskSubmit.textContent = groupChat ? '创建群聊' : '开始协作';
+  el.taskInput.required = false;
+  el.taskInputLabel.textContent = '第一条消息（可选）';
+  el.taskInput.placeholder = '可以留空，创建群聊后再从底部发送第一条消息…';
+  el.taskSubmit.textContent = '创建群聊';
   hideFormError(el.formError);
   renderTaskDefaults();
 }
@@ -1135,13 +1186,8 @@ function setSidebarView(view) {
 }
 
 function setMainView(view) {
-  if (!state.currentId && view === 'tasks') {
-    showToast('先创建一个协作任务。', true);
-    return;
-  }
-  state.mainView = view === 'tasks' ? 'tasks' : 'chat';
+  state.mainView = 'chat';
   el.chatView.classList.toggle('hidden', state.mainView !== 'chat');
-  el.tasksView.classList.toggle('hidden', state.mainView !== 'tasks');
   document.querySelectorAll('[data-main-view]').forEach((button) => {
     button.classList.toggle('active', button.dataset.mainView === state.mainView);
   });
@@ -1157,16 +1203,14 @@ function closeDetails() {
 }
 
 function setDetailView(view) {
-  state.detailView = ['overview', 'evidence', 'agent'].includes(view) ? view : 'overview';
+  state.detailView = ['overview', 'agent'].includes(view) ? view : 'overview';
   el.detailOverview.classList.toggle('hidden', state.detailView !== 'overview');
-  el.detailEvidence.classList.toggle('hidden', state.detailView !== 'evidence');
   el.detailAgentPanel.classList.toggle('hidden', state.detailView !== 'agent');
   document.querySelectorAll('[data-detail-view]').forEach((button) => {
     button.classList.toggle('active', button.dataset.detailView === state.detailView);
   });
   const labels = {
     overview: ['运行详情', '状态、耗时与活动记录'],
-    evidence: ['证据', '需求、争议与决策'],
     agent: [agentName(state.detailAgent), '对等协作者资料'],
   };
   [el.detailTitle.textContent, el.detailSubtitle.textContent] = labels[state.detailView];
@@ -1197,26 +1241,25 @@ function closeRunSearch() {
 
 function openNewTask() {
   hideFormError(el.formError);
-  const defaultMode = state.draftTaskMode || state.settings?.values?.collaboration_mode || 'workflow';
   state.draftTaskMode = null;
-  const modeInput = document.querySelector(`input[name="task-mode"][value="${defaultMode}"]`);
-  if (modeInput) modeInput.checked = true;
   updateNewTaskMode();
   renderTaskFiles();
+  restoreNewTaskDraft();
   el.newTaskDialog.showModal();
   window.setTimeout(() => {
     (selectedTaskMode() === 'group_chat' ? el.taskSubmit : el.taskInput).focus();
   }, 0);
 }
 
-function addTaskFiles(fileList) {
+function addTaskFiles(fileList, target = 'task') {
   const incoming = Array.from(fileList || []);
   if (!incoming.length) return;
+  const files = target === 'composer' ? state.composerFiles : state.newTaskFiles;
   const errors = [];
   incoming.forEach((file) => {
     const extension = file.name.includes('.') ? file.name.split('.').at(-1).toLowerCase() : '';
-    if (!DOCUMENT_EXTENSIONS.has(extension)) {
-      errors.push(`${file.name} 不是支持的文档格式`);
+    if (!UPLOAD_EXTENSIONS.has(extension)) {
+      errors.push(`${file.name} 不是支持的文档或图片格式`);
       return;
     }
     if (!file.size) {
@@ -1227,33 +1270,79 @@ function addTaskFiles(fileList) {
       errors.push(`${file.name} 超过 10 MB`);
       return;
     }
-    const duplicate = state.taskFiles.some((item) => item.name === file.name && item.size === file.size && item.lastModified === file.lastModified);
+    const duplicate = files.some((item) => item.name === file.name && item.size === file.size && item.lastModified === file.lastModified);
     if (duplicate) return;
-    if (state.taskFiles.length >= MAX_DOCUMENT_FILES) {
-      errors.push(`每个任务最多上传 ${MAX_DOCUMENT_FILES} 个文档`);
+    if (files.length >= MAX_DOCUMENT_FILES) {
+      errors.push(`每条消息最多添加 ${MAX_DOCUMENT_FILES} 个附件`);
       return;
     }
-    const total = state.taskFiles.reduce((sum, item) => sum + item.size, 0) + file.size;
+    const total = files.reduce((sum, item) => sum + item.size, 0) + file.size;
     if (total > MAX_DOCUMENT_TOTAL_BYTES) {
       errors.push('文档合计大小不能超过 20 MB');
       return;
     }
-    state.taskFiles.push(file);
+    files.push(file);
   });
   renderTaskFiles();
-  if (errors.length) showFormError(el.formError, errors[0]);
-  else hideFormError(el.formError);
+  if (target === 'task') {
+    if (errors.length) showFormError(el.formError, errors[0]);
+    else hideFormError(el.formError);
+  } else if (errors.length) {
+    showToast(errors[0], true);
+  }
+}
+
+function isImageFile(file) {
+  if (!file) return false;
+  if (typeof file.type === 'string' && file.type.toLowerCase().startsWith('image/')) return true;
+  const name = String(file.name || '').toLowerCase();
+  const extension = name.includes('.') ? name.split('.').at(-1) : '';
+  return IMAGE_EXTENSIONS.has(extension);
+}
+
+function previewUrlFor(file) {
+  if (!file || typeof URL === 'undefined' || typeof URL.createObjectURL !== 'function') return '';
+  let url = state.previewUrls.get(file);
+  if (!url) {
+    url = URL.createObjectURL(file);
+    state.previewUrls.set(file, url);
+  }
+  return url;
+}
+
+function releasePreviewUrl(file) {
+  if (!file || typeof URL === 'undefined' || typeof URL.revokeObjectURL !== 'function') return;
+  const url = state.previewUrls.get(file);
+  if (!url) return;
+  URL.revokeObjectURL(url);
+  state.previewUrls.delete(file);
+}
+
+function appendImageThumbnail(parent, file, className, alt) {
+  const preview = document.createElement('img');
+  preview.className = className;
+  preview.alt = alt || file.name || '图片附件';
+  preview.src = previewUrlFor(file);
+  preview.addEventListener('error', () => {
+    preview.remove();
+    releasePreviewUrl(file);
+    if (parent.classList.contains('selected-document-icon')) parent.textContent = '▧';
+    parent.classList.add('image-preview-failed');
+  }, { once: true });
+  parent.append(preview);
+  return preview;
 }
 
 function renderTaskFiles() {
   el.documentList.replaceChildren();
-  el.documentList.classList.toggle('hidden', !state.taskFiles.length);
-  state.taskFiles.forEach((file, index) => {
+  el.documentList.classList.toggle('hidden', !state.newTaskFiles.length);
+  state.newTaskFiles.forEach((file, index) => {
     const row = document.createElement('div');
     row.className = 'selected-document';
     const icon = document.createElement('span');
     icon.className = 'selected-document-icon';
-    icon.textContent = '▧';
+    if (isImageFile(file)) appendImageThumbnail(icon, file, 'selected-document-thumb', file.name);
+    else icon.textContent = '▧';
     const copy = document.createElement('span');
     const name = document.createElement('strong');
     name.textContent = file.name;
@@ -1269,10 +1358,37 @@ function renderTaskFiles() {
     row.append(icon, copy, remove);
     el.documentList.append(row);
   });
+  el.composerAttachmentList.replaceChildren();
+  el.composerAttachmentList.classList.toggle('hidden', !state.composerFiles.length);
+  state.composerFiles.forEach((file, index) => {
+    const chip = document.createElement('span');
+    chip.className = 'composer-attachment';
+    const image = isImageFile(file);
+    if (image) {
+      chip.classList.add('is-image');
+      chip.title = `${file.name} · ${formatBytes(file.size)}`;
+      appendImageThumbnail(chip, file, 'composer-attachment-thumb', file.name);
+    }
+    if (!image) {
+      const label = document.createElement('strong');
+      label.textContent = file.name;
+      label.title = `${file.name} · ${formatBytes(file.size)}`;
+      chip.append(label);
+    }
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.dataset.removeComposerDocument = String(index);
+    remove.setAttribute('aria-label', `移除 ${file.name}`);
+    remove.title = '移除附件';
+    remove.textContent = '×';
+    chip.append(label, remove);
+    el.composerAttachmentList.append(chip);
+  });
 }
 
-async function encodeTaskFiles() {
-  return Promise.all(state.taskFiles.map(async (file) => ({
+async function encodeTaskFiles(target = 'task') {
+  const files = target === 'composer' ? state.composerFiles : state.newTaskFiles;
+  return Promise.all(files.map(async (file) => ({
     name: file.name,
     size: file.size,
     content_type: file.type || 'application/octet-stream',
@@ -1294,80 +1410,95 @@ function readFileAsBase64(file) {
   });
 }
 
-function clearTaskFiles() {
-  state.taskFiles = [];
-  el.documentInput.value = '';
+function clearTaskFiles(target = 'all') {
+  if (target === 'all' || target === 'task') {
+    state.newTaskFiles.forEach(releasePreviewUrl);
+    state.newTaskFiles = [];
+    el.documentInput.value = '';
+  }
+  if (target === 'all' || target === 'composer') {
+    state.composerFiles.forEach(releasePreviewUrl);
+    state.composerFiles = [];
+    el.composerFileInput.value = '';
+  }
   renderTaskFiles();
 }
 
 async function submitTask() {
-  const task = el.taskInput.value.trim();
-  const collaborationMode = selectedTaskMode();
-  if (!task && collaborationMode !== 'group_chat') {
-    showFormError(el.formError, '需求不能为空。');
-    return;
-  }
-  if (!task && state.taskFiles.length) {
-    showFormError(el.formError, '添加参考文档时，请同时填写第一条消息。');
-    return;
-  }
+  let task = el.taskInput.value.trim();
+  if (!task && state.newTaskFiles.length) task = '请查看并分析附件。';
   setButtonBusy(el.taskSubmit, true, '正在启动…');
   hideFormError(el.formError);
   try {
-    const attachments = await encodeTaskFiles();
+    const attachments = await encodeTaskFiles('task');
     await startTask({
       task,
       attachments,
-      ...taskSettingsPayload(collaborationMode),
+      ...taskSettingsPayload(),
     });
     el.newTaskDialog.close();
     el.taskInput.value = '';
+    try { localStorage.removeItem(`${NEW_TASK_DRAFT_KEY}:${state.health?.workspace || 'default'}`); } catch {}
     el.quickTaskInput.value = '';
-    clearTaskFiles();
+    clearTaskFiles('task');
   } catch (error) {
     showFormError(el.formError, error.message);
   } finally {
-    setButtonBusy(el.taskSubmit, false, collaborationMode === 'group_chat' ? '创建群聊' : '开始协作');
+    setButtonBusy(el.taskSubmit, false, '创建群聊');
   }
 }
 
 async function submitQuickTask() {
-  const task = el.quickTaskInput.value.trim();
-  if (!task) {
+  let task = el.quickTaskInput.value.trim();
+  if (!task && !state.composerFiles.length) {
     el.quickTaskInput.focus();
     return;
   }
+  if (!task && state.composerFiles.length) task = '请查看并分析附件。';
+  const inGroupChat = Boolean(state.currentId);
+  const editedMessage = state.editingMessageId ? findGroupChatMessage(state.editingMessageId) : null;
+  const options = editedMessage
+    ? {
+      edited_from: editedMessage.id,
+      recipients: Array.isArray(editedMessage.recipients)
+        ? editedMessage.recipients.filter((recipient) => recipient !== 'user')
+        : [],
+    }
+    : {};
   setButtonBusy(el.quickTaskSubmit, true, '正在发送…');
   try {
-    if (currentCollaborationMode() === 'group_chat' && state.currentId) {
-      await sendGroupChatMessage(task);
+    const attachments = await encodeTaskFiles('composer');
+    if (inGroupChat) {
+      await sendGroupChatMessage(task, attachments, options);
     } else {
       await startTask({
         task,
-        ...taskSettingsPayload(state.settings?.values?.collaboration_mode || 'workflow'),
+        attachments,
+        ...taskSettingsPayload(),
       });
     }
     el.quickTaskInput.value = '';
+    state.editingMessageId = null;
+    resizeComposer();
+    clearTaskFiles('composer');
+    clearDraft(state.currentId);
     hideMentionMenu();
   } catch (error) {
     showToast(error.message, true);
   } finally {
-    setButtonBusy(el.quickTaskSubmit, false, '发送 ◁');
+    setButtonBusy(el.quickTaskSubmit, false, inGroupChat ? '发送消息' : '发送');
   }
 }
 
 function selectedTaskMode() {
-  return document.querySelector('input[name="task-mode"]:checked')?.value || state.settings?.values?.collaboration_mode || 'workflow';
+  return 'group_chat';
 }
 
-function taskSettingsPayload(collaborationMode = 'workflow') {
+function taskSettingsPayload() {
   const values = state.settings?.values || {};
   return {
     workspace: state.settings?.workspace || state.health?.workspace || '',
     config: state.settings?.source_path || '',
-    executor: values.executor || 'claude',
-    consensus: Boolean(values.consensus),
-    collaboration_mode: collaborationMode,
   };
 }
 
@@ -1380,24 +1511,22 @@ async function startTask(payload) {
   state.currentId = session.id;
   state.detail = null;
   state.mainView = 'chat';
-  showToast(session.collaboration_mode === 'group_chat'
-    ? hasInitialMessage
-      ? '群聊已创建，正在等待 Agent 回复。'
-      : '群聊已创建，可以发送第一条消息。'
-    : '任务已启动，Claude Code 与 Codex 正在并行分析。');
+  showToast(hasInitialMessage
+    ? '群聊已创建，正在等待 Agent 回复。'
+    : '群聊已创建，可以发送第一条消息。');
   await refreshAll();
 }
 
-async function sendGroupChatMessage(message) {
+async function sendGroupChatMessage(message, attachments = [], options = {}) {
   if (!state.currentId) throw new Error('没有选中的群聊对话。');
   const runId = state.currentId;
-  const pending = queuePendingChatMessage(runId, message);
+  const pending = queuePendingChatMessage(runId, message, attachments, options);
   renderDetail();
   scrollChatToBottom();
   try {
     await api(`/api/sessions/${encodeURIComponent(runId)}/messages`, {
       method: 'POST',
-      body: JSON.stringify({ message }),
+      body: JSON.stringify({ message, attachments, ...options }),
     });
     pending.delivery_status = 'accepted';
     if (state.currentId === runId) renderDetail();
@@ -1410,7 +1539,7 @@ async function sendGroupChatMessage(message) {
   }
 }
 
-function queuePendingChatMessage(runId, content) {
+function queuePendingChatMessage(runId, content, attachments = [], options = {}) {
   const chat = state.detail?.session?.group_chat || state.detail?.record?.group_chat || {};
   const serverMessageCount = Array.isArray(chat.messages) ? chat.messages.length : 0;
   const pending = {
@@ -1418,6 +1547,11 @@ function queuePendingChatMessage(runId, content) {
     sender: 'user',
     role: 'user',
     content,
+    attachments: attachments.map((item) => ({
+      name: item.name,
+      size: item.size,
+      pending: true,
+    })),
     recipients: [],
     created_at: new Date().toISOString(),
     action: 'discuss',
@@ -1426,7 +1560,14 @@ function queuePendingChatMessage(runId, content) {
     server_message_count: serverMessageCount,
     expected_recipients: optimisticChatRecipients(content),
     server_user_id: '',
+    hidden: Boolean(options.retry_of),
+    retry_of: options.retry_of || '',
+    retry_mode: options.retry_mode || '',
   };
+  if (options.retry_of) {
+    pending.server_user_id = options.reply_to || options.retry_of;
+    pending.expected_recipients = options.agent ? [options.agent] : optimisticChatRecipients(content);
+  }
   const messages = state.pendingChatMessages.get(runId) || [];
   messages.push(pending);
   state.pendingChatMessages.set(runId, messages);
@@ -1478,6 +1619,7 @@ function reconcilePendingChatMessages(runId, serverMessages, runStatus) {
         message.role === 'assistant'
         && optimistic.server_user_id
         && message.reply_to === optimistic.server_user_id
+        && (!optimistic.retry_of || message.retry_of === optimistic.retry_of)
       ))
       .map((message) => message.sender));
     optimistic.waiting_recipients = optimistic.expected_recipients
@@ -1490,92 +1632,131 @@ function reconcilePendingChatMessages(runId, serverMessages, runStatus) {
   return remaining;
 }
 
+function groupChatMessageKey(message) {
+  return String(message?.id || message?.client_id || '');
+}
+
+// Keep each Agent reply beside the user message that caused it. The server
+// appends concurrent replies as they finish, while optimistic loading cards
+// are created locally; rendering the two lists separately therefore makes a
+// later question appear before the earlier reply. Parent-aware ordering keeps
+// user messages in send order and inserts all replies immediately after their
+// parent, regardless of completion order.
+function orderGroupChatMessages(serverMessages, pendingUsers, pendingReplies) {
+  const source = [
+    ...serverMessages,
+    ...pendingUsers,
+    ...pendingReplies,
+  ].map((message, index) => ({ message, index }));
+  const itemsByKey = new Map();
+  source.forEach((item) => {
+    const key = groupChatMessageKey(item.message);
+    if (key) itemsByKey.set(key, item);
+  });
+  const repliesByParent = new Map();
+  source.forEach((item) => {
+    const parent = String(item.message.reply_to || '');
+    if (!parent || !itemsByKey.has(parent)) return;
+    const replies = repliesByParent.get(parent) || [];
+    replies.push(item);
+    repliesByParent.set(parent, replies);
+  });
+  const emitted = new Set();
+  const ordered = [];
+  const emit = (item) => {
+    if (!item || emitted.has(item.index)) return;
+    emitted.add(item.index);
+    ordered.push(item.message);
+  };
+  source.forEach((item) => {
+    if (emitted.has(item.index)) return;
+    const parent = String(item.message.reply_to || '');
+    if (parent && itemsByKey.has(parent)) return;
+    emit(item);
+    const key = groupChatMessageKey(item.message);
+    (repliesByParent.get(key) || []).forEach(emit);
+  });
+  source.forEach(emit);
+  return ordered;
+}
+
 function scrollChatToBottom() {
   window.requestAnimationFrame(() => {
     el.artifactFeed.scrollTop = el.artifactFeed.scrollHeight;
+    state.feedPinnedToBottom = true;
+    updateFeedJumpButton();
   });
 }
 
-function currentCollaborationMode() {
-  return state.detail?.session?.collaboration_mode
-    || state.detail?.record?.collaboration_mode
-    || null;
-}
-
-async function resumeCurrent() {
-  if (!state.currentId) return;
-  await resumeRun(state.currentId);
-}
-
-async function resumeRun(runId) {
-  el.resumeButton.disabled = true;
-  try {
-    await api('/api/tasks', {
-      method: 'POST',
-      body: JSON.stringify({ resume_id: runId }),
-    });
-    state.currentId = runId;
-    state.detail = null;
-    showToast('任务已从精确检查点恢复。');
-    await refreshAll();
-  } catch (error) {
-    showToast(error.message, true);
-  } finally {
-    el.resumeButton.disabled = false;
-  }
-}
-
-function openFeedback(action) {
-  state.feedbackAction = action;
-  hideFormError(el.feedbackError);
-  el.feedbackInput.value = '';
-  const targeted = action === 'targeted_revision';
-  el.feedbackTitle.textContent = targeted ? '向指定智能体提出要求' : '修订统一方案';
-  el.targetAgentField.classList.toggle('hidden', !targeted);
-  el.feedbackDialog.showModal();
-  window.setTimeout(() => el.feedbackInput.focus(), 0);
-}
-
-async function submitFeedback() {
-  const feedback = el.feedbackInput.value.trim();
-  if (!feedback) {
-    showFormError(el.feedbackError, '修订要求不能为空。');
+// Pull a message into the composer as a markdown quote so follow-up questions
+// carry the context the agents need without retyping it.
+function quoteMessage(feedKey) {
+  const text = state.messageTexts.get(feedKey) || '';
+  if (!text) {
+    showToast('这条消息没有可引用的内容。', true);
     return;
   }
-  setButtonBusy(el.feedbackSubmit, true, '正在发送…');
-  try {
-    await sendPlanAction({
-      action: state.feedbackAction,
-      feedback,
-      target_agent: state.feedbackAction === 'targeted_revision' ? el.targetAgentInput.value : '',
-    });
-    el.feedbackDialog.close();
-  } catch (error) {
-    showFormError(el.feedbackError, error.message);
-  } finally {
-    setButtonBusy(el.feedbackSubmit, false, '发送要求');
-  }
+  const lines = text.trim().split(/\r?\n/).slice(0, 12);
+  const truncated = text.trim().split(/\r?\n/).length > lines.length;
+  const quoted = lines.map((line) => `> ${line}`).join('\n');
+  const existing = el.quickTaskInput.value.trimEnd();
+  const block = `${quoted}${truncated ? '\n> …' : ''}\n\n`;
+  el.quickTaskInput.value = existing ? `${existing}\n\n${block}` : block;
+  el.quickTaskInput.focus();
+  el.quickTaskInput.setSelectionRange(
+    el.quickTaskInput.value.length,
+    el.quickTaskInput.value.length,
+  );
 }
 
-async function sendPlanAction(payload) {
-  if (!state.currentId) throw new Error('没有选中的任务。');
+function findGroupChatMessage(messageId) {
+  const chat = state.detail?.session?.group_chat || state.detail?.record?.group_chat || {};
+  return (Array.isArray(chat.messages) ? chat.messages : []).find(
+    (message) => String(message.id || '') === String(messageId),
+  ) || null;
+}
+
+function editMessage(messageId) {
+  const message = findGroupChatMessage(messageId);
+  if (!message || message.sender !== 'user') return;
+  state.editingMessageId = message.id;
+  el.quickTaskInput.value = message.content || '';
+  resizeComposer();
+  el.quickTaskInput.focus();
+  el.quickTaskInput.setSelectionRange(el.quickTaskInput.value.length, el.quickTaskInput.value.length);
+  showToast('已载入消息编辑内容；发送后会创建新的尝试，原消息仍会保留。');
+}
+
+async function retryMessage(messageId, retryMode = 'regenerate') {
+  const message = findGroupChatMessage(messageId);
+  if (!message || message.role !== 'assistant' || !state.currentId) return;
+  const parent = findGroupChatMessage(message.reply_to);
+  if (!parent) {
+    showToast('找不到这条回复对应的用户问题。', true);
+    return;
+  }
+  const options = {
+    retry_of: message.id,
+    retry_mode: retryMode,
+    agent: message.sender,
+    reply_to: parent.id,
+  };
+  const pending = queuePendingChatMessage(state.currentId, parent.content, [], options);
+  renderDetail();
+  scrollChatToBottom();
   try {
-    await api(`/api/sessions/${encodeURIComponent(state.currentId)}/actions`, {
+    await api(`/api/sessions/${encodeURIComponent(state.currentId)}/messages`, {
       method: 'POST',
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ message: parent.content, attachments: [], ...options }),
     });
-    const labels = {
-      execute: '已批准统一方案，准备进入执行阶段。',
-      revise: '整体修订要求已发送。',
-      targeted_revision: '定向要求已发送给目标智能体。',
-      export: '正在导出最终技术文档。',
-      cancel: '正在取消任务。',
-    };
-    showToast(labels[payload.action] || '操作已提交。');
+    pending.delivery_status = 'accepted';
+    renderDetail();
+    showToast(retryMode === 'continue' ? '已要求 Agent 继续回复。' : '已要求 Agent 重新生成回复。');
     await refreshAll();
   } catch (error) {
+    removePendingChatMessage(state.currentId, pending.client_id);
+    renderDetail();
     showToast(error.message, true);
-    throw error;
   }
 }
 
@@ -1590,6 +1771,38 @@ function connectEvents() {
       if (update.type === 'workspace') {
         void refreshDefaultWorkspace();
         return;
+      }
+      if (update.type === 'native_interaction' && update.run_id) {
+        const isCurrent = !state.currentId || state.currentId === update.run_id;
+        if (isCurrent) {
+          state.currentId = update.run_id;
+          state.detail = null;
+          state.mainView = 'chat';
+          showToast('Agent 正在等待你的权限决定或补充信息。');
+          scheduleRefresh(0);
+        } else {
+          showToast('后台任务需要你的权限决定或补充信息。');
+        }
+        notifyBrowser('Agent 需要你的操作', '请在页面中处理权限或补充问题。', update.run_id);
+        markRunUnread(update.run_id, 'Agent 需要你的操作', '请在页面中处理权限或补充问题。');
+        return;
+      }
+      if (update.type === 'event' && update.stream_text) {
+        handleStreamUpdate(update);
+        // Appending text locally avoids a refetch per token, but status, plan
+        // gate and timeline still come from the detail endpoint.
+        scheduleStreamRefresh();
+        return;
+      }
+      if (update.type === 'chat_message' || update.type === 'finished') {
+        clearStreamBuffers(update.run_id);
+        if (update.run_id && update.run_id !== state.currentId) {
+          const title = update.type === 'finished' ? '任务已完成' : '收到新的 Agent 回复';
+          markRunUnread(update.run_id, title, 'MultiAgent 有新的协作状态更新。');
+        }
+        if (update.type === 'finished' && (update.run_id === state.currentId || document.hidden)) {
+          notifyBrowser('任务状态更新', '当前任务已完成或停止。', update.run_id);
+        }
       }
     } catch {
       // A malformed notification should still trigger the normal refresh path.
@@ -1607,6 +1820,82 @@ function connectEvents() {
 function scheduleRefresh(delay = 100) {
   window.clearTimeout(state.refreshTimer);
   state.refreshTimer = window.setTimeout(() => void refreshAll(), delay);
+}
+
+// Throttle rather than debounce: a steady token stream would keep resetting a
+// debounce timer and starve the refresh entirely, freezing status and timeline.
+function scheduleStreamRefresh(interval = 1500) {
+  if (state.streamRefreshTimer) return;
+  const elapsed = Date.now() - state.streamRefreshAt;
+  const wait = elapsed >= interval ? 0 : interval - elapsed;
+  state.streamRefreshTimer = window.setTimeout(() => {
+    state.streamRefreshTimer = null;
+    state.streamRefreshAt = Date.now();
+    void refreshAll();
+  }, wait);
+}
+
+// Stream updates carry raw model text when the interface toggle is on. Buffer
+// them per (run, agent) and append into the matching loading card without a
+// full refresh; the real message still lands via the normal chat_message path.
+function handleStreamUpdate(update) {
+  if (!state.streamModelText) return;
+  const runId = String(update.run_id || '');
+  if (!runId || runId !== String(state.currentId || '')) return;
+  const agent = agentKeyFromName(update.source) || update.source;
+  const step = String(update.step_id || agent).replace(/[^A-Za-z0-9_-]/g, '-');
+  const key = `${runId}:${agent}:${step}`;
+  const previous = state.streamBuffers.get(key) || '';
+  state.streamBuffers.set(key, previous + String(update.stream_text));
+  appendStreamToFeed(runId);
+}
+
+function clearStreamBuffers(runId) {
+  if (!runId) return;
+  const prefix = `${runId}:`;
+  Array.from(state.streamBuffers.keys()).forEach((key) => {
+    if (key.startsWith(prefix)) state.streamBuffers.delete(key);
+  });
+}
+
+function appendStreamToFeed(runId) {
+  if (String(feedCacheRunId) !== String(runId)) return;
+  const latest = new Map();
+  state.streamBuffers.forEach((text, key) => {
+    const [run, agent, step] = key.split(':');
+    if (run !== String(runId) || !text) return;
+    latest.set(`${agent}:${step || agent}`, { agent, text });
+  });
+  latest.forEach(({ agent, text }, streamKey) => {
+    const feedKey = `stream-${runId}-${streamKey.replace(':', '-')}`;
+    const existing = el.artifactFeed.querySelector(`[data-feed-key="${feedKey}"]`);
+    const html = streamCardMarkup(feedKey, agent, text);
+    if (existing) {
+      const replacement = nodeFromMarkup(html);
+      if (replacement) existing.replaceWith(replacement);
+    } else {
+      const node = nodeFromMarkup(html);
+      if (node) el.artifactFeed.appendChild(node);
+    }
+    feedHtmlCache.set(feedKey, html);
+  });
+  if (state.feedPinnedToBottom) scrollChatToBottom();
+}
+
+function streamCardMarkup(feedKey, agent, text) {
+  const name = agentName(agent);
+  return `<article class="message-row message-${escapeHtml(agent)} message-loading message-streaming" data-feed-key="${escapeHtml(feedKey)}">
+    ${avatarMarkup(agent)}
+    <div class="message-main">
+      <div class="message-header">
+        <strong>${escapeHtml(name)}</strong>
+        <span class="message-role">正在生成 · 流式预览</span>
+        <span class="message-time"></span>
+      </div>
+      <span class="message-tag">实时</span>
+      <div class="markdown-body">${renderMarkdown(normalizeContent(text))}</div>
+    </div>
+  </article>`;
 }
 
 async function refreshAll() {
@@ -1655,12 +1944,9 @@ async function loadDetail(runId) {
   try {
     const detail = await api(`/api/runs/${encodeURIComponent(runId)}`);
     if (state.currentId !== runId) return;
+    clearRunUnread(runId);
     state.detail = detail;
-    const run = state.runs.find((item) => item.id === runId);
-    if (run?.detached && detail.record?.checkpoint) {
-      run.resumable = true;
-      renderRunList();
-    }
+    restoreDraft(runId);
     renderDetail();
   } catch (error) {
     if (state.currentId === runId) showToast(error.message, true);
@@ -1669,11 +1955,135 @@ async function loadDetail(runId) {
 
 function selectRun(runId) {
   closeRunContextMenu();
+  saveDraftNow(state.currentId);
+  el.quickTaskInput.value = '';
+  clearTaskFiles('composer');
+  resizeComposer();
   state.currentId = runId;
+  state.draftLoadedRunId = null;
+  clearRunUnread(runId);
   state.detail = null;
   state.mainView = 'chat';
   renderRunList();
   void loadDetail(runId);
+}
+
+const DRAFT_STORAGE_KEY = 'multiagent.composer-drafts.v1';
+
+function draftStorageKey(runId = state.currentId) {
+  const workspace = state.health?.workspace || 'default';
+  return `${DRAFT_STORAGE_KEY}:${workspace}:${runId || 'new'}`;
+}
+
+function saveDraftNow(runId = state.currentId) {
+  if (typeof localStorage === 'undefined') return;
+  const value = el.quickTaskInput?.value || '';
+  if (!value.trim() && !state.composerFiles.length && !runId) return;
+  const key = draftStorageKey(runId);
+  const payload = { text: value, saved_at: new Date().toISOString() };
+  try {
+    if (value || state.composerFiles.length) localStorage.setItem(key, JSON.stringify(payload));
+    else localStorage.removeItem(key);
+  } catch {
+    // Drafts are a convenience feature; quota errors must not block sending.
+  }
+}
+
+function clearDraft(runId = state.currentId) {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.removeItem(draftStorageKey(runId));
+  } catch {
+    // Ignore storage failures; this is only a convenience cache.
+  }
+}
+
+const NEW_TASK_DRAFT_KEY = 'multiagent.new-task-draft.v1';
+
+function scheduleNewTaskDraftSave() {
+  window.clearTimeout(state.draftSaveTimer);
+  state.draftSaveTimer = window.setTimeout(() => {
+    try {
+      const text = el.taskInput.value || '';
+      if (text) localStorage.setItem(`${NEW_TASK_DRAFT_KEY}:${state.health?.workspace || 'default'}`, text);
+      else localStorage.removeItem(`${NEW_TASK_DRAFT_KEY}:${state.health?.workspace || 'default'}`);
+    } catch {
+      // Ignore local storage failures.
+    }
+  }, 250);
+}
+
+function restoreNewTaskDraft() {
+  try {
+    if (el.taskInput.value.trim()) return;
+    const text = localStorage.getItem(`${NEW_TASK_DRAFT_KEY}:${state.health?.workspace || 'default'}`) || '';
+    if (text) el.taskInput.value = text;
+  } catch {
+    // Ignore local storage failures.
+  }
+}
+
+function scheduleDraftSave() {
+  window.clearTimeout(state.draftSaveTimer);
+  state.draftSaveTimer = window.setTimeout(() => saveDraftNow(), 250);
+}
+
+function restoreDraft(runId = state.currentId) {
+  if (state.draftLoadedRunId === String(runId || 'new')) return;
+  state.draftLoadedRunId = String(runId || 'new');
+  try {
+    const draft = JSON.parse(localStorage.getItem(draftStorageKey(runId)) || 'null');
+    if (draft && typeof draft.text === 'string' && !el.quickTaskInput.value.trim()) {
+      el.quickTaskInput.value = draft.text;
+      resizeComposer();
+    }
+  } catch {
+    // Ignore malformed or unavailable local drafts.
+  }
+}
+
+const UNREAD_STORAGE_KEY = 'multiagent.unread-runs.v1';
+
+function loadUnreadRuns(workspace) {
+  try {
+    const raw = JSON.parse(localStorage.getItem(`${UNREAD_STORAGE_KEY}:${workspace}`) || '[]');
+    state.unreadRuns = new Set(Array.isArray(raw) ? raw.filter((id) => typeof id === 'string') : []);
+  } catch {
+    state.unreadRuns = new Set();
+  }
+}
+
+function persistUnreadRuns() {
+  const workspace = state.health?.workspace || '';
+  if (!workspace) return;
+  localStorage.setItem(`${UNREAD_STORAGE_KEY}:${workspace}`, JSON.stringify([...state.unreadRuns]));
+}
+
+function markRunUnread(runId, title, body) {
+  if (!runId || runId === state.currentId) return;
+  state.unreadRuns.add(String(runId));
+  persistUnreadRuns();
+  renderRunList();
+  notifyBrowser(title, body, runId);
+}
+
+function clearRunUnread(runId) {
+  if (!runId || !state.unreadRuns.delete(String(runId))) return;
+  persistUnreadRuns();
+  renderRunList();
+}
+
+function notifyBrowser(title, body, runId = '') {
+  if (!state.notificationsEnabled || !('Notification' in window) || Notification.permission !== 'granted') return;
+  const key = `${runId}:${title}:${body}`;
+  if (state.notifiedEvents.has(key)) return;
+  state.notifiedEvents.add(key);
+  const notification = new Notification(title, { body, tag: runId || 'multiagent' });
+  notification.onclick = () => {
+    window.focus();
+    if (runId) selectRun(runId);
+    notification.close();
+  };
 }
 
 function renderRunList() {
@@ -1780,6 +2190,14 @@ function createRunButton(run) {
   const status = document.createElement('span');
   status.textContent = `${statusLabel(run.status)} · ${relativeTime(run.updated_at)}`;
   meta.append(dot, status);
+  if (state.unreadRuns.has(String(run.id))) {
+    const unread = document.createElement('span');
+    unread.className = 'run-item-unread';
+    unread.textContent = '新';
+    unread.title = '有新的协作更新';
+    meta.append(unread);
+  }
+  button.classList.toggle('has-unread', state.unreadRuns.has(String(run.id)));
   button.append(title, meta);
   return button;
 }
@@ -1793,14 +2211,12 @@ function toggleArchivedRuns() {
 
 function openRunContextMenu(run, clientX, clientY) {
   state.contextRunId = run.id;
-  const resume = el.contextMenu.querySelector('[data-context-action="resume"]');
   const stop = el.contextMenu.querySelector('[data-context-action="stop"]');
   const archive = el.contextMenu.querySelector('[data-context-action="archive"]');
   const deleteButton = el.contextMenu.querySelector('[data-context-action="delete"]');
   const archiveLabel = archive.querySelector('span:last-child');
   const active = run.live === true;
 
-  resume.classList.toggle('hidden', !run.resumable);
   stop.classList.toggle('hidden', !active);
   stop.disabled = String(run.status || '').toLowerCase() === 'stopping';
   stop.querySelector('span:last-child').textContent = stop.disabled ? '正在停止…' : '停止任务';
@@ -1838,10 +2254,6 @@ async function handleContextAction(action) {
   }
   if (action === 'rename') {
     openRunRename(run);
-    return;
-  }
-  if (action === 'resume') {
-    await resumeRun(run.id);
     return;
   }
   if (action === 'stop') {
@@ -1904,7 +2316,7 @@ async function submitRunRename() {
 
 async function deleteArchivedRun(run) {
   const title = displayTaskTitle(run);
-  if (!window.confirm(`永久删除“${title}”？\n\n任务记录、检查点和上传文档都会被删除，且无法恢复。`)) return;
+  if (!window.confirm(`永久删除“${title}”？\n\n任务记录和上传文档都会被删除，且无法恢复。`)) return;
   try {
     await api(`/api/runs/${encodeURIComponent(run.id)}`, { method: 'DELETE' });
     if (state.currentId === run.id) {
@@ -1947,13 +2359,13 @@ async function stopCurrentTask() {
 }
 
 async function requestTaskStop(runId) {
-  if (!window.confirm('确定停止当前任务吗？已完成的步骤和检查点会保留，可稍后恢复。')) return;
+  if (!window.confirm('确定停止当前群聊中的 Agent 吗？')) return;
   try {
     await api(`/api/sessions/${encodeURIComponent(runId)}/stop`, {
       method: 'POST',
       body: JSON.stringify({}),
     });
-    showToast('正在停止 Claude Code、Codex 和当前验证进程…');
+    showToast('正在停止 Claude Code 和 Codex…');
     await refreshAll();
   } catch (error) {
     showToast(error.message, true);
@@ -1989,10 +2401,11 @@ function renderEmpty() {
   el.emptyState.classList.remove('hidden');
   el.runView.classList.add('hidden');
   el.stopTaskButton.classList.add('hidden');
-  el.resumeButton.classList.add('hidden');
   el.statusBadge.textContent = '等待任务';
   el.statusBadge.dataset.status = 'waiting';
   document.title = 'MultiAgent 工作台';
+  closeNativeInteractionDialog();
+  restoreDraft(null);
 }
 
 function renderDetail() {
@@ -2003,8 +2416,7 @@ function renderDetail() {
   const status = detached ? 'interrupted' : recordedStatus;
   const workspace = session?.workspace || record.workspace || state.health?.workspace || '';
   const task = session?.task || record.display_task || record.task || '未命名任务';
-  const collaborationMode = session?.collaboration_mode || record.collaboration_mode || 'workflow';
-  const groupChat = collaborationMode === 'group_chat';
+  const groupChat = true;
 
   el.emptyState.classList.add('hidden');
   el.runView.classList.remove('hidden');
@@ -2015,14 +2427,15 @@ function renderDetail() {
   el.statusBadge.dataset.status = statusKey(status);
   document.title = `${task} · MultiAgent`;
   el.quickTaskInput.placeholder = groupChat
-    ? '讨论：@Claude（Claude Code）请审核…；执行：@Claude 执行：…（一次仅一个 Agent）'
+    ? '@Claude 或 @Codex 定向交流；单独点名时由该 Agent 判断是否需要修改代码'
     : '在协作大厅输入新需求，让 Claude Code 与 Codex 开始协作';
-  el.quickTaskSubmit.textContent = groupChat ? '发送消息 ◁' : '发送 ◁';
-  el.quickAttach.classList.toggle('hidden', groupChat);
+  el.quickTaskSubmit.textContent = groupChat ? '发送消息' : '发送';
+  el.quickAttach.title = groupChat ? '为这条消息添加附件' : '为新任务添加附件';
+  el.quickAttach.setAttribute('aria-label', el.quickAttach.title);
   if (!groupChat) hideMentionMenu();
 
   const error = detached
-    ? '任务已不在当前 UI 服务中运行；上次服务可能退出，可从最近检查点恢复。'
+    ? '任务已不在当前 UI 服务中运行；上次服务可能退出。'
     : session?.error || record.error || '';
   el.errorBanner.textContent = error;
   el.errorBanner.classList.toggle('notice-banner', Boolean(error) && ['interrupted', 'cancelled'].includes(status));
@@ -2033,29 +2446,32 @@ function renderDetail() {
   renderArtifacts(record, session);
   renderOverview(record, session, status);
   renderTimeline(record, session);
-  renderEvidence(record);
-  renderKanban(record);
-  renderPlanGate(session);
+  renderNativeInteraction(session);
   renderAgentProfile();
-  document.querySelectorAll('[data-main-view="tasks"]').forEach((button) => {
-    button.classList.toggle('hidden', groupChat);
-  });
-  if (groupChat && state.mainView === 'tasks') state.mainView = 'chat';
   setMainView(state.mainView);
 
-  const canResume = ['failed', 'interrupted', 'cancelled'].includes(status) && Boolean(record.checkpoint);
-  const canStop = ['starting', 'running', 'awaiting_plan', 'stopping'].includes(status);
+  const canStop = ['starting', 'running', 'awaiting_interaction', 'stopping'].includes(status);
   el.stopTaskButton.classList.toggle('hidden', !canStop);
   el.stopTaskButton.disabled = status === 'stopping';
   el.stopTaskButton.textContent = status === 'stopping' ? '■ 正在停止…' : '■ 停止';
-  el.resumeButton.classList.toggle('hidden', !canResume);
 }
 
 function renderAgentStatus(container, navDot, key, name, session, runStatus) {
   const event = session?.agent_events?.[key];
+  const interaction = (session?.native_interactions || []).find(
+    (request) => agentKeyFromName(request.source) === key,
+  );
   const stopping = runStatus === 'stopping';
-  const eventStatus = stopping ? 'stopping' : event?.status || (runStatus === 'complete' ? 'complete' : runStatus);
-  const detail = stopping ? fallbackAgentDetail(name, runStatus) : event?.safe_summary || fallbackAgentDetail(name, runStatus);
+  const eventStatus = stopping
+    ? 'stopping'
+    : interaction ? 'waiting_user'
+      : runStatus === 'awaiting_interaction' ? event?.status || 'waiting'
+        : event?.status || (runStatus === 'complete' ? 'complete' : runStatus);
+  const detail = stopping
+    ? fallbackAgentDetail(name, runStatus)
+    : interaction ? `${name} 正在等待你的权限决定或补充信息`
+      : runStatus === 'awaiting_interaction' && !event ? `${name} 当前未被此请求阻塞`
+        : event?.safe_summary || fallbackAgentDetail(name, runStatus);
   const elapsed = Number(event?.elapsed_seconds);
   container.innerHTML = `
     <div class="agent-status-title">
@@ -2070,71 +2486,132 @@ function renderAgentStatus(container, navDot, key, name, session, runStatus) {
 function fallbackAgentDetail(name, status) {
   if (status === 'complete') return '本次协作已完成';
   if (status === 'ready') return `等待下一条群聊消息或 @${name}`;
-  if (status === 'awaiting_plan') return '方案已提交，等待用户决定';
+  if (status === 'awaiting_interaction') return '正在等待你的权限决定或补充信息';
   if (status === 'stopping') return '正在安全停止当前任务';
   if (['failed', 'cancelled', 'interrupted'].includes(status)) return '当前任务已停止';
   return `等待 ${name} 的安全进度事件`;
 }
 
-function renderArtifacts(record, session) {
-  const collaborationMode = session?.collaboration_mode || record.collaboration_mode || 'workflow';
-  if (collaborationMode === 'group_chat') {
-    renderGroupChat(record, session);
+function renderNativeInteraction(session) {
+  const requests = Array.isArray(session?.native_interactions)
+    ? session.native_interactions
+    : [];
+  const request = requests[0];
+  if (!request) {
+    closeNativeInteractionDialog();
     return;
   }
-  const checkpoint = record.checkpoint || {};
-  const artifacts = checkpoint.artifacts || {};
-  const plan = session?.plan || {};
-  const task = session?.task || record.display_task || record.task || '';
-  const attachments = session?.attachments || record.attachments || [];
-  const parts = [messageCard('你', '需求方', { final_text: task, attachments }, 'user', '需求')];
-
-  const proposalA = plan.proposal_a || artifacts.proposal_a;
-  const proposalB = plan.proposal_b || artifacts.proposal_b;
-  if (proposalA) parts.push(messageCard('Claude Code', '独立方案 · 对等审核 Codex', proposalA, 'claude', '方案'));
-  if (proposalB) parts.push(messageCard('Codex', '独立方案 · 对等审核 Claude Code', proposalB, 'codex', '方案'));
-
-  const reviews = plan.cross_reviews || [artifacts.cross_review_a, artifacts.cross_review_b].filter(Boolean);
-  if (reviews[0]) parts.push(messageCard('Claude Code', '对 Codex 方案的交叉审核', reviews[0], 'claude', '审核', true));
-  if (reviews[1]) parts.push(messageCard('Codex', '对 Claude Code 方案的交叉审核', reviews[1], 'codex', '审核', true));
-
-  const unified = plan.unified_proposal || artifacts.unified_proposal;
-  if (unified) {
-    const agent = agentKeyFromName(unified.agent);
-    parts.push(messageCard(unified.agent || '协作组', '双方共同认可的统一方案', unified, agent, '统一方案', true, true));
+  if (state.nativeInteractionRunId && state.nativeInteractionRunId !== state.currentId) {
+    closeNativeInteractionDialog();
   }
+  if (
+    state.nativeInteractionId === request.id
+    && state.nativeInteractionRunId === state.currentId
+    && el.nativeInteractionDialog.open
+  ) return;
 
-  const consensus = Object.entries(artifacts)
-    .filter(([key]) => key.startsWith('consensus_review_v'))
-    .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }));
-  consensus.forEach(([key, result]) => {
-    parts.push(messageCard(result.agent || '审核', `共识审核 ${key.replace('consensus_review_', '')}`, result, agentKeyFromName(result.agent), '共识审核', true));
+  state.nativeInteractionId = request.id;
+  state.nativeInteractionRunId = state.currentId;
+  el.nativeInteractionSource.textContent = `${request.source || 'Agent'} · 原生交互请求`;
+  el.nativeInteractionTitle.textContent = request.title || '等待你的确认';
+  el.nativeInteractionQueue.textContent = requests.length > 1
+    ? `还有 ${requests.length - 1} 个请求正在排队`
+    : '';
+  el.nativeInteractionQueue.classList.toggle('hidden', requests.length <= 1);
+  el.nativeInteractionMessage.textContent = request.message || '';
+  el.nativeInteractionMessage.classList.toggle('hidden', !request.message);
+  const command = String(request.command || '');
+  el.nativeInteractionCommand.querySelector('pre').textContent = command;
+  el.nativeInteractionCommand.classList.toggle('hidden', !command);
+  const cwd = String(request.cwd || '');
+  el.nativeInteractionCwd.textContent = cwd ? `工作目录：${cwd}` : '';
+  el.nativeInteractionCwd.classList.toggle('hidden', !cwd);
+  el.nativeInteractionQuestions.innerHTML = (request.questions || []).map((question) => {
+    const id = String(question.id || 'question');
+    const options = Array.isArray(question.options) ? question.options : [];
+    const control = options.length
+      ? `<select data-native-question="${escapeHtml(id)}">
+          <option value="">请选择…</option>
+          ${options.map((option) => `<option value="${escapeHtml(option.value)}">${escapeHtml(option.label)}</option>`).join('')}
+          ${question.allow_other ? '<option value="__other__">其他…</option>' : ''}
+        </select>
+        ${question.allow_other ? `<input class="native-interaction-other hidden" data-native-other="${escapeHtml(id)}" type="${question.secret ? 'password' : 'text'}" placeholder="请输入其他回答" autocomplete="off" />` : ''}`
+      : `<input data-native-question="${escapeHtml(id)}" type="${question.secret ? 'password' : 'text'}" autocomplete="off" placeholder="请输入回答" />`;
+    return `<label class="native-interaction-question">
+      <span>${escapeHtml(question.header || '需要你的回答')}</span>
+      <strong>${escapeHtml(question.question || '请提供信息')}</strong>
+      ${control}
+    </label>`;
+  }).join('');
+  el.nativeInteractionQuestions.querySelectorAll('select[data-native-question]').forEach((select) => {
+    select.addEventListener('change', () => {
+      const other = el.nativeInteractionQuestions.querySelector(`[data-native-other="${cssEscape(select.dataset.nativeQuestion)}"]`);
+      other?.classList.toggle('hidden', select.value !== '__other__');
+      if (select.value === '__other__') other?.focus();
+    });
   });
-  if (plan.consensus_review && !consensus.length) {
-    parts.push(messageCard(plan.consensus_review.agent || '审核', '最新统一方案审核', plan.consensus_review, agentKeyFromName(plan.consensus_review.agent), '共识审核', true));
-  }
+  el.nativeInteractionActions.innerHTML = (request.options || []).map((option) => {
+    const action = String(option.value || '');
+    const tone = action === 'approve' || action === 'submit'
+      ? 'primary-button'
+      : action === 'cancel' ? 'danger-button' : 'secondary-button';
+    return `<button class="native-action ${tone}" type="button" data-native-action="${escapeHtml(action)}" title="${escapeHtml(option.description || '')}">${escapeHtml(option.label || action)}</button>`;
+  }).join('');
+  hideFormError(el.nativeInteractionError);
+  if (!el.nativeInteractionDialog.open) el.nativeInteractionDialog.showModal();
+}
 
-  if (artifacts.execution_result) {
-    const result = artifacts.execution_result;
-    parts.push(messageCard(
-      result.agent || '执行智能体',
-      '实施结果',
-      {
-        ...result,
-        changes: checkpoint.change_summary || result.changes,
-        changes_key: `workflow-${record.id || 'current'}`,
-      },
-      agentKeyFromName(result.agent),
-      '实施',
-      true,
-    ));
-  }
-  const codeReviews = Array.isArray(checkpoint.reviews) ? checkpoint.reviews : [];
-  codeReviews.forEach((review, index) => {
-    parts.push(messageCard(review.agent || '审核智能体', `第 ${index + 1} 轮代码审核`, review, agentKeyFromName(review.agent), '代码审核', true));
+async function submitNativeInteraction(action, button = null) {
+  const runId = state.nativeInteractionRunId;
+  const interactionId = state.nativeInteractionId;
+  if (!runId || !interactionId) return;
+  const answers = {};
+  el.nativeInteractionQuestions.querySelectorAll('[data-native-question]').forEach((control) => {
+    const questionId = control.dataset.nativeQuestion;
+    let value = control.value;
+    if (value === '__other__') {
+      value = el.nativeInteractionQuestions.querySelector(`[data-native-other="${cssEscape(questionId)}"]`)?.value || '';
+    }
+    answers[questionId] = value ? [value] : [];
   });
+  hideFormError(el.nativeInteractionError);
+  if (button) setButtonBusy(button, true, '正在提交…');
+  try {
+    await api(`/api/sessions/${encodeURIComponent(runId)}/interactions/${encodeURIComponent(interactionId)}`, {
+      method: 'POST',
+      body: JSON.stringify({ action, answers }),
+    });
+    closeNativeInteractionDialog();
+    showToast(action === 'deny' || action === 'cancel' ? '已拒绝原生请求。' : '已发送决定，Agent 将继续处理。');
+    await refreshAll();
+  } catch (error) {
+    showFormError(el.nativeInteractionError, error.message);
+  } finally {
+    if (button?.isConnected) setButtonBusy(button, false, button.dataset.originalLabel || button.textContent);
+  }
+}
 
-  el.artifactFeed.innerHTML = parts.join('');
+async function declineNativeInteraction() {
+  const cancel = el.nativeInteractionActions.querySelector('[data-native-action="cancel"]');
+  const deny = el.nativeInteractionActions.querySelector('[data-native-action="deny"]');
+  const button = cancel || deny;
+  if (button) await submitNativeInteraction(button.dataset.nativeAction, button);
+}
+
+function closeNativeInteractionDialog() {
+  if (el.nativeInteractionDialog.open) el.nativeInteractionDialog.close();
+  state.nativeInteractionId = null;
+  state.nativeInteractionRunId = null;
+  hideFormError(el.nativeInteractionError);
+}
+
+function cssEscape(value) {
+  if (window.CSS?.escape) return window.CSS.escape(String(value || ''));
+  return String(value || '').replace(/[^A-Za-z0-9_-]/g, '\\$&');
+}
+
+function renderArtifacts(record, session) {
+  renderGroupChat(record, session);
 }
 
 function renderGroupChat(record, session) {
@@ -2145,7 +2622,7 @@ function renderGroupChat(record, session) {
     serverMessages,
     session?.status || record.status,
   );
-  const pendingUsers = pendingTurns.filter((message) => !message.server_user_id);
+  const pendingUsers = pendingTurns.filter((message) => !message.server_user_id && !message.hidden);
   const pendingReplies = pendingTurns.flatMap((turn) => (
     (turn.waiting_recipients || turn.expected_recipients).map((agent) => ({
       id: `${turn.client_id}-${agent}`,
@@ -2156,10 +2633,14 @@ function renderGroupChat(record, session) {
       created_at: turn.created_at,
       action: turn.action,
       loading_reply: true,
+      reply_to: turn.server_user_id || turn.client_id,
     }))
   ));
-  const messages = [...serverMessages, ...pendingUsers, ...pendingReplies];
-  const parts = messages.map((message) => {
+  const messages = orderGroupChatMessages(serverMessages, pendingUsers, pendingReplies)
+    .filter((message) => !message.hidden);
+  const runId = record.id || state.currentId || 'current';
+  state.messageTexts.clear();
+  const entries = messages.map((message, index) => {
     const sender = message.sender || 'system';
     const user = sender === 'user';
     const recipients = Array.isArray(message.recipients) ? message.recipients : [];
@@ -2170,14 +2651,21 @@ function renderGroupChat(record, session) {
     const execution = message.action === 'execute';
     const optimistic = message.optimistic === true;
     const loadingReply = message.loading_reply === true;
+    const failureReason = String(message.failure_reason || '');
+    const failedReply = message.status === 'failed' || Boolean(failureReason);
+    const feedKey = `msg-${message.id || message.client_id || `${sender}-${index}`}`;
     const role = loadingReply
       ? '正在回复 · 等待内容'
+      : failedReply
+      ? `${failureReason === 'timeout' ? '响应超时' : '回复失败'} · 共享给所有成员`
       : optimistic
       ? message.delivery_status === 'accepted' ? '已发送 · 等待 Agent 回复' : '正在发送到群聊'
       : user
-      ? `${execution ? '执行请求' : '讨论消息'} · 发送给 ${recipientNames || '群聊'}`
+      ? `${message.edited_from ? '编辑后重新发送' : execution ? '执行请求' : '讨论消息'} · 发送给 ${recipientNames || '群聊'}`
+      : message.retry_of
+      ? `${message.retry_mode === 'continue' ? '继续回复' : '重新生成'} · 共享给所有成员`
       : execution ? '目标工作区执行结果 · 共享给所有成员' : '群聊回复 · 共享给所有成员';
-    return messageCard(
+    const html = messageCard(
       user ? '你' : agentName(sender),
       role,
       {
@@ -2187,19 +2675,109 @@ function renderGroupChat(record, session) {
         created_at: message.created_at || '',
         workspace: message.workspace || '',
         changes: message.changes || null,
-        changes_key: `chat-${record.id || 'current'}-${message.id || 'message'}`,
+        changes_key: `chat-${runId}-${message.id || 'message'}`,
+        message_id: message.id || '',
+        retry_of: message.retry_of || '',
         pending: optimistic,
         loading: loadingReply,
+        failed: failedReply,
+        feed_key: feedKey,
+        quotable: !optimistic && !loadingReply && !failedReply,
+        run_id: runId,
       },
       user ? 'user' : sender,
       loadingReply
         ? '回复中'
+        : failedReply
+        ? failureReason === 'timeout' ? '超时' : '失败'
         : optimistic
         ? message.delivery_status === 'accepted' ? '已发送' : '发送中'
         : execution ? (user ? '执行' : '执行结果') : (user ? '消息' : '回复'),
     );
+    return { key: feedKey, html };
   });
-  el.artifactFeed.innerHTML = parts.join('') || '<div class="board-empty">发送第一条消息开始群聊。</div>';
+  patchFeed(runId, entries, `<div class="chat-empty">
+    <span class="chat-empty-mark" aria-hidden="true">@</span>
+    <strong>发送第一条消息开始群聊</strong>
+    <small>输入 @ 可选择响应者，也可以直接发送给默认成员；附件支持点击、拖放或粘贴图片。</small>
+  </div>`);
+  appendStreamToFeed(runId);
+}
+
+const feedHtmlCache = new Map();
+let feedCacheRunId = null;
+
+// Keyed incremental patch of the message feed. Rebuilding the whole subtree on
+// every SSE tick dropped text selection, collapsed <details> state and reset the
+// scroll position, so only nodes whose markup actually changed are replaced.
+function patchFeed(runId, entries, emptyMarkup = '') {
+  const container = el.artifactFeed;
+  if (feedCacheRunId !== runId) {
+    feedCacheRunId = runId;
+    feedHtmlCache.clear();
+    container.replaceChildren();
+    state.feedPinnedToBottom = true;
+  }
+  const pinned = state.feedPinnedToBottom || isFeedNearBottom();
+
+  if (!entries.length) {
+    feedHtmlCache.clear();
+    container.innerHTML = emptyMarkup;
+    updateFeedJumpButton();
+    return;
+  }
+
+  const existing = new Map();
+  Array.from(container.children).forEach((node) => {
+    const key = node instanceof HTMLElement ? node.dataset.feedKey : '';
+    if (key) existing.set(key, node);
+    else node.remove();
+  });
+
+  const keys = new Set(entries.map((entry) => entry.key));
+  let previous = null;
+  entries.forEach((entry) => {
+    let node = existing.get(entry.key) || null;
+    if (node && feedHtmlCache.get(entry.key) !== entry.html) {
+      const replacement = nodeFromMarkup(entry.html);
+      if (replacement) {
+        node.replaceWith(replacement);
+        node = replacement;
+      }
+    }
+    if (!node) node = nodeFromMarkup(entry.html);
+    if (!node) return;
+    feedHtmlCache.set(entry.key, entry.html);
+    existing.set(entry.key, node);
+    const anchor = previous ? previous.nextSibling : container.firstChild;
+    if (node !== anchor) container.insertBefore(node, anchor);
+    previous = node;
+  });
+
+  existing.forEach((node, key) => {
+    if (keys.has(key)) return;
+    node.remove();
+    feedHtmlCache.delete(key);
+  });
+
+  if (pinned) scrollChatToBottom();
+  else updateFeedJumpButton();
+}
+
+function nodeFromMarkup(html) {
+  const template = document.createElement('template');
+  template.innerHTML = String(html || '').trim();
+  return template.content.firstElementChild;
+}
+
+function isFeedNearBottom(threshold = 140) {
+  const container = el.artifactFeed;
+  return container.scrollHeight - container.scrollTop - container.clientHeight <= threshold;
+}
+
+function updateFeedJumpButton() {
+  if (!el.feedJump) return;
+  el.feedJump.classList.toggle('hidden', isFeedNearBottom());
 }
 
 function messageCard(name, role, result, agent, tag, details = false, highlight = false) {
@@ -2213,7 +2791,11 @@ function messageCard(name, role, result, agent, tag, details = false, highlight 
   const changes = result.changes;
   const pending = result.pending === true;
   const loading = result.loading === true;
-  return `<article class="message-row message-${speaker}${highlight ? ' message-highlight' : ''}${pending ? ' message-pending' : ''}${loading ? ' message-loading' : ''}">
+  const failed = result.failed === true;
+  const feedKey = String(result.feed_key || '');
+  if (feedKey && text) state.messageTexts.set(feedKey, String(text));
+  const tools = loading || !text ? '' : messageToolsMarkup(feedKey, result.quotable === true, result.message_id || '');
+  return `<article class="message-row message-${speaker}${highlight ? ' message-highlight' : ''}${pending ? ' message-pending' : ''}${loading ? ' message-loading' : ''}${failed ? ' message-failed' : ''}"${feedKey ? ` data-feed-key="${escapeHtml(feedKey)}"` : ''}>
     ${avatarMarkup(agent)}
     <div class="message-main">
       <div class="message-header">
@@ -2225,10 +2807,32 @@ function messageCard(name, role, result, agent, tag, details = false, highlight 
       ${workspace ? `<div class="execution-workspace"><strong>写入工作区</strong><code title="${escapeHtml(workspace)}">${escapeHtml(workspace)}</code></div>` : ''}
       ${loading ? replyLoadingMarkup(name) : `<div class="markdown-body">${renderMarkdown(normalizeContent(text))}</div>`}
       ${changeSummaryMarkup(changes, result.changes_key)}
-      ${attachmentMarkup(attachments)}
-      ${details ? '<div class="message-actions"><button class="thread-button" data-open-detail="evidence" type="button">▢ 查看证据</button></div>' : ''}
+      ${attachmentMarkup(attachments, result.run_id)}
+      ${details ? '<div class="message-actions"><button class="thread-button" data-open-detail="overview" type="button">▢ 查看详情</button></div>' : ''}
+      ${tools}
     </div>
   </article>`;
+}
+
+function messageToolsMarkup(feedKey, quotable, messageId = '') {
+  if (!feedKey) return '';
+  const message = findGroupChatMessage(messageId || feedKey.replace(/^msg-/, ''));
+  const quote = quotable
+    ? `<button class="message-tool" data-message-quote="${escapeHtml(feedKey)}" type="button" title="引用这条消息回复">❝ 引用</button>`
+    : '';
+  const edit = message?.sender === 'user' && !message.hidden
+    ? `<button class="message-tool" data-message-edit="${escapeHtml(message.id)}" type="button" title="编辑后重新发送">✎ 编辑</button>`
+    : '';
+  const retry = message?.role === 'assistant' && !message.hidden
+    ? `<button class="message-tool" data-message-retry="${escapeHtml(message.id)}" data-retry-mode="regenerate" type="button" title="重新生成这条回复">↻ 重试</button>
+       <button class="message-tool" data-message-retry="${escapeHtml(message.id)}" data-retry-mode="continue" type="button" title="继续生成这条回复">⋯ 继续</button>`
+    : '';
+  return `<div class="message-tools">
+    <button class="message-tool" data-message-copy="${escapeHtml(feedKey)}" type="button" title="复制这条消息的原文">⧉ 复制</button>
+    ${edit}
+    ${retry}
+    ${quote}
+  </div>`;
 }
 
 function replyLoadingMarkup(name) {
@@ -2317,9 +2921,28 @@ function changeStatusLabel(status) {
   return { added: '新增', deleted: '删除', modified: '修改' }[status] || '修改';
 }
 
-function attachmentMarkup(attachments) {
+function attachmentMarkup(attachments, runId) {
   if (!attachments.length) return '';
-  return `<div class="message-attachments">${attachments.map((item) => `<span class="message-attachment" title="${escapeHtml(item.path || item.name || '')}"><span aria-hidden="true">▧</span><strong>${escapeHtml(item.name || '文档')}</strong><small>${escapeHtml(formatBytes(item.size || 0))}</small></span>`).join('')}</div>`;
+  return `<div class="message-attachments">${attachments.map((item) => {
+    const name = item.name || '文档';
+    const size = escapeHtml(formatBytes(item.size || 0));
+    const title = escapeHtml(item.path || name);
+    const label = `<span aria-hidden="true">▧</span><strong>${escapeHtml(name)}</strong><small>${size}</small>`;
+    if (item.pending || !runId || !item.name) {
+      return `<span class="message-attachment" title="${title}">${label}</span>`;
+    }
+    const href = `/api/runs/${encodeURIComponent(runId)}/attachments/${encodeURIComponent(item.name)}`;
+    const extension = item.name.includes('.') ? item.name.split('.').at(-1).toLowerCase() : '';
+    if (IMAGE_EXTENSIONS.has(extension)) {
+      // ?inline=1 is served with a content type derived from the validated
+      // extension, so rendering it in an <img> cannot smuggle active content.
+      return `<figure class="message-attachment message-attachment-image" title="${title}">
+        <a class="message-attachment-preview" href="${escapeHtml(href)}?inline=1" target="_blank" rel="noopener" aria-label="预览 ${escapeHtml(name)}"><img src="${escapeHtml(href)}?inline=1" alt="${escapeHtml(name)}" loading="lazy" /></a>
+        <figcaption><span><strong>${escapeHtml(name)}</strong><small>${size}</small></span><a href="${escapeHtml(href)}" download="${escapeHtml(name)}">下载</a></figcaption>
+      </figure>`;
+    }
+    return `<a class="message-attachment message-attachment-link" href="${escapeHtml(href)}" download="${escapeHtml(name)}" title="${title}">${label}</a>`;
+  }).join('')}</div>`;
 }
 
 function avatarMarkup(agent) {
@@ -2330,25 +2953,19 @@ function avatarMarkup(agent) {
 
 function renderOverview(record, session, status) {
   const summary = record.summary || {};
-  const checkpoint = record.checkpoint || {};
-  const collaboration = record.collaboration || checkpoint.collaboration || {};
-  const collaborationMode = session?.collaboration_mode || record.collaboration_mode || 'workflow';
   const rows = [
     ['状态', statusLabel(status)],
     ['工作区', compactPath(session?.workspace || record.workspace || '')],
-    ['协作模式', collaborationMode === 'group_chat' ? '群聊协作' : '共识实施'],
-    ['执行方式', collaborationMode === 'group_chat' ? '按消息中的 @ 动态指定' : agentName(session?.executor || record.executor)],
-    ['方案版本', `v${collaboration.proposal_version || 0}`],
-    ['流程细节', collaborationMode === 'group_chat' ? '讨论只读 · 单 Agent 写目标工作区 · 全员共享上下文' : (session?.consensus ?? record.consensus) ? '证据化共识' : '快速协作'],
+    ['协作模式', '群聊协作'],
+    ['执行方式', '按消息中的 @ 动态指定'],
+    ['流程细节', '讨论只读 · 单 Agent 写目标工作区 · 全员共享上下文'],
     ['累计耗时', formatDuration(summary.elapsed_seconds || 0)],
     ['运行次数', String(record.attempts || 1)],
     ['输入令牌数', formatNumber(summary.input_tokens || 0)],
     ['输出令牌数', formatNumber(summary.output_tokens || 0)],
     ['上传文档', `${Array.isArray(session?.attachments || record.attachments) ? (session?.attachments || record.attachments).length : 0} 个`],
   ];
-  if (collaborationMode === 'group_chat') {
-    rows.push(['执行轮次', `${summary.execution_turns || 0} 次`]);
-  }
+  rows.push(['执行轮次', `${summary.execution_turns || 0} 次`]);
   el.overview.innerHTML = rows.map(([label, value]) => `<div class="info-row"><span>${escapeHtml(label)}</span><strong title="${escapeHtml(value)}">${escapeHtml(value)}</strong></div>`).join('');
 }
 
@@ -2356,7 +2973,6 @@ function renderTimeline(record, session) {
   const combined = [...(Array.isArray(record.events) ? record.events : []), ...(Array.isArray(session?.events) ? session.events : [])];
   const seen = new Set();
   const events = combined.filter((event) => {
-    if (event.kind === 'collaboration') return false;
     const key = `${event.timestamp || ''}|${event.source || ''}|${event.step_id || ''}|${event.safe_summary || ''}`;
     if (seen.has(key)) return false;
     seen.add(key);
@@ -2371,67 +2987,46 @@ function renderTimeline(record, session) {
     el.eventTimeline.innerHTML = '<div class="board-empty">智能体开始工作后，活动记录会显示在这里。</div>';
     return;
   }
-  el.eventTimeline.innerHTML = visibleEvents.map((event) => `<div class="event-item">
-    <div class="event-item-head"><span class="status-dot status-${statusKey(event.status)}"></span><strong>${escapeHtml(eventSourceLabel(event.source))}</strong></div>
-    <div>${escapeHtml(event.safe_summary || event.text || eventKindLabel(event.kind))}</div>
-    <small>${escapeHtml(stepLabel(event.step_id) || eventKindLabel(event.kind, ''))} · ${escapeHtml(formatEventTime(event.timestamp))}</small>
-  </div>`).join('');
+  el.eventTimeline.innerHTML = visibleEvents.map(renderActivityEvent).join('');
 }
 
-function renderEvidence(record) {
-  const collaboration = record.collaboration || record.checkpoint?.collaboration || {};
-  const issues = Array.isArray(collaboration.issues) ? collaboration.issues : [];
-  const requirements = Array.isArray(collaboration.requirements) ? collaboration.requirements : [];
-  const instructions = (Array.isArray(collaboration.messages) ? collaboration.messages : []).filter((message) => message.kind === 'instruction');
-  const items = [];
-
-  if (record.technical_document) {
-    items.push(evidenceItem('MARKDOWN', '技术文档已导出', record.technical_document, 'complete'));
+function renderActivityEvent(event) {
+  const activity = event.activity && typeof event.activity === 'object' ? event.activity : null;
+  if (!activity) {
+    return `<div class="event-item event-kind-${escapeHtml(String(event.kind || 'status'))}">
+      <div class="event-item-head"><span class="status-dot status-${statusKey(event.status)}"></span><strong>${escapeHtml(eventSourceLabel(event.source))}</strong></div>
+      <div>${escapeHtml(event.safe_summary || event.text || eventKindLabel(event.kind))}</div>
+      <small>${escapeHtml(stepLabel(event.step_id) || eventKindLabel(event.kind, ''))} · ${escapeHtml(formatEventTime(event.timestamp))}</small>
+    </div>`;
   }
-  issues.forEach((issue) => {
-    items.push(evidenceItem(issue.severity || '争议', `${issue.id || '争议'} · ${issue.problem || ''}`, `${issueStatusLabel(issue.status)} · ${issue.resolution || '尚未解决'}`, issue.status === 'resolved' ? 'complete' : 'failed'));
-  });
-  requirements.forEach((requirement) => {
-    items.push(evidenceItem(requirement.id || 'REQ', requirement.text || '', `${requirement.covered ? '已覆盖' : '未覆盖'} · ${(requirement.evidence || []).length} 项证据`, requirement.covered ? 'complete' : 'waiting'));
-  });
-  instructions.forEach((instruction) => {
-    items.push(evidenceItem(`你 → ${agentName(instruction.recipient)}`, instruction.body || '', '定向要求', 'awaiting_plan'));
-  });
-  el.evidenceBoard.innerHTML = items.join('') || '<div class="board-empty">暂无结构化证据或争议。</div>';
+  const type = ['command', 'file_change', 'read', 'search', 'tool'].includes(activity.type) ? activity.type : 'tool';
+  const detail = String(activity.detail || '').trim();
+  const open = detail && ['working', 'starting', 'waiting_model'].includes(String(event.status || '')) ? ' open' : '';
+  const detailMarkup = detail
+    ? `<div class="activity-card-body"><span>${escapeHtml(activity.detail_label || '详情')}</span><pre><code>${escapeHtml(detail)}</code></pre></div>`
+    : '';
+  const toolName = activity.tool_name ? `<span class="activity-tool-name">${escapeHtml(activity.tool_name)}</span>` : '';
+  return `<details class="activity-card activity-${type} ${detail ? 'activity-expandable' : 'activity-static'}"${open}>
+    <summary>
+      <span class="activity-icon" aria-hidden="true">${activityIcon(type)}</span>
+      <span class="activity-heading"><strong>${escapeHtml(activity.title || eventKindLabel(event.kind))}</strong><small>${escapeHtml(eventSourceLabel(event.source))} · ${escapeHtml(formatEventTime(event.timestamp))}</small></span>
+      ${toolName}
+      <span class="activity-state"><span class="status-dot status-${statusKey(event.status)}"></span>${escapeHtml(activityStatusLabel(event.status))}</span>
+    </summary>
+    ${detailMarkup}
+  </details>`;
 }
 
-function evidenceItem(tag, title, meta, status) {
-  return `<div class="evidence-item">
-    <div class="evidence-item-head"><span class="status-dot status-${statusKey(status)}"></span><span class="tag">${escapeHtml(tag)}</span></div>
-    <strong>${escapeHtml(title)}</strong><small>${escapeHtml(meta)}</small>
-  </div>`;
+function activityIcon(type) {
+  return { command: '&gt;_', file_change: '±', read: '▤', search: '⌕', tool: '◇' }[type] || '◇';
 }
 
-function renderKanban(record) {
-  const collaboration = record.collaboration || record.checkpoint?.collaboration || {};
-  const tasks = Array.isArray(collaboration.tasks) ? collaboration.tasks : [];
-  const columns = [
-    ['todo', '待处理'],
-    ['progress', '进行中'],
-    ['blocked', '受阻'],
-    ['done', '已完成'],
-  ];
-  el.taskCount.textContent = `本次协作共 ${tasks.length} 项任务`;
-  el.kanban.innerHTML = columns.map(([lane, label]) => {
-    const laneTasks = tasks.filter((task) => taskLane(task) === lane);
-    const cards = laneTasks.length
-      ? laneTasks.map((task, index) => `<article class="task-card"><small>协作大厅 · ${escapeHtml(task.id || String(index + 1))}</small><strong>${escapeHtml(task.title || task.id || '未命名任务')}</strong><div class="task-card-meta">负责人：${escapeHtml(agentName(task.owner))} · ${escapeHtml(statusLabel(task.status))}</div></article>`).join('')
-      : '<div class="kanban-empty">暂无任务</div>';
-    return `<section class="kanban-column"><div class="kanban-column-header"><span class="kanban-badge ${lane}">${label}</span><span class="kanban-count">${laneTasks.length}</span></div>${cards}</section>`;
-  }).join('');
-}
-
-function taskLane(task) {
-  const status = String(task.status || '').toLowerCase();
-  if (['done', 'complete', 'completed', 'approved', 'skipped'].includes(status)) return 'done';
-  if (['in_progress', 'running', 'working'].includes(status)) return 'progress';
-  if (['blocked', 'failed', 'rejected'].includes(status)) return 'blocked';
-  return 'todo';
+function activityStatusLabel(status) {
+  const value = String(status || '').toLowerCase();
+  if (['working', 'starting', 'waiting_model', 'in_progress'].includes(value)) return '进行中';
+  if (['failed', 'error'].includes(value)) return '失败';
+  if (['warning', 'waiting_user'].includes(value)) return '需处理';
+  return '已完成';
 }
 
 function renderAgentProfile() {
@@ -2443,8 +3038,10 @@ function renderAgentProfile() {
   const persistedEvent = persistedEvents.filter((item) => agentKeyFromName(item.source) === key).at(-1);
   const event = session.agent_events?.[key] || persistedEvent;
   const status = event?.status || session.status || record.status || 'waiting';
-  const role = '独立提案者、交叉审核者与对等协作者';
-  const coordinator = (session.executor || record.executor) === key ? '当前执行协调者' : '对等审核协作者';
+  const role = key === 'claude'
+    ? '需求分析与协作伙伴'
+    : '工程实现与验证协作伙伴';
+  const coordinator = '按消息点名参与，写权限随本轮动态授予';
   el.agentProfile.innerHTML = `<div class="agent-profile-card">
     ${avatarMarkup(key)}
     <h2>${escapeHtml(name)} <span class="status-dot status-${statusKey(status)}"></span></h2>
@@ -2458,76 +3055,19 @@ function renderAgentProfile() {
   </div>`;
 }
 
-function renderPlanGate(session) {
-  const waiting = session?.status === 'awaiting_plan' && Boolean(session.plan);
-  el.planGate.classList.toggle('hidden', !waiting);
-  if (!waiting) return;
-  const revisions = session.plan.revision_count || 0;
-  el.planGateNote.textContent = session.document
-    ? `已导出：${session.document}`
-    : `已人工修订 ${revisions} 次 · 可执行、整体修订、定向要求、导出或取消。`;
-}
-
-function issueStatusLabel(status) {
-  const labels = {
-    open: '待解决',
-    resolved: '已解决',
-    accepted: '已接受',
-    rejected: '已拒绝',
-    blocked: '受阻',
-  };
-  return labels[String(status || '').toLowerCase()] || String(status || '待解决');
-}
-
 function normalizeContent(text) {
-  const value = String(text || '').trim();
-  if (!value.startsWith('{')) return value;
-  try {
-    const data = JSON.parse(value);
-    if (!data || typeof data !== 'object' || !data.verdict) return value;
-    const lines = [`## 审核结论：${data.verdict === 'accept' ? '接受' : '要求修订'}`, ''];
-    if (data.criteria && typeof data.criteria === 'object') {
-      lines.push('| 审核维度 | 结果 |', '| --- | --- |');
-      const labels = {
-        requirements: '需求覆盖',
-        architecture: '架构合理性',
-        failure_paths: '失败与边界路径',
-        compatibility: '兼容性',
-        testing: '测试与验收',
-      };
-      Object.entries(data.criteria).forEach(([key, passed]) => {
-        lines.push(`| ${labels[key] || key} | ${passed ? '通过' : '未通过'} |`);
-      });
-      lines.push('');
-    }
-    appendList(lines, '已达成事项', data.agreements);
-    appendList(lines, '剩余分歧', data.remaining_disagreements);
-    appendList(lines, '要求修订', data.required_revisions);
-    if (Array.isArray(data.issues) && data.issues.length) {
-      lines.push('### 争议');
-      data.issues.forEach((issue) => {
-        lines.push(`- **${issue.id || '争议'} [${issue.severity || ''}/${issueStatusLabel(issue.status)}]** ${issue.problem || ''}`);
-        if (issue.resolution) lines.push(`  - 处理：${issue.resolution}`);
-      });
-    }
-    return lines.join('\n');
-  } catch {
-    return value;
-  }
-}
-
-function appendList(lines, title, values) {
-  if (!Array.isArray(values) || !values.length) return;
-  lines.push(`### ${title}`);
-  values.forEach((value) => lines.push(`- ${value}`));
-  lines.push('');
+  return String(text || '').trim();
 }
 
 function renderMarkdown(source) {
   const codeBlocks = [];
   const text = String(source || '').replace(/```([^\n]*)\n([\s\S]*?)```/g, (_match, language, code) => {
     const token = `@@CODEBLOCK${codeBlocks.length}@@`;
-    codeBlocks.push(`<pre><code data-language="${escapeHtml(language.trim())}">${escapeHtml(code.trimEnd())}</code></pre>`);
+    const label = language.trim();
+    codeBlocks.push(`<figure class="code-block">
+      <figcaption class="code-block-head"><span class="code-block-lang">${escapeHtml(label || '代码')}</span><button class="code-copy" type="button" data-code-copy>⧉ 复制</button></figcaption>
+      <pre><code data-language="${escapeHtml(label)}">${escapeHtml(code.trimEnd())}</code></pre>
+    </figure>`);
     return `\n${token}\n`;
   });
   const lines = text.split(/\r?\n/);
@@ -2635,11 +3175,12 @@ function setConnection(connected) {
 
 function statusKey(status) {
   const value = String(status || '').toLowerCase();
-  if (value.includes('complete') || value === 'ready' || value === 'done' || value === 'resolved' || value === 'approved') return 'complete';
+  if (value.includes('complete') || value === 'ready' || value === 'done' || value === 'resolved') return 'complete';
   if (value.includes('fail') || value.includes('error') || value === 'open') return 'failed';
   if (value.includes('interrupt')) return 'interrupted';
   if (value.includes('cancel') || value === 'blocked') return 'cancelled';
-  if (value.includes('await') || value.includes('review')) return 'awaiting_plan';
+  if (value === 'awaiting_interaction' || value === 'waiting_user') return 'awaiting_interaction';
+  if (value.includes('await')) return 'working';
   if (value === 'stopping') return 'cancelled';
   if (value.includes('run') || value.includes('work') || value.includes('progress') || value === 'starting') return 'running';
   return 'waiting';
@@ -2650,7 +3191,8 @@ function statusLabel(status) {
     starting: '正在启动',
     running: '协作中',
     ready: '等待消息',
-    awaiting_plan: '等待方案确认',
+    awaiting_interaction: '等待你的操作',
+    waiting_user: '等待你的操作',
     stopping: '正在停止',
     complete: '已完成',
     completed: '已完成',
@@ -2662,10 +3204,7 @@ function statusLabel(status) {
     pending: '待处理',
     in_progress: '进行中',
     working: '进行中',
-    reviewing: '审核中',
-    review: '审核中',
     skipped: '已跳过',
-    approved: '已通过',
     resolved: '已解决',
     rejected: '已拒绝',
     blocked: '受阻',
@@ -2711,9 +3250,11 @@ function eventKindLabel(kind, fallback = '状态更新') {
     status: '状态更新',
     result: '结果更新',
     error: '发生错误',
-    plan: '方案更新',
-    review: '审核更新',
     tool: '工具活动',
+    tool_result: '工具结果',
+    lifecycle: '运行状态',
+    interaction_request: '权限请求',
+    interaction_response: '交互结果',
   };
   return labels[String(kind || '').toLowerCase()] || fallback;
 }
@@ -2721,27 +3262,9 @@ function eventKindLabel(kind, fallback = '状态更新') {
 function stepLabel(step) {
   const value = String(step || '');
   const labels = {
-    proposal: '独立方案',
-    proposal_a: 'Claude Code 独立方案',
-    proposal_b: 'Codex 独立方案',
-    initial_planning: '初始规划',
-    cross_review: '交叉审核',
-    unified_proposal: '统一方案',
-    consensus: '共识审核',
-    implementation: '实施',
-    verification: '验证',
-    final_review: '最终审核',
-    user_plan_revision: '用户要求修订方案',
+    tool: '工具活动',
   };
   if (labels[value]) return labels[value];
-  const codeReview = value.match(/^code_review_(\d+)$/);
-  if (codeReview) return `第 ${codeReview[1]} 轮代码审核`;
-  const codeRevision = value.match(/^code_revision_(\d+)$/);
-  if (codeRevision) return `第 ${codeRevision[1]} 轮代码修订`;
-  const consensusRevision = value.match(/^consensus_revision_v(\d+)$/);
-  if (consensusRevision) return `共识方案修订 v${consensusRevision[1]}`;
-  const consensusReview = value.match(/^consensus_review_v(\d+)(?:_(.+))?$/);
-  if (consensusReview) return `共识审核 v${consensusReview[1]}${consensusReview[2] ? ` · ${agentName(consensusReview[2])}` : ''}`;
   return value;
 }
 

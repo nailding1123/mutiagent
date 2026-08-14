@@ -12,10 +12,18 @@ from multiagent_cli.adapters import (
     ClaudeEventParser,
     CodexAdapter,
     CodexEventParser,
+    _claude_interaction_request,
+    _claude_interaction_response,
+    _codex_interaction_request,
+    _codex_interaction_response,
 )
-from multiagent_cli.bridge_models import AgentCommandSettings, BridgeError
+from multiagent_cli.bridge_models import (
+    AgentCommandSettings,
+    BridgeError,
+    NativeInteractionResponse,
+)
 from multiagent_cli.bridge_config import resolve_bridge_settings
-from multiagent_cli.cli import _make_adapters
+from multiagent_cli.runtime import make_adapters
 from multiagent_cli.token_api import TokenAPICredentials
 
 
@@ -51,6 +59,8 @@ class EventParserTests(unittest.TestCase):
         self.assertEqual(parser.session_id, "thread-1")
         self.assertEqual(tool_events[0].kind, "tool")
         self.assertEqual(tool_events[0].text, "pytest")
+        self.assertEqual(tool_events[0].metadata["activity_type"], "command")
+        self.assertEqual(tool_events[0].metadata["command"], "pytest")
         self.assertEqual(text_events[0].kind, "progress")
         self.assertEqual(text_events[0].text, "修复完成")
         self.assertEqual(parser.final_text, "修复完成")
@@ -91,6 +101,8 @@ class EventParserTests(unittest.TestCase):
 
         self.assertEqual(parser.session_id, "session-1")
         self.assertEqual([event.kind for event in events], ["tool", "progress"])
+        self.assertEqual(events[0].metadata["activity_type"], "read")
+        self.assertEqual(events[0].metadata["path"], "a.py")
         self.assertEqual(parser.final_text, "最终完成")
         self.assertEqual(parser.input_tokens, 80)
         self.assertEqual(parser.output_tokens, 20)
@@ -150,7 +162,7 @@ class CommandBuilderTests(unittest.TestCase):
                 workspace=workspace,
             )
 
-            adapters = _make_adapters(settings, state_root=state_root)
+            adapters = make_adapters(settings, state_root=state_root)
             claude_command = adapters["claude"].build_command(
                 workspace=workspace,
                 mode="read",
@@ -176,6 +188,48 @@ class CommandBuilderTests(unittest.TestCase):
         self.assertIn(
             'model_providers.OpenAI.base_url="https://tokencheap.io/v1"',
             codex_command,
+        )
+
+    def test_native_request_adapters_normalize_provider_protocols(self) -> None:
+        claude_request = _claude_interaction_request(
+            {
+                "type": "control_request",
+                "request_id": "claude-1",
+                "request": {
+                    "subtype": "can_use_tool",
+                    "tool_name": "Bash",
+                    "input": {"command": "pytest -q"},
+                },
+            },
+            "Claude",
+        )
+        self.assertIsNotNone(claude_request)
+        assert claude_request is not None
+        self.assertEqual(claude_request.kind, "command_approval")
+        claude_response = _claude_interaction_response(
+            {"request_id": "claude-1"},
+            NativeInteractionResponse("approve"),
+        )
+        self.assertEqual(claude_response["response"]["request_id"], "claude-1")
+        self.assertEqual(claude_response["response"]["response"]["behavior"], "allow")
+
+        codex_request = _codex_interaction_request(
+            {
+                "id": 7,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"command": "pytest -q", "cwd": "/tmp"},
+            },
+            "Codex",
+        )
+        self.assertIsNotNone(codex_request)
+        assert codex_request is not None
+        self.assertEqual(codex_request.id, "7")
+        self.assertEqual(
+            _codex_interaction_response(
+                {"method": "item/commandExecution/requestApproval"},
+                NativeInteractionResponse("cancel"),
+            ),
+            {"decision": "cancel"},
         )
 
 
@@ -293,6 +347,49 @@ else:
         self.assertTrue(any(event.status == "waiting_model" for event in lifecycle))
         self.assertTrue(any(event.status == "completed" for event in lifecycle))
         self.assertTrue(all(event.timestamp for event in lifecycle))
+
+    def test_claude_native_control_request_round_trip(self) -> None:
+        script_text = """#!/usr/bin/env python3
+import json
+import sys
+
+initial = json.loads(sys.stdin.readline())
+print(json.dumps({
+    "type": "control_request",
+    "request_id": "approval-1",
+    "request": {
+        "subtype": "can_use_tool",
+        "tool_name": "Bash",
+        "input": {"command": "pytest -q"}
+    }
+}), flush=True)
+response = json.loads(sys.stdin.readline())
+allowed = response["response"]["response"]["behavior"] == "allow"
+print(json.dumps({
+    "type": "result",
+    "session_id": "claude-native",
+    "result": "approved" if allowed and initial["type"] == "user" else "failed",
+    "is_error": False
+}), flush=True)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            fake_cli = Path(directory) / "claude-bridge.py"
+            fake_cli.write_text(script_text, encoding="utf-8")
+            adapter = ClaudeAdapter(
+                AgentCommandSettings((sys.executable, str(fake_cli)), timeout=2)
+            )
+            requests = []
+            result = adapter.run(
+                "task",
+                workspace=Path(directory),
+                mode="write",
+                on_interaction=lambda request: (
+                    requests.append(request) or NativeInteractionResponse("approve")
+                ),
+            )
+
+        self.assertEqual(result.final_text, "approved")
+        self.assertEqual(requests[0].command, "pytest -q")
 
     def test_adapter_kills_a_native_cli_after_timeout(self) -> None:
         script_text = """#!/usr/bin/env python3

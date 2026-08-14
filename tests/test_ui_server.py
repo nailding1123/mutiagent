@@ -14,7 +14,12 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from multiagent_cli.bridge_models import AgentRunResult
+from multiagent_cli.bridge_models import (
+    AgentEvent,
+    AgentRunResult,
+    NativeInteractionOption,
+    NativeInteractionRequest,
+)
 from multiagent_cli.run_store import RunStore
 from multiagent_cli import ui_server
 from multiagent_cli.ui_server import (
@@ -42,6 +47,173 @@ class FakeChatAdapter:
 
 
 class UIServerTests(unittest.TestCase):
+    def test_native_interaction_round_trip_does_not_block_other_session_state(self) -> None:
+        published: list[tuple[str, Any]] = []
+        with tempfile.TemporaryDirectory() as directory:
+            session = UISession(
+                run_id="native-run",
+                task="task",
+                workspace=Path(directory),
+                notify=lambda kind, run_id, extra=None: published.append((kind, extra)),
+            )
+            request = NativeInteractionRequest(
+                id="provider-1",
+                source="Claude",
+                kind="command_approval",
+                title="请求执行命令",
+                command="pytest -q",
+                options=(
+                    NativeInteractionOption("approve", "允许一次"),
+                    NativeInteractionOption("cancel", "拒绝并停止"),
+                ),
+            )
+            result: list[Any] = []
+            worker = threading.Thread(
+                target=lambda: result.append(session.wait_for_native_interaction(request)),
+                daemon=True,
+            )
+            worker.start()
+            deadline = time.monotonic() + 1
+            while not session.to_dict()["native_interactions"] and time.monotonic() < deadline:
+                time.sleep(0.01)
+            public_id = session.to_dict()["native_interactions"][0]["id"]
+            self.assertEqual(session.to_dict()["status"], "awaiting_interaction")
+            session.submit_native_interaction(public_id, {"action": "approve"})
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result[0].action, "approve")
+            self.assertEqual(session.to_dict()["native_interactions"], [])
+            self.assertIn(("native_interaction", {"interaction_id": public_id}), published)
+
+    def test_stopping_session_releases_pending_native_interaction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = UISession(
+                run_id="native-stop",
+                task="task",
+                workspace=Path(directory),
+                notify=lambda *_args: None,
+            )
+            request = NativeInteractionRequest(
+                id="provider-1",
+                source="Codex",
+                kind="permission_approval",
+                title="需要权限",
+                options=(NativeInteractionOption("cancel", "拒绝并停止"),),
+            )
+            result: list[Any] = []
+            worker = threading.Thread(
+                target=lambda: result.append(session.wait_for_native_interaction(request)),
+                daemon=True,
+            )
+            session.status = "running"
+            worker.start()
+            deadline = time.monotonic() + 1
+            while not session.to_dict()["native_interactions"] and time.monotonic() < deadline:
+                time.sleep(0.01)
+            session.request_stop()
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result[0].action, "cancel")
+
+    def test_group_chat_allows_another_agent_while_first_is_replying(self) -> None:
+        claude_started = threading.Event()
+        release_claude = threading.Event()
+
+        class SlowChatAdapter(FakeChatAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                claude_started.set()
+                release_claude.wait(2)
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".multiagent.json").write_text(
+                json.dumps(
+                    {
+                        "claude": {"command": "/bin/echo"},
+                        "codex": {"command": "/bin/echo"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            claude = SlowChatAdapter(
+                "Claude",
+                [AgentRunResult("Claude", "慢回答", session_id="ca")],
+            )
+            codex = FakeChatAdapter(
+                "Codex",
+                [AgentRunResult("Codex", "先回答", session_id="cb")],
+            )
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={"claude": claude, "codex": codex},
+            ):
+                started = manager.start_task({})
+                run_id = started["id"]
+                manager.send_chat_message(run_id, {"message": "@Claude 分析一下"})
+                self.assertTrue(claude_started.wait(1))
+                manager.send_chat_message(run_id, {"message": "@Codex 回答这个问题"})
+                deadline = time.monotonic() + 1
+                while not codex.calls and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(len(codex.calls), 1)
+                self.assertEqual((manager.store.get(run_id) or {})["status"], "running")
+                release_claude.set()
+                self._wait_for_status(manager, run_id, "ready", message_count=4)
+
+        self.assertEqual(len(claude.calls), 1)
+        self.assertEqual(len(codex.calls), 1)
+
+    def test_group_chat_rejects_a_second_turn_for_the_same_busy_agent(self) -> None:
+        claude_started = threading.Event()
+        release_claude = threading.Event()
+
+        class SlowChatAdapter(FakeChatAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                claude_started.set()
+                release_claude.wait(2)
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".multiagent.json").write_text(
+                json.dumps(
+                    {
+                        "claude": {"command": "/bin/echo"},
+                        "codex": {"command": "/bin/echo"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            claude = SlowChatAdapter(
+                "Claude",
+                [AgentRunResult("Claude", "慢回答", session_id="ca")],
+            )
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={
+                    "claude": claude,
+                    "codex": FakeChatAdapter("Codex", []),
+                },
+            ):
+                run_id = manager.start_task({})["id"]
+                manager.send_chat_message(run_id, {"message": "@Claude 分析一下"})
+                self.assertTrue(claude_started.wait(1))
+                with self.assertRaisesRegex(UIError, "Claude 正在回复"):
+                    manager.send_chat_message(run_id, {"message": "@Claude 再回答一个"})
+                release_claude.set()
+                self._wait_for_status(manager, run_id, "ready", message_count=2)
+
     def test_serve_ui_reuses_an_existing_compatible_service(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -77,7 +249,6 @@ class UIServerTests(unittest.TestCase):
             (workspace / ".multiagent.json").write_text(
                 json.dumps(
                     {
-                        "collaboration_mode": "group_chat",
                         "claude": {"command": "/bin/echo"},
                         "codex": {"command": "/bin/echo"},
                     }
@@ -100,7 +271,7 @@ class UIServerTests(unittest.TestCase):
                 default_workspace=workspace,
             )
             with patch(
-                "multiagent_cli.cli._make_adapters",
+                "multiagent_cli.runtime.make_adapters",
                 return_value={"claude": claude, "codex": codex},
             ):
                 started = manager.start_task({"task": "分别给出初始方案"})
@@ -114,7 +285,6 @@ class UIServerTests(unittest.TestCase):
 
             record = manager.store.get(run_id)
 
-        self.assertEqual(record["collaboration_mode"], "group_chat")
         self.assertEqual(record["status"], "ready")
         self.assertEqual(len(record["group_chat"]["messages"]), 5)
         self.assertEqual(len(claude.calls), 1)
@@ -144,10 +314,10 @@ class UIServerTests(unittest.TestCase):
                 default_workspace=workspace,
             )
             with patch(
-                "multiagent_cli.cli._make_adapters",
+                "multiagent_cli.runtime.make_adapters",
                 return_value={"claude": claude, "codex": codex},
             ):
-                started = manager.start_task({"collaboration_mode": "group_chat"})
+                started = manager.start_task({})
                 run_id = started["id"]
                 initial_record = manager.store.get(run_id) or {}
 
@@ -168,17 +338,6 @@ class UIServerTests(unittest.TestCase):
         self.assertEqual(len(claude.calls), 1)
         self.assertEqual(codex.calls, [])
 
-    def test_workflow_still_requires_an_initial_task(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            manager = UISessionManager(
-                store=RunStore(workspace / "state"),
-                default_workspace=workspace,
-            )
-
-            with self.assertRaisesRegex(UIError, "任务不能为空"):
-                manager.start_task({"collaboration_mode": "workflow"})
-
     def test_rename_run_changes_display_title_but_preserves_original_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -187,8 +346,6 @@ class UIServerTests(unittest.TestCase):
                 task="原始需求内容",
                 display_task="原名称",
                 workspace=workspace,
-                executor="claude",
-                consensus=False,
                 run_id="rename-run",
             )
             manager = UISessionManager(store=store, default_workspace=workspace)
@@ -196,8 +353,6 @@ class UIServerTests(unittest.TestCase):
                 run_id="rename-run",
                 task="原名称",
                 workspace=workspace,
-                executor="claude",
-                consensus=False,
                 notify=manager.publish,
             )
             manager._reserve_session(session)
@@ -232,7 +387,6 @@ class UIServerTests(unittest.TestCase):
             (workspace / ".multiagent.json").write_text(
                 json.dumps(
                     {
-                        "collaboration_mode": "group_chat",
                         "claude": {"command": "/bin/echo"},
                         "codex": {"command": "/bin/echo"},
                     }
@@ -269,7 +423,7 @@ class UIServerTests(unittest.TestCase):
                 default_workspace=workspace,
             )
             with patch(
-                "multiagent_cli.cli._make_adapters",
+                "multiagent_cli.runtime.make_adapters",
                 return_value={"claude": claude, "codex": codex},
             ):
                 started = manager.start_task({"task": "@Claude 执行：生成结果文件"})
@@ -317,8 +471,6 @@ class UIServerTests(unittest.TestCase):
             (workspace / ".multiagent.json").write_text(
                 json.dumps(
                     {
-                        "planning_collaboration": False,
-                        "plan_approval": False,
                         "claude": {"command": "/bin/echo"},
                         "codex": {"command": "/bin/echo"},
                     }
@@ -352,9 +504,341 @@ class UIServerTests(unittest.TestCase):
             self.assertEqual(attachment["name"], "requirements.md")
             self.assertEqual(attachment_path.read_bytes(), content)
             self.assertEqual(attachment_path.stat().st_mode & 0o777, 0o400)
-            self.assertIn(str(attachment_path), session.agent_task)
+            mirror_path = Path(attachment["workspace_path"])
+            self.assertEqual(mirror_path.read_bytes(), content)
+            self.assertIn(str(mirror_path), session.agent_task)
+            self.assertNotIn(str(attachment_path), session.agent_task)
             self.assertIn("请先读取", session.agent_task)
             self.assertNotIn("data", attachment)
+
+    def test_pasted_images_are_accepted_but_svg_stays_rejected(self) -> None:
+        """Raster uploads back the paste-a-screenshot flow; svg must stay out
+        because serving it inline would be a same-origin XSS document."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".multiagent.json").write_text(
+                json.dumps(
+                    {
+                        "claude": {"command": "/bin/echo"},
+                        "codex": {"command": "/bin/echo"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            png = b"\x89PNG\r\n\x1a\n fake raster bytes"
+
+            with patch.object(UISessionManager, "_run_session"):
+                started = manager.start_task(
+                    {
+                        "task": "看这张截图",
+                        "attachments": [
+                            {
+                                "name": "paste-2026-08-12T09-30-00.png",
+                                "size": len(png),
+                                "content_type": "image/png",
+                                "data": base64.b64encode(png).decode("ascii"),
+                            }
+                        ],
+                    }
+                )
+
+            stored = started["attachments"][0]
+
+            self.assertEqual(stored["name"], "paste-2026-08-12T09-30-00.png")
+            self.assertEqual(Path(stored["path"]).read_bytes(), png)
+
+            with self.assertRaisesRegex(UIError, "不支持的文档格式"):
+                manager.start_task(
+                    {
+                        "task": "这个不该被接受",
+                        "attachments": [
+                            {
+                                "name": "payload.svg",
+                                "size": 4,
+                                "content_type": "image/svg+xml",
+                                "data": base64.b64encode(b"<svg").decode("ascii"),
+                            }
+                        ],
+                    }
+                )
+
+    def test_mid_chat_upload_keeps_earlier_attachments_of_the_same_run(self) -> None:
+        """The per-run upload directory already exists once a task-level
+        document was stored, so a later chat upload must extend it instead of
+        wiping it (and must not silently overwrite a same-named file)."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "_attachments"
+            first = ui_server._save_uploaded_documents(
+                root,
+                "run-1",
+                [
+                    {
+                        "name": "shot.png",
+                        "size": 5,
+                        "content_type": "image/png",
+                        "data": base64.b64encode(b"first").decode("ascii"),
+                    }
+                ],
+            )
+            second = ui_server._save_uploaded_documents(
+                root,
+                "run-1",
+                [
+                    {
+                        "name": "shot.png",
+                        "size": 6,
+                        "content_type": "image/png",
+                        "data": base64.b64encode(b"second").decode("ascii"),
+                    }
+                ],
+            )
+
+            self.assertEqual(Path(first[0]["path"]).read_bytes(), b"first")
+            self.assertNotEqual(second[0]["name"], first[0]["name"])
+            self.assertEqual(Path(second[0]["path"]).read_bytes(), b"second")
+
+            # A rejected later upload must leave the existing files untouched.
+            with self.assertRaises(UIError):
+                ui_server._save_uploaded_documents(
+                    root,
+                    "run-1",
+                    [
+                        {
+                            "name": "notes.md",
+                            "size": 2,
+                            "content_type": "text/markdown",
+                            "data": base64.b64encode(b"ok").decode("ascii"),
+                        },
+                        {
+                            "name": "bad.sh",
+                            "size": 4,
+                            "content_type": "text/plain",
+                            "data": base64.b64encode(b"exit").decode("ascii"),
+                        },
+                    ],
+                )
+
+            self.assertEqual(Path(first[0]["path"]).read_bytes(), b"first")
+            self.assertEqual(Path(second[0]["path"]).read_bytes(), b"second")
+            self.assertFalse((root / "run-1" / "notes.md").exists())
+
+    def test_accumulated_chat_attachments_stay_addressable_past_the_per_message_cap(
+        self,
+    ) -> None:
+        """The per-message cap is 5, but a chat accumulates uploads over many
+        turns. Re-applying the per-message cap when reading the record back
+        would drop the newest entries, and an attachment absent from the record
+        can no longer be downloaded."""
+
+        stored = [
+            {
+                "name": f"file-{index}.png",
+                "path": f"/tmp/run/file-{index}.png",
+                "size": 3,
+                "content_type": "image/png",
+            }
+            for index in range(ui_server.MAX_UPLOAD_FILES + 3)
+        ]
+
+        kept = ui_server._stored_attachments(stored)
+
+        self.assertEqual(len(kept), len(stored))
+        self.assertEqual(kept[-1]["name"], stored[-1]["name"])
+
+        overflowing = [
+            {
+                "name": f"file-{index}.png",
+                "path": f"/tmp/run/file-{index}.png",
+                "size": 3,
+                "content_type": "image/png",
+            }
+            for index in range(ui_server.MAX_RUN_ATTACHMENTS + 5)
+        ]
+
+        bounded = ui_server._stored_attachments(overflowing)
+
+        # Growth is bounded, and it is the most recent uploads that survive.
+        self.assertEqual(len(bounded), ui_server.MAX_RUN_ATTACHMENTS)
+        self.assertEqual(bounded[-1]["name"], overflowing[-1]["name"])
+
+    def test_chat_message_attachments_are_recorded_and_given_to_the_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".multiagent.json").write_text(
+                json.dumps(
+                    {
+                        "claude": {"command": "/bin/echo"},
+                        "codex": {"command": "/bin/echo"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            claude = FakeChatAdapter(
+                "Claude",
+                [
+                    AgentRunResult("Claude", "第一轮", session_id="ca"),
+                    AgentRunResult("Claude", "看到图了", session_id="ca"),
+                ],
+            )
+            codex = FakeChatAdapter(
+                "Codex", [AgentRunResult("Codex", "第一轮", session_id="cb")]
+            )
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            png = b"\x89PNG\r\n\x1a\n bytes"
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={"claude": claude, "codex": codex},
+            ):
+                started = manager.start_task({"task": "开始"})
+                run_id = started["id"]
+                self._wait_for_status(manager, run_id, "ready")
+                manager.send_chat_message(
+                    run_id,
+                    {
+                        "message": "@Claude 看这张图",
+                        "attachments": [
+                            {
+                                "name": "screen.png",
+                                "size": len(png),
+                                "content_type": "image/png",
+                                "data": base64.b64encode(png).decode("ascii"),
+                            }
+                        ],
+                    },
+                )
+                self._wait_for_status(manager, run_id, "ready", message_count=5)
+
+            record = manager.store.get(run_id)
+            names = [item["name"] for item in record["attachments"]]
+            prompt = claude.calls[-1]["prompt"]
+            user_messages = [
+                message
+                for message in record["group_chat"]["messages"]
+                if message["role"] == "user"
+            ]
+
+        # The record must own the upload, otherwise the download route refuses it.
+        self.assertIn("screen.png", names)
+        # The agent gets the absolute path and reads the image with its own tool.
+        self.assertIn("screen.png", prompt)
+        self.assertIn("请先读取", prompt)
+        self.assertEqual(
+            [item["name"] for item in user_messages[-1]["attachments"]],
+            ["screen.png"],
+        )
+
+    def test_attachment_prompt_points_agents_at_the_workspace_mirror(self) -> None:
+        """Agents are sandboxed to the workspace, so the prompt must reference
+        the in-workspace mirror copy while the record keeps the store path
+        (the download route authorizes against the record)."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".multiagent.json").write_text(
+                json.dumps(
+                    {
+                        "claude": {"command": "/bin/echo"},
+                        "codex": {"command": "/bin/echo"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            claude = FakeChatAdapter(
+                "Claude", [AgentRunResult("Claude", "收到", session_id="ca")]
+            )
+            codex = FakeChatAdapter(
+                "Codex", [AgentRunResult("Codex", "收到", session_id="cb")]
+            )
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            png = b"\x89PNG\r\n\x1a\n mirror me"
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={"claude": claude, "codex": codex},
+            ):
+                started = manager.start_task(
+                    {
+                        "task": "@Claude 读这张图",
+                        "attachments": [
+                            {
+                                "name": "shot.png",
+                                "size": len(png),
+                                "content_type": "image/png",
+                                "data": base64.b64encode(png).decode("ascii"),
+                            }
+                        ],
+                    }
+                )
+                self._wait_for_status(manager, started["id"], "ready")
+
+            record = manager.store.get(started["id"])
+            stored = record["attachments"][0]
+            prompt = claude.calls[-1]["prompt"]
+            mirror = (
+                workspace / ".multiagent" / "attachments" / started["id"] / "shot.png"
+            )
+
+            # The mirror copy exists inside the workspace with the same bytes.
+            self.assertTrue(mirror.is_file())
+            self.assertEqual(mirror.read_bytes(), png)
+            # The prompt hands the agent the in-workspace path it can open.
+            self.assertIn(str(mirror), prompt)
+            # The record stays on the store path so the download route keeps
+            # working and no sandbox escape is implied.
+            self.assertIn(str(manager.attachments_root), stored["path"])
+            self.assertNotIn(".multiagent", stored["path"])
+
+    def test_delete_run_removes_the_workspace_attachment_mirror(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = RunStore(workspace / "state")
+            manager = UISessionManager(store=store, default_workspace=workspace)
+            record = store.start(
+                task="带镜像的群聊",
+                workspace=workspace,
+                run_id="mirror-delete",
+            )
+            mirror = (
+                workspace / ".multiagent" / "attachments" / record["id"]
+            )
+            mirror.mkdir(parents=True)
+            (mirror / "shot.png").write_bytes(b"bytes")
+            store.update(record["id"], status="complete", archived=True)
+
+            manager.delete_run(record["id"])
+
+            self.assertFalse(mirror.exists())
+
+    def test_workspace_mirror_failure_does_not_break_the_upload(self) -> None:
+        """Mirroring is best-effort: an unwritable workspace dir must not
+        fail the upload, and the prompt falls back to the original path."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            attachments = [
+                {
+                    "name": "shot.png",
+                    "path": str(workspace / "original.png"),
+                    "size": 3,
+                    "content_type": "image/png",
+                }
+            ]
+            (workspace / "original.png").write_bytes(b"png")
+
+            text = ui_server._task_with_attachments("看图", attachments)
+
+            self.assertIn(str(workspace / "original.png"), text)
 
     def test_upload_rejects_unsafe_document_format(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -362,7 +846,6 @@ class UIServerTests(unittest.TestCase):
             (workspace / ".multiagent.json").write_text(
                 json.dumps(
                     {
-                        "planning_collaboration": False,
                         "claude": {"command": "/bin/echo"},
                         "codex": {"command": "/bin/echo"},
                     }
@@ -396,8 +879,6 @@ class UIServerTests(unittest.TestCase):
             record = store.start(
                 task="待删除任务",
                 workspace=workspace,
-                executor="claude",
-                consensus=False,
                 run_id="delete-archived",
             )
             attachment_directory = manager.attachments_root / record["id"]
@@ -413,56 +894,6 @@ class UIServerTests(unittest.TestCase):
             self.assertIsNone(store.get(record["id"]))
             self.assertFalse(attachment_directory.exists())
 
-    def test_orphaned_running_record_is_shown_as_interrupted_and_resumable(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            store = RunStore(workspace / "state")
-            store.start(
-                task="旧服务遗留任务",
-                workspace=workspace,
-                executor="claude",
-                consensus=False,
-                run_id="orphaned-run",
-            )
-            store.update(
-                "orphaned-run",
-                phase="initialized",
-                checkpoint={"phase": "initialized"},
-            )
-            manager = UISessionManager(store=store, default_workspace=workspace)
-
-            summary = manager.list_runs()[0]
-            detail = manager.run_detail("orphaned-run")
-
-            self.assertEqual(summary["status"], "interrupted")
-            self.assertTrue(summary["resumable"])
-            self.assertTrue(summary["detached"])
-            self.assertEqual(detail["record"]["status"], "interrupted")
-            self.assertIn("不在当前 UI 服务", detail["record"]["error"])
-            self.assertEqual(store.get("orphaned-run")["status"], "running")
-            with self.assertRaisesRegex(UIError, "不属于当前 UI 服务"):
-                manager.stop_task("orphaned-run")
-
-            archived = manager.set_archived("orphaned-run", True)
-            self.assertTrue(archived["archived"])
-            self.assertEqual(archived["status"], "interrupted")
-            self.assertEqual(store.get("orphaned-run")["status"], "interrupted")
-
-            live = UISession(
-                run_id="orphaned-run",
-                task="恢复后的活动任务",
-                workspace=workspace,
-                executor="claude",
-                consensus=False,
-                notify=manager.publish,
-            )
-            manager._reserve_session(live)
-            active_summary = manager.list_runs()[0]
-
-        self.assertEqual(active_summary["status"], "starting")
-        self.assertTrue(active_summary["live"])
-        self.assertFalse(active_summary["resumable"])
-
     def test_public_sessions_and_records_hide_internal_error_details(self) -> None:
         secret_error = "failed at /private/project with token sk-example-secret"
         with tempfile.TemporaryDirectory() as directory:
@@ -471,8 +902,6 @@ class UIServerTests(unittest.TestCase):
             store.start(
                 task="失败任务",
                 workspace=workspace,
-                executor="codex",
-                consensus=False,
                 run_id="failed-secret",
             )
             store.update("failed-secret", status="failed", error=secret_error)
@@ -481,8 +910,6 @@ class UIServerTests(unittest.TestCase):
                 run_id="live-secret",
                 task="活动失败任务",
                 workspace=workspace,
-                executor="codex",
-                consensus=False,
                 notify=manager.publish,
             )
             session.fail(secret_error)
@@ -491,67 +918,10 @@ class UIServerTests(unittest.TestCase):
             detail = manager.run_detail("failed-secret")
             live = session.to_dict()
 
-        self.assertEqual(summary["error"], "任务执行失败")
-        self.assertEqual(detail["record"]["error"], "任务执行失败")
-        self.assertEqual(live["error"], "任务执行失败")
+        self.assertEqual(summary["error"], "群聊处理失败")
+        self.assertEqual(detail["record"]["error"], "群聊处理失败")
+        self.assertEqual(live["error"], "群聊处理失败")
         self.assertNotIn("sk-example-secret", json.dumps(detail))
-
-    def test_running_ui_task_stops_both_agents_and_keeps_checkpoint(self) -> None:
-        script_text = """#!/usr/bin/env python3
-import sys
-import time
-sys.stdin.read()
-time.sleep(30)
-"""
-        with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            fake_cli = workspace / "slow-agent.py"
-            fake_cli.write_text(script_text, encoding="utf-8")
-            (workspace / ".multiagent.json").write_text(
-                json.dumps(
-                    {
-                        "planning_collaboration": True,
-                        "plan_approval": False,
-                        "claude": {
-                            "command": [sys.executable, str(fake_cli)]
-                        },
-                        "codex": {
-                            "command": [sys.executable, str(fake_cli)]
-                        },
-                    }
-                ),
-                encoding="utf-8",
-            )
-            store = RunStore(workspace / "state")
-            manager = UISessionManager(store=store, default_workspace=workspace)
-            started = manager.start_task({"task": "停止双 Agent"})
-            run_id = started["id"]
-
-            deadline = time.monotonic() + 4
-            while time.monotonic() < deadline:
-                session = manager.session(run_id)
-                if session is not None and len(session.to_dict()["agent_events"]) == 2:
-                    break
-                time.sleep(0.02)
-            else:
-                self.fail("两个 Agent 未在限定时间内启动")
-
-            stopping = manager.stop_task(run_id)
-            self.assertEqual(stopping["status"], "stopping")
-            deadline = time.monotonic() + 4
-            while time.monotonic() < deadline:
-                finished = manager.session(run_id).to_dict()
-                if finished["status"] == "interrupted":
-                    break
-                time.sleep(0.02)
-            else:
-                self.fail("任务未在限定时间内停止")
-
-            record = store.get(run_id)
-
-        self.assertEqual(finished["exit_code"], 130)
-        self.assertEqual(record["status"], "interrupted")
-        self.assertEqual(record["checkpoint"]["phase"], "initialized")
 
     def test_resume_uses_saved_snapshot_when_config_file_was_removed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -560,14 +930,10 @@ time.sleep(30)
             store.start(
                 task="恢复任务",
                 workspace=workspace,
-                executor="claude",
-                consensus=False,
                 run_id="resume-snapshot",
                 settings_snapshot={
                     "config_path": str(workspace / "removed.json"),
                     "resolved_config": {
-                        "planning_collaboration": False,
-                        "plan_approval": False,
                         "claude": {"command": "/bin/echo"},
                         "codex": {"command": "/bin/echo"},
                     },
@@ -580,7 +946,7 @@ time.sleep(30)
                 session = manager.start_task({"resume_id": "resume-snapshot"})
 
             self.assertEqual(session["id"], "resume-snapshot")
-            self.assertEqual(session["status"], "starting")
+            self.assertEqual(session["status"], "running")
 
     def test_resume_rejects_path_like_run_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -603,16 +969,12 @@ time.sleep(30)
                 run_id="first",
                 task="first",
                 workspace=workspace,
-                executor="claude",
-                consensus=False,
                 notify=manager.publish,
             )
             second = UISession(
                 run_id="second",
                 task="second",
                 workspace=workspace,
-                executor="codex",
-                consensus=False,
                 notify=manager.publish,
             )
 
@@ -631,8 +993,6 @@ time.sleep(30)
                 run_id="active-shutdown",
                 task="运行中任务",
                 workspace=workspace,
-                executor="claude",
-                consensus=False,
                 notify=manager.publish,
             )
             manager._reserve_session(session)
@@ -650,8 +1010,6 @@ time.sleep(30)
             store.start(
                 task="归档任务",
                 workspace=workspace,
-                executor="claude",
-                consensus=False,
                 run_id="archive-run",
             )
             manager = UISessionManager(store=store, default_workspace=workspace)
@@ -659,8 +1017,6 @@ time.sleep(30)
                 run_id="archive-run",
                 task="归档任务",
                 workspace=workspace,
-                executor="claude",
-                consensus=False,
                 notify=manager.publish,
             )
             manager._reserve_session(live)
@@ -686,6 +1042,8 @@ time.sleep(30)
                 json.dumps(
                     {
                         "custom_extension": {"enabled": True},
+                        "consensus": True,
+                        "verification": {"commands": [["python3", "-m", "unittest"]]},
                         "api_key": "never-return-this-value",
                         "claude": {
                             "command": "/bin/echo",
@@ -703,21 +1061,12 @@ time.sleep(30)
             loaded = manager.get_settings()
             self.assertNotIn("never-return-this-value", json.dumps(loaded))
             values = loaded["values"]
-            values["executor"] = "codex"
-            values["collaboration_mode"] = "group_chat"
             values["group_chat_default_agent"] = "codex"
             values["group_chat_execution"] = False
-            values["identities"]["agent_a"] = "共识 Claude 身份"
-            values["identities"]["agent_b"] = "共识 Codex 身份"
             values["group_chat_identities"]["agent_a"] = "群聊 Claude 身份"
             values["group_chat_identities"]["agent_b"] = "群聊 Codex 身份"
-            values["consensus"] = True
-            values["max_consensus_rounds"] = 5
             values["claude"]["model"] = "claude-test"
             values["codex"]["model"] = "codex-test"
-            values["verification"]["commands"] = [
-                {"name": "echo", "command": ["/bin/echo", "ok"]}
-            ]
             values["ui"] = {
                 "theme": "ocean",
                 "show_archived": True,
@@ -744,19 +1093,16 @@ time.sleep(30)
             )
             persisted = json.loads(config_path.read_text(encoding="utf-8"))
 
-            self.assertEqual(saved["values"]["executor"], "codex")
-            self.assertEqual(saved["values"]["collaboration_mode"], "group_chat")
             self.assertEqual(saved["values"]["group_chat_default_agent"], "codex")
             self.assertFalse(saved["values"]["group_chat_execution"])
             self.assertEqual(Path(saved["source_path"]), config_path.resolve())
             self.assertEqual(persisted["custom_extension"], {"enabled": True})
+            self.assertNotIn("consensus", persisted)
+            self.assertNotIn("verification", persisted)
             self.assertEqual(persisted["api_key"], "never-return-this-value")
             self.assertEqual(persisted["claude"]["custom_agent_field"], "keep-me")
-            self.assertEqual(persisted["max_consensus_rounds"], 5)
-            self.assertEqual(persisted["collaboration_mode"], "group_chat")
             self.assertEqual(persisted["group_chat_default_agent"], "codex")
             self.assertFalse(persisted["group_chat_execution"])
-            self.assertEqual(persisted["identities"]["agent_a"], "共识 Claude 身份")
             self.assertEqual(
                 persisted["group_chat_identities"]["agent_a"],
                 "群聊 Claude 身份",
@@ -765,7 +1111,6 @@ time.sleep(30)
             self.assertTrue(persisted["ui"]["compact_sidebar"])
             self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
             defaults = manager.get_settings(defaults=True)
-            self.assertEqual(defaults["values"]["executor"], "claude")
             self.assertEqual(defaults["values"]["ui"]["theme"], "paper")
             self.assertFalse(defaults["values"]["ui"]["compact_sidebar"])
 
@@ -785,7 +1130,7 @@ time.sleep(30)
             config_path.write_text(
                 json.dumps(
                     {
-                        "executor": "codex",
+                        "external_setting": "keep",
                         "custom_extension": {"keep": True},
                         "ui": {"show_archived": True},
                     }
@@ -810,7 +1155,7 @@ time.sleep(30)
             persisted = json.loads(config_path.read_text(encoding="utf-8"))
 
         self.assertEqual(saved["values"]["ui"]["theme"], "botanical")
-        self.assertEqual(persisted["executor"], "codex")
+        self.assertEqual(persisted["external_setting"], "keep")
         self.assertEqual(persisted["custom_extension"], {"keep": True})
         self.assertFalse(persisted["ui"]["show_archived"])
         self.assertTrue(persisted["ui"]["compact_sidebar"])
@@ -828,6 +1173,176 @@ time.sleep(30)
             with self.assertRaisesRegex(UIError, "界面开关必须"):
                 manager.save_ui_preferences(
                     {"workspace": directory, "ui": {"compact_sidebar": 1}}
+                )
+            saved = manager.save_ui_preferences(
+                {"workspace": directory, "ui": {"browser_notifications": True}}
+            )
+            self.assertTrue(saved["values"]["ui"]["browser_notifications"])
+
+    def _stream_session(
+        self,
+        workspace: Path,
+        enabled: bool,
+    ) -> tuple[UISession, list[tuple[str, Any]]]:
+        published: list[tuple[str, Any]] = []
+
+        def notify(kind: str, run_id: str, extra: Any = None) -> None:
+            published.append((kind, extra))
+
+        session = UISession(
+            run_id="stream-run",
+            task="task",
+            workspace=workspace,
+            notify=notify,
+            stream_gate=lambda: enabled,
+        )
+        return session, published
+
+    def test_streaming_is_off_until_the_interface_toggle_enables_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session, published = self._stream_session(Path(directory), False)
+            session.on_event(AgentEvent("Claude", "progress", "hidden text"))
+
+        self.assertEqual(published, [("event", None)])
+
+    def test_stream_updates_publish_increments_not_repeated_full_text(self) -> None:
+        """Both CLI parsers re-emit the whole current block on every update, so
+        the session must publish only the unsent tail."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            session, published = self._stream_session(Path(directory), True)
+
+            session.on_event(AgentEvent("Claude", "progress", "Hello"))
+            first = published[-1][1]
+            session.on_event(AgentEvent("Claude", "progress", "Hello world"))
+            second = published[-1][1]
+
+            # Codex emits agent_message twice (item.updated then item.completed).
+            before = len(published)
+            session.on_event(AgentEvent("Claude", "progress", "Hello world"))
+            duplicate = published[-1][1]
+            after = len(published)
+
+            session.on_event(AgentEvent("Claude", "progress", "Next block"))
+            fresh = published[-1][1]
+
+        self.assertEqual(first["stream_text"], "Hello")
+        self.assertEqual(first["source"], "Claude")
+        self.assertEqual(first["step_id"], "")
+        self.assertEqual(second["stream_text"], " world")
+        self.assertIsNone(duplicate)
+        self.assertEqual(after, before + 1)
+        self.assertEqual(fresh["stream_text"], "\n\nNext block")
+
+    def test_stream_buffer_resets_between_turns(self) -> None:
+        """Without a reset the next turn's identical opening text would be
+        mistaken for an already-sent prefix and swallowed."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            session, published = self._stream_session(Path(directory), True)
+            session.on_event(AgentEvent("Claude", "progress", "First turn"))
+            session.finish_chat_turn(state={}, status="ready")
+            session.on_event(AgentEvent("Claude", "progress", "First turn"))
+            after_finish = published[-1][1]
+
+            session.begin_chat_turn()
+            session.on_event(AgentEvent("Claude", "progress", "First turn"))
+            after_begin = published[-1][1]
+
+        self.assertEqual(after_finish["stream_text"], "First turn")
+        self.assertEqual(after_begin["stream_text"], "First turn")
+
+    def test_streaming_never_exposes_non_stream_kinds_or_touches_the_record(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session, published = self._stream_session(Path(directory), True)
+            persisted: list[dict[str, Any]] = []
+            session.bind_record_persistence(
+                lambda event: persisted.append(event.to_dict(safe=True))
+            )
+            session.on_event(AgentEvent("Claude", "tool", "cat /etc/passwd"))
+            tool_extra = published[-1][1]
+            session.on_event(AgentEvent("Claude", "progress", "raw model text"))
+
+        self.assertIsNone(tool_extra)
+        # The record keeps the sanitized view even while SSE carries raw text.
+        self.assertNotIn("raw model text", json.dumps(persisted, ensure_ascii=False))
+        self.assertNotIn("cat /etc/passwd", json.dumps(persisted, ensure_ascii=False))
+
+    def test_tool_activity_is_visible_without_enabling_text_streaming(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session, published = self._stream_session(Path(directory), False)
+            session.on_event(
+                AgentEvent(
+                    "Codex",
+                    "tool",
+                    "pytest -q",
+                    safe_summary="Codex · 正在执行命令",
+                    metadata={
+                        "activity_type": "command",
+                        "tool_name": "Bash",
+                        "command": "pytest -q",
+                    },
+                )
+            )
+
+        self.assertIsNone(published[-1][1])
+        self.assertEqual(session.events[-1]["activity"]["title"], "执行命令")
+        self.assertEqual(session.events[-1]["activity"]["detail"], "pytest -q")
+
+    def test_stream_preference_defaults_off_and_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            config_path = workspace / ".multiagent.json"
+            missing = ui_server._stream_preference(workspace)
+
+            config_path.write_text(
+                json.dumps({"ui": {"stream_model_text": True}}), encoding="utf-8"
+            )
+            enabled = ui_server._stream_preference(workspace)
+
+            config_path.write_text("{ not json", encoding="utf-8")
+            broken = ui_server._stream_preference(workspace)
+
+            config_path.write_text(
+                json.dumps({"ui": {"stream_model_text": "yes"}}), encoding="utf-8"
+            )
+            non_bool = ui_server._stream_preference(workspace)
+
+        self.assertFalse(missing)
+        self.assertTrue(enabled)
+        self.assertFalse(broken)
+        self.assertFalse(non_bool)
+
+    def test_saving_the_stream_toggle_applies_without_a_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            self.assertFalse(manager._stream_enabled())
+
+            saved = manager.save_ui_preferences(
+                {"workspace": str(workspace), "ui": {"stream_model_text": True}}
+            )
+            persisted = json.loads(
+                (workspace / ".multiagent.json").read_text(encoding="utf-8")
+            )
+
+            self.assertTrue(manager._stream_enabled())
+            self.assertTrue(saved["values"]["ui"]["stream_model_text"])
+            self.assertTrue(persisted["ui"]["stream_model_text"])
+
+            manager.save_ui_preferences(
+                {"workspace": str(workspace), "ui": {"stream_model_text": False}}
+            )
+            self.assertFalse(manager._stream_enabled())
+
+            with self.assertRaisesRegex(UIError, "界面开关必须"):
+                manager.save_ui_preferences(
+                    {"workspace": str(workspace), "ui": {"stream_model_text": 1}}
                 )
 
     def test_token_api_key_is_stored_privately_and_never_returned(self) -> None:
@@ -890,105 +1405,6 @@ time.sleep(30)
             item["path"] for item in listing["shortcuts"]
         })
 
-    def test_plan_gate_exports_then_returns_targeted_agent_decision(self) -> None:
-        plan_ready = threading.Event()
-        document_ready = threading.Event()
-        notices: list[tuple[str, str]] = []
-        document = Path("/tmp/final-plan.md")
-
-        def notify(kind: str, run_id: str) -> None:
-            notices.append((kind, run_id))
-            if kind == "plan":
-                plan_ready.set()
-            if kind == "document":
-                document_ready.set()
-
-        session = UISession(
-            run_id="run-ui",
-            task="实现界面",
-            workspace=Path("/tmp"),
-            executor="claude",
-            consensus=True,
-            notify=notify,
-        )
-        returned = []
-
-        def wait_for_decision() -> None:
-            returned.append(
-                session.wait_for_plan(
-                    AgentRunResult("Claude", "Agent A 方案"),
-                    AgentRunResult("Codex", "Agent B 方案"),
-                    (
-                        AgentRunResult("Claude", "A 审核 B"),
-                        AgentRunResult("Codex", "B 审核 A"),
-                    ),
-                    AgentRunResult("Claude", "统一方案"),
-                    None,
-                    0,
-                    on_export=lambda: document,
-                )
-            )
-
-        worker = threading.Thread(target=wait_for_decision)
-        worker.start()
-        self.assertTrue(plan_ready.wait(timeout=2))
-
-        session.submit_action(action="export")
-        self.assertTrue(document_ready.wait(timeout=2))
-        self.assertEqual(session.to_dict()["document"], str(document))
-
-        session.submit_action(
-            action="targeted_revision",
-            feedback="只让 Codex 补充失败路径",
-            target_agent="codex",
-        )
-        worker.join(timeout=2)
-
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(returned[0].action, "targeted_revision")
-        self.assertEqual(returned[0].target_agent, "codex")
-        self.assertEqual(returned[0].feedback, "只让 Codex 补充失败路径")
-        self.assertIn(("plan_decision", "run-ui"), notices)
-
-    def test_stop_wakes_plan_gate_and_is_idempotent(self) -> None:
-        plan_ready = threading.Event()
-        stop_calls = []
-        returned = []
-        session = UISession(
-            run_id="stop-plan",
-            task="停止任务",
-            workspace=Path("/tmp"),
-            executor="claude",
-            consensus=False,
-            notify=lambda kind, _run_id: plan_ready.set() if kind == "plan" else None,
-        )
-        session.bind_stop_handler(lambda: stop_calls.append("stop"))
-
-        def wait_for_decision() -> None:
-            returned.append(
-                session.wait_for_plan(
-                    AgentRunResult("Claude", "Agent A 方案"),
-                    AgentRunResult("Codex", "Agent B 方案"),
-                    (),
-                    AgentRunResult("Claude", "统一方案"),
-                    None,
-                    0,
-                    on_export=lambda: Path("/tmp/unused.md"),
-                )
-            )
-
-        worker = threading.Thread(target=wait_for_decision)
-        worker.start()
-        self.assertTrue(plan_ready.wait(timeout=2))
-        session.request_stop()
-        session.request_stop()
-        worker.join(timeout=2)
-
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(stop_calls, ["stop"])
-        self.assertEqual(returned[0].action, "interrupt")
-        self.assertEqual(session.to_dict()["status"], "stopping")
-
     def test_local_http_server_serves_health_history_and_static_ui(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -998,8 +1414,6 @@ time.sleep(30)
             record = store.start(
                 task="检查界面",
                 workspace=workspace,
-                executor="claude",
-                consensus=False,
                 run_id="run-http",
             )
             store.update(record["id"], status="complete")
@@ -1117,12 +1531,54 @@ time.sleep(30)
                     run_id="live-http",
                     task="可停止任务",
                     workspace=workspace,
-                    executor="claude",
-                    consensus=False,
                     notify=manager.publish,
                 )
                 active.bind_stop_handler(lambda: None)
                 manager._reserve_session(active)
+                interaction_started = threading.Event()
+                interaction_result: list[Any] = []
+
+                def wait_for_interaction() -> None:
+                    interaction_started.set()
+                    interaction_result.append(
+                        active.wait_for_native_interaction(
+                            NativeInteractionRequest(
+                                id="provider-http",
+                                source="Codex",
+                                kind="command_approval",
+                                title="请求执行命令",
+                                command="python3 -m unittest",
+                                options=(
+                                    NativeInteractionOption("approve", "允许一次"),
+                                    NativeInteractionOption("cancel", "拒绝并停止"),
+                                ),
+                            )
+                        )
+                    )
+
+                interaction_worker = threading.Thread(
+                    target=wait_for_interaction,
+                    daemon=True,
+                )
+                interaction_worker.start()
+                self.assertTrue(interaction_started.wait(1))
+                deadline = time.monotonic() + 1
+                interaction_id = ""
+                while not interaction_id and time.monotonic() < deadline:
+                    requests = active.to_dict()["native_interactions"]
+                    interaction_id = requests[0]["id"] if requests else ""
+                    if not interaction_id:
+                        time.sleep(0.01)
+                interaction_request = Request(
+                    f"{base}/api/sessions/live-http/interactions/{interaction_id}",
+                    data=json.dumps({"action": "approve"}).encode("utf-8"),
+                    headers={"Content-Type": "application/json", "Origin": base},
+                    method="POST",
+                )
+                interaction_reply = json.loads(
+                    urlopen(interaction_request, timeout=2).read()
+                )
+                interaction_worker.join(1)
                 stop_request = Request(
                     f"{base}/api/sessions/live-http/stop",
                     data=b"{}",
@@ -1170,6 +1626,7 @@ time.sleep(30)
         self.assertIn('id="rename-run-dialog"', html)
         self.assertIn("已归档", html)
         self.assertIn('id="settings-dialog"', html)
+        self.assertIn('id="native-interaction-dialog"', html)
         self.assertIn('id="stop-task-button"', html)
         self.assertIn('id="shutdown-ui-button"', html)
         self.assertIn('id="settings-workspace-browse"', html)
@@ -1198,6 +1655,9 @@ time.sleep(30)
         self.assertIn("function renderKanban", script)
         self.assertIn("return 'Claude Code';", script)
         self.assertIn("function renderTimeline", script)
+        self.assertIn("function renderActivityEvent", script)
+        self.assertIn("activity-card", script)
+        self.assertIn("实时回复预览", html)
         self.assertNotIn("function eventMessage", script)
         self.assertNotIn("phase.includes('review')", script)
         self.assertIn("function renderDirectFileNotice", script)
@@ -1212,13 +1672,15 @@ time.sleep(30)
         self.assertIn("function insertMention", script)
         self.assertIn("function changeSummaryMarkup", script)
         self.assertIn("function changeFileMarkup", script)
-        self.assertIn("checkpoint.change_summary", script)
         self.assertIn("function queuePendingChatMessage", script)
         self.assertIn("function optimisticChatRecipients", script)
         self.assertIn("function reconcilePendingChatMessages", script)
         self.assertIn("function replyLoadingMarkup", script)
         self.assertIn("function refreshDefaultWorkspace", script)
         self.assertIn("function openRunRename", script)
+        self.assertIn("function renderNativeInteraction", script)
+        self.assertEqual(interaction_reply["native_interactions"], [])
+        self.assertEqual(interaction_result[0].action, "approve")
         self.assertIn("function submitRunRename", script)
         self.assertIn("function updateNewTaskMode", script)
         self.assertIn("function applyTheme", script)
@@ -1236,6 +1698,19 @@ time.sleep(30)
         self.assertIn("scrollChatToBottom", script)
         self.assertIn("!event.shiftKey", script)
         self.assertIn("requestSubmit(el.quickTaskSubmit)", script)
+        self.assertIn("newTaskFiles: []", script)
+        self.assertIn("composerFiles: []", script)
+        self.assertIn("addTaskFiles(el.composerFileInput.files, 'composer')", script)
+        self.assertIn("addTaskFiles(el.documentInput.files, 'task')", script)
+        self.assertIn("function previewUrlFor", script)
+        self.assertIn("appendImageThumbnail", script)
+        self.assertIn(".composer-attachment.is-image", style)
+        self.assertIn("if (!image)", script)
+        self.assertIn(".composer-attachment-thumb", style)
+        self.assertIn("if (!task && state.composerFiles.length) task = '请查看并分析附件。'", script)
+        self.assertNotIn("el.quickTaskInput.value = '请查看附件图片。'", script)
+        self.assertNotIn("el.quickAttach.classList.toggle('hidden', groupChat)", script)
+        self.assertIn("attachments.map((item) => ({", script)
         self.assertIn(".message-row.message-user", style)
         self.assertIn(".message-row.message-claude", style)
         self.assertIn(".message-row.message-codex", style)
@@ -1243,7 +1718,26 @@ time.sleep(30)
         self.assertIn(".diff-preview", style)
         self.assertIn(".message-row.message-pending", style)
         self.assertIn(".message-row.message-loading", style)
+        self.assertIn(".message-row.message-failed", style)
+        self.assertIn("message.failure_reason", script)
+        self.assertIn("failureReason === 'timeout' ? '响应超时'", script)
+        self.assertIn("orderGroupChatMessages", script)
+        self.assertIn("reply_to: turn.server_user_id || turn.client_id", script)
+        self.assertIn("max-width: min(78%, 820px)", style)
+        self.assertIn("width: fit-content", style)
+        self.assertIn(".message-row.message-claude.message-loading .message-main", style)
         self.assertIn("@keyframes reply-bounce", style)
+        self.assertIn(".composer-attachment-list", style)
+        self.assertIn("settings-browser-notifications", html)
+        self.assertIn("function notifyBrowser", script)
+        self.assertIn("function saveDraftNow", script)
+        self.assertIn("data-message-edit", script)
+        self.assertIn("data-message-retry", script)
+        self.assertIn(".message-tools", style)
+        self.assertIn(".message-attachment-image", style)
+        self.assertIn(".markdown-body .code-block", style)
+        self.assertIn(".feed-jump", style)
+        self.assertIn(".message-streaming", style)
         self.assertIn('body[data-theme="ocean"]', style)
         self.assertIn('body[data-theme="graphite"]', style)
         self.assertIn('body[data-theme="botanical"]', style)
@@ -1264,6 +1758,110 @@ time.sleep(30)
         self.assertEqual(saved_settings["values"]["ui"]["theme"], "ocean")
         self.assertEqual(stopped["status"], "stopping")
         self.assertTrue(shutdown["ok"])
+
+    def test_attachment_route_serves_images_inline_and_documents_as_download(
+        self,
+    ) -> None:
+        """Inline rendering backs the chat thumbnail. The content type must come
+        from the validated extension, never from the uploader's declared type,
+        and non-raster uploads must never be renderable in the page."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            store = RunStore(workspace / "state")
+            store.start(
+                task="附件下载",
+                workspace=workspace,
+                run_id="run-files",
+            )
+            manager = UISessionManager(store=store, default_workspace=workspace)
+            png = b"\x89PNG\r\n\x1a\n raster"
+            saved = ui_server._save_uploaded_documents(
+                manager.attachments_root,
+                "run-files",
+                [
+                    {
+                        "name": "shot.png",
+                        "size": len(png),
+                        # A lying content_type must not decide how we serve it.
+                        "content_type": "text/html",
+                        "data": base64.b64encode(png).decode("ascii"),
+                    },
+                    {
+                        "name": "notes.md",
+                        "size": 5,
+                        "content_type": "text/markdown",
+                        "data": base64.b64encode(b"notes").decode("ascii"),
+                    },
+                ],
+            )
+            store.update("run-files", attachments=saved)
+            static_root = Path(__file__).resolve().parents[1] / "multiagent_cli" / "web"
+            try:
+                server = LocalUIHTTPServer(
+                    ("127.0.0.1", 0),
+                    make_request_handler(manager, static_root),
+                )
+            except PermissionError:
+                self.skipTest("当前沙箱禁止绑定本机测试端口")
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                inline = urlopen(
+                    f"{base}/api/runs/run-files/attachments/shot.png?inline=1",
+                    timeout=2,
+                )
+                inline_body = inline.read()
+                download = urlopen(
+                    f"{base}/api/runs/run-files/attachments/shot.png",
+                    timeout=2,
+                )
+                download_body = download.read()
+                document = urlopen(
+                    f"{base}/api/runs/run-files/attachments/notes.md",
+                    timeout=2,
+                )
+                document_body = document.read()
+                with self.assertRaises(HTTPError) as inline_document:
+                    urlopen(
+                        f"{base}/api/runs/run-files/attachments/notes.md?inline=1",
+                        timeout=2,
+                    )
+                with self.assertRaises(HTTPError) as traversal:
+                    urlopen(
+                        f"{base}/api/runs/run-files/attachments/"
+                        "..%2F..%2Fstate%2Findex.json",
+                        timeout=2,
+                    )
+                with self.assertRaises(HTTPError) as unknown_run:
+                    urlopen(
+                        f"{base}/api/runs/run-missing/attachments/shot.png",
+                        timeout=2,
+                    )
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=2)
+
+        self.assertEqual(inline_body, png)
+        self.assertEqual(inline.headers["Content-Type"], "image/png")
+        self.assertTrue(inline.headers["Content-Disposition"].startswith("inline"))
+        self.assertEqual(inline.headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(download_body, png)
+        self.assertTrue(
+            download.headers["Content-Disposition"].startswith("attachment")
+        )
+        # The lying "text/html" the uploader declared must never come back.
+        self.assertEqual(download.headers["Content-Type"], "image/png")
+        self.assertEqual(document_body, b"notes")
+        # Non-raster uploads are opaque bytes, never a renderable type.
+        self.assertEqual(
+            document.headers["Content-Type"], "application/octet-stream"
+        )
+        self.assertEqual(inline_document.exception.code, 404)
+        self.assertEqual(traversal.exception.code, 404)
+        self.assertEqual(unknown_run.exception.code, 404)
 
 
 if __name__ == "__main__":

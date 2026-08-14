@@ -6,7 +6,7 @@ from multiagent_cli.bridge_models import AgentEvent, EVENT_PROTOCOL
 
 
 class AgentEventProtocolTests(unittest.TestCase):
-    def test_v2_event_adds_status_workflow_and_time_context(self) -> None:
+    def test_v2_event_adds_status_and_time_context(self) -> None:
         event = AgentEvent(
             "Claude",
             "lifecycle",
@@ -79,6 +79,40 @@ class AgentEventProtocolTests(unittest.TestCase):
             event.to_dict(safe=True)["text"],
             "工作区已有未提交改动",
         )
+
+    def test_public_activity_shows_commands_but_redacts_secrets(self) -> None:
+        event = AgentEvent(
+            "Codex",
+            "tool",
+            "pytest -q",
+            safe_summary="Codex · 正在执行命令",
+            metadata={
+                "activity_type": "command",
+                "tool_name": "Bash",
+                "command": "OPENAI_API_KEY=sk-live-secret pytest -q",
+            },
+        )
+
+        payload = event.to_dict(safe=True, include_activity=True)
+
+        self.assertEqual(payload["text"], "Codex · 正在执行命令")
+        self.assertEqual(payload["activity"]["title"], "执行命令")
+        self.assertIn("pytest -q", payload["activity"]["detail"])
+        self.assertNotIn("sk-live-secret", payload["activity"]["detail"])
+        self.assertNotIn("OPENAI_API_KEY=sk-live-secret", payload["activity"]["detail"])
+
+    def test_public_activity_does_not_turn_model_text_into_thinking_trace(self) -> None:
+        event = AgentEvent(
+            "Claude",
+            "progress",
+            "隐藏的内部推理内容",
+            safe_summary="Claude · 正在处理模型输出",
+        )
+
+        payload = event.to_dict(safe=True, include_activity=True)
+
+        self.assertNotIn("activity", payload)
+        self.assertNotIn("隐藏的内部推理内容", payload["text"])
 
 
 if __name__ == "__main__":

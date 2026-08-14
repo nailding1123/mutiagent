@@ -34,19 +34,6 @@ class RunStoreTests(unittest.TestCase):
 
             self.assertEqual(root, legacy)
 
-    def test_run_records_collaboration_mode(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            store = RunStore(Path(directory))
-            record = store.start(
-                task="讨论方案",
-                workspace=Path(directory),
-                executor="claude",
-                consensus=False,
-                collaboration_mode="group_chat",
-            )
-
-        self.assertEqual(record["collaboration_mode"], "group_chat")
-
     def test_rejects_path_like_run_ids(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -59,8 +46,6 @@ class RunStoreTests(unittest.TestCase):
                 store.start(
                     task="invalid",
                     workspace=root,
-                    executor="claude",
-                    consensus=False,
                     run_id="../outside",
                 )
 
@@ -70,15 +55,11 @@ class RunStoreTests(unittest.TestCase):
             record = store.start(
                 task="修复登录",
                 workspace=Path(directory),
-                executor="claude",
-                consensus=True,
             )
             store.update(record["id"], status="failed", error="temporary")
             resumed = store.start(
                 task="修复登录",
                 workspace=Path(directory),
-                executor="codex",
-                consensus=True,
                 run_id=record["id"],
                 display_task="修复登录页面",
                 attachments=[{"name": "需求.pdf", "size": 4}],
@@ -102,15 +83,11 @@ class RunStoreTests(unittest.TestCase):
             first = store.start(
                 task="删除我",
                 workspace=Path(directory),
-                executor="claude",
-                consensus=False,
                 run_id="delete-me",
             )
             store.start(
                 task="保留我",
                 workspace=Path(directory),
-                executor="codex",
-                consensus=False,
                 run_id="keep-me",
             )
 

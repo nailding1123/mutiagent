@@ -14,4 +14,4 @@ SCRIPT_DIR=$(CDPATH= cd -P -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
 PROJECT_DIR=$(dirname -- "$SCRIPT_DIR")
 
 export PYTHONPATH="$PROJECT_DIR${PYTHONPATH:+:$PYTHONPATH}"
-exec /usr/bin/python3 -m multiagent_cli "$@"
+exec /usr/bin/python3 -m multiagent_cli.web_launcher "$@"

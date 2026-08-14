@@ -18,7 +18,7 @@ FALLBACK_PORT_COUNT = 32
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="multiagent-web",
+        prog="multiagent",
         description="启动或打开 MultiAgent 本地 Web 工作台。",
     )
     parser.add_argument("-C", "--workspace", help="默认工作区")

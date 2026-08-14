@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "multiagent"
 version = "2.5.0"
-description = "An evidence-driven terminal bridge for Claude Code and Codex CLI collaboration."
+description = "A local group-chat bridge for Claude Code and Codex CLI."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -13,10 +13,7 @@ authors = [{ name = "MultiAgent contributors" }]
 dependencies = []
 
 [project.scripts]
-multiagent = "multiagent_cli.cli:main"
-
-[project.gui-scripts]
-multiagent-web = "multiagent_cli.web_launcher:main"
+multiagent = "multiagent_cli.web_launcher:main"
 
 [tool.setuptools.packages.find]
 include = ["multiagent_cli*"]

@@ -1,26 +1,13 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 from .token_api import TokenAPISettings
 
-if TYPE_CHECKING:
-    from .collaboration import CollaborationState
-
-
-DEFAULT_AGENT_A_IDENTITY = (
-    "你是对等协作的 Agent A。你与 Agent B 拥有相同的方案提出权、质疑权和否决权；"
-    "请独立分析、提供证据、认真回应交叉审核，并以达成可验证的共同方案为目标。"
-    "只有当前阶段明确授予写权限时才能修改文件，且不得覆盖用户已有改动或擅自提交 Git。"
-)
-DEFAULT_AGENT_B_IDENTITY = (
-    "你是对等协作的 Agent B。你与 Agent A 拥有相同的方案提出权、质疑权和否决权；"
-    "请独立分析、提供证据、认真回应交叉审核，并以达成可验证的共同方案为目标。"
-    "只有当前阶段明确授予写权限时才能修改文件，且不得覆盖用户已有改动或擅自提交 Git。"
-)
 DEFAULT_GROUP_CHAT_AGENT_A_IDENTITY = (
     "你是群聊中的 Claude，一名善于理解需求、分析复杂问题和组织方案的协作伙伴。"
     "直接回应用户当前的问题，并结合群聊历史补充有价值的信息。若 Codex 已经回答，"
@@ -36,33 +23,31 @@ DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY = (
     "工作区内容为依据，不确定的内容要明确说明。"
 )
 
-COLLABORATION_MODES = {"workflow", "group_chat"}
-
 EVENT_PROTOCOL = "multiagent.event.v2"
 
 _EVENT_DEFAULT_STATUSES = {
-    "phase": "in_progress",
     "lifecycle": "in_progress",
     "progress": "working",
     "tool": "working",
     "tool_result": "working",
     "text": "completed",
     "metric": "completed",
-    "checkpoint": "completed",
-    "collaboration": "updated",
-    "verification": "working",
-    "verification_result": "completed",
     "warning": "warning",
     "error": "failed",
     "log": "working",
+    "interaction_request": "waiting_user",
+    "interaction_response": "working",
 }
 
 _SAFE_TEXT_KINDS = {
-    "phase",
     "lifecycle",
-    "checkpoint",
-    "verification_result",
     "warning",
+}
+
+# 在显式开启"显示模型原文流"时允许流式增量通过；默认仍处于 safe 通道
+_STREAM_TEXT_KINDS = {
+    "progress",
+    "text",
 }
 
 _SAFE_METADATA_KEYS = {
@@ -73,10 +58,21 @@ _SAFE_METADATA_KEYS = {
     "input_tokens",
     "output_tokens",
     "passed",
-    "phase",
     "timed_out",
     "timeout_seconds",
 }
+
+_PUBLIC_ACTIVITY_KINDS = {"tool", "tool_result"}
+_MAX_PUBLIC_ACTIVITY_CHARS = 6_000
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(?i)(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|authorization|password|passwd|secret|token)\b[\"']?\s*[:=]\s*)"
+    r"(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+)
+_BEARER_TOKEN_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_COMMON_SECRET_RE = re.compile(
+    r"\b(?:sk|pk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_\-]{8,}\b",
+    re.IGNORECASE,
+)
 
 
 class BridgeError(RuntimeError):
@@ -87,12 +83,8 @@ class AgentTimeoutError(BridgeError):
     """One model attempt exceeded its configured response timeout."""
 
 
-class BridgeCancelled(BridgeError):
-    """The user cancelled before implementation began."""
-
-
-class ConsensusLimitReached(BridgeError):
-    """The plan did not reach unanimous approval within the configured rounds."""
+class NativeInteractionUnavailable(BridgeError):
+    """A native CLI requested user interaction but no handler was attached."""
 
 
 @dataclass(frozen=True)
@@ -112,23 +104,11 @@ class BridgeSettings:
     """Resolved settings for a Claude/Codex bridge session."""
 
     workspace: Path
-    executor: str
-    review_rounds: int
-    planning_collaboration: bool
-    consensus: bool
-    max_consensus_rounds: int
-    plan_approval: bool
-    max_plan_revisions: int
-    final_review: bool
-    verification_commands: tuple["VerificationCommand", ...]
     claude: AgentCommandSettings
     codex: AgentCommandSettings
     config_path: Path | None = None
-    agent_a_identity: str = DEFAULT_AGENT_A_IDENTITY
-    agent_b_identity: str = DEFAULT_AGENT_B_IDENTITY
     group_chat_agent_a_identity: str = DEFAULT_GROUP_CHAT_AGENT_A_IDENTITY
     group_chat_agent_b_identity: str = DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY
-    collaboration_mode: str = "workflow"
     group_chat_default_agent: str = "both"
     group_chat_execution: bool = True
     token_api: TokenAPISettings = field(default_factory=TokenAPISettings)
@@ -139,7 +119,7 @@ class AgentEvent:
     """Versioned event emitted by native CLIs and the bridge.
 
     The first three fields intentionally retain the v1 positional API.  v2 adds
-    stable workflow context and both wall-clock and relative timing without
+    stable turn context and both wall-clock and relative timing without
     forcing renderers or run stores to expose raw commands and intermediate
     model text.
     """
@@ -165,14 +145,27 @@ class AgentEvent:
         if self.elapsed_seconds is not None and self.elapsed_seconds < 0:
             object.__setattr__(self, "elapsed_seconds", 0.0)
 
-    def to_dict(self, *, safe: bool = False) -> dict[str, Any]:
-        """Serialize the event, optionally replacing sensitive details."""
+    def to_dict(
+        self,
+        *,
+        safe: bool = False,
+        allow_stream: bool = False,
+        include_activity: bool = False,
+    ) -> dict[str, Any]:
+        """Serialize the event, optionally replacing sensitive details.
+
+        When ``allow_stream`` is True, streaming-capable kinds (progress/text)
+        keep their raw text so the UI can render incrementally. Other kinds
+        still fall back to ``safe_summary`` when ``safe`` is requested.
+        """
 
         text = self.text
         if safe and self.kind not in _SAFE_TEXT_KINDS:
-            text = self.safe_summary or (
-                f"{self.source} · 本轮发生错误" if self.kind == "error" else ""
-            )
+            stream_allowed = allow_stream and self.kind in _STREAM_TEXT_KINDS
+            if not stream_allowed:
+                text = self.safe_summary or (
+                    f"{self.source} · 本轮发生错误" if self.kind == "error" else ""
+                )
         metadata = dict(self.metadata)
         if safe:
             metadata = {
@@ -180,7 +173,7 @@ class AgentEvent:
                 for key, value in metadata.items()
                 if key in _SAFE_METADATA_KEYS
             }
-        return {
+        payload = {
             "protocol": self.protocol,
             "source": self.source,
             "kind": self.kind,
@@ -191,6 +184,155 @@ class AgentEvent:
             "text": text,
             "safe_summary": self.safe_summary,
             "metadata": metadata,
+        }
+        if safe and include_activity:
+            activity = self._public_activity()
+            if activity is not None:
+                payload["activity"] = activity
+        return payload
+
+    def _public_activity(self) -> dict[str, str] | None:
+        """Return a bounded, redacted tool/command description for the UI.
+
+        Native agents may put credentials or other private values in tool
+        inputs. The Web UI therefore never receives raw event metadata; this
+        deliberately small projection is the only detailed activity channel.
+        """
+
+        if self.kind not in _PUBLIC_ACTIVITY_KINDS:
+            return None
+        metadata = self.metadata
+        activity_type = _public_activity_value(
+            metadata.get("activity_type"),
+            fallback="tool",
+            limit=40,
+        )
+        tool_name = _public_activity_value(metadata.get("tool_name"), limit=120)
+        command = _public_activity_value(metadata.get("command"))
+        path = _public_activity_value(metadata.get("path"))
+        output = _public_activity_value(metadata.get("output"))
+        detail = _public_activity_value(metadata.get("detail"))
+        if not any((command, path, output, detail)):
+            detail = _public_activity_value(self.text)
+
+        if self.kind == "tool_result":
+            title = {
+                "command": "命令执行结果",
+                "file_change": "文件操作结果",
+                "read": "读取结果",
+                "search": "搜索结果",
+            }.get(activity_type, "工具调用结果")
+            selected_detail = output or detail
+        else:
+            title = {
+                "command": "执行命令",
+                "file_change": "修改文件",
+                "read": "读取文件",
+                "search": "搜索内容",
+            }.get(activity_type, f"调用工具 · {tool_name}" if tool_name else "调用工具")
+            selected_detail = command or path or detail
+
+        return {
+            "type": activity_type,
+            "title": title,
+            "tool_name": tool_name,
+            "detail": selected_detail,
+            "detail_label": (
+                "命令"
+                if command and self.kind == "tool"
+                else "输出"
+                if output and self.kind == "tool_result"
+                else "路径"
+                if path and selected_detail == path
+                else "详情"
+            ),
+        }
+
+
+@dataclass(frozen=True)
+class NativeInteractionOption:
+    """One user-facing choice exposed by a native coding agent."""
+
+    value: str
+    label: str
+    description: str = ""
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "value": self.value,
+            "label": self.label,
+            "description": self.description,
+        }
+
+
+@dataclass(frozen=True)
+class NativeInteractionQuestion:
+    """One native question, optionally with a fixed set of choices."""
+
+    id: str
+    question: str
+    header: str = ""
+    options: tuple[NativeInteractionOption, ...] = ()
+    allow_other: bool = False
+    secret: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "question": self.question,
+            "header": self.header,
+            "options": [option.to_dict() for option in self.options],
+            "allow_other": self.allow_other,
+            "secret": self.secret,
+        }
+
+
+@dataclass(frozen=True)
+class NativeInteractionRequest:
+    """Provider-neutral approval or user-input request from a native CLI."""
+
+    id: str
+    source: str
+    kind: str
+    title: str
+    message: str = ""
+    command: str = ""
+    cwd: str = ""
+    options: tuple[NativeInteractionOption, ...] = ()
+    questions: tuple[NativeInteractionQuestion, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "source": self.source,
+            "kind": self.kind,
+            "title": self.title,
+            "message": self.message,
+            "command": self.command,
+            "cwd": self.cwd,
+            "options": [option.to_dict() for option in self.options],
+            "questions": [question.to_dict() for question in self.questions],
+            "metadata": dict(self.metadata),
+        }
+
+
+@dataclass(frozen=True)
+class NativeInteractionResponse:
+    """The user's answer to a provider-neutral native request."""
+
+    action: str
+    answers: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    text: str = ""
+
+    def normalized_answers(self) -> dict[str, tuple[str, ...]]:
+        return {
+            str(key): (
+                tuple(str(value) for value in values)
+                if isinstance(values, (list, tuple))
+                else (str(values),)
+            )
+            for key, values in self.answers.items()
         }
 
 
@@ -207,92 +349,25 @@ class AgentRunResult:
     output_tokens: int = 0
 
 
-@dataclass(frozen=True)
-class PlanDecision:
-    """User decision at the pre-implementation plan gate."""
-
-    action: str
-    feedback: str = ""
-    target_agent: str = ""
-
-
-@dataclass(frozen=True)
-class VerificationCommand:
-    """One deterministic command run by the bridge, not by an agent."""
-
-    name: str
-    command: tuple[str, ...]
-    timeout: float = 300
-
-
-@dataclass(frozen=True)
-class VerificationResult:
-    """Captured result of one deterministic verification command."""
-
-    name: str
-    command: tuple[str, ...]
-    exit_code: int | None
-    output: str
-    duration_seconds: float
-    timed_out: bool = False
-
-    @property
-    def passed(self) -> bool:
-        return not self.timed_out and self.exit_code == 0
-
-
-@dataclass(frozen=True)
-class WorkspaceSnapshot:
-    """Git state captured before or after an agent workflow."""
-
-    is_git_repo: bool
-    branch: str = ""
-    head: str = ""
-    status: str = ""
-    diff: str = ""
-
-    @property
-    def is_dirty(self) -> bool:
-        return bool(self.status.strip())
-
-
-@dataclass(frozen=True)
-class ReviewFinding:
-    severity: str
-    file: str
-    line: int | None
-    requirement: str
-    problem: str
-    evidence: str
-    suggestion: str
-
-
-@dataclass(frozen=True)
-class ReviewDecision:
-    verdict: str
-    findings: tuple[ReviewFinding, ...] = ()
-    requirements_covered: tuple[str, ...] = ()
-    structured: bool = True
-
-
-@dataclass(frozen=True)
-class BridgeOutcome:
-    """Result of the complete implement-review-revise workflow."""
-
-    task: str
-    executor: str
-    execution_result: AgentRunResult
-    reviews: tuple[AgentRunResult, ...] = field(default_factory=tuple)
-    review_decisions: tuple[ReviewDecision, ...] = field(default_factory=tuple)
-    verifications: tuple[VerificationResult, ...] = field(default_factory=tuple)
-    baseline: WorkspaceSnapshot | None = None
-    final_snapshot: WorkspaceSnapshot | None = None
-    approved: bool | None = None
-    collaboration: "CollaborationState | None" = None
-    agent_proposals: tuple[AgentRunResult, ...] = field(default_factory=tuple)
-    cross_reviews: tuple[AgentRunResult, ...] = field(default_factory=tuple)
-    unified_proposal: AgentRunResult | None = None
-    consensus_reviews: tuple[AgentRunResult, ...] = field(default_factory=tuple)
+def _public_activity_value(
+    value: object,
+    *,
+    fallback: str = "",
+    limit: int = _MAX_PUBLIC_ACTIVITY_CHARS,
+) -> str:
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return fallback
+    text = str(value).strip()
+    if not text:
+        return fallback
+    text = _SECRET_ASSIGNMENT_RE.sub(r"\1***", text)
+    text = _BEARER_TOKEN_RE.sub("Bearer ***", text)
+    text = _COMMON_SECRET_RE.sub("***", text)
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head
+    return f"{text[:head]}\n… 已截断 …\n{text[-tail:]}"
 
 
 def _event_timestamp() -> str:
