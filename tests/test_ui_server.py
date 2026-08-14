@@ -797,7 +797,7 @@ class UIServerTests(unittest.TestCase):
             self.assertIn(str(mirror.resolve()), prompt)
             # The record stays on the store path so the download route keeps
             # working and no sandbox escape is implied.
-            self.assertIn(str(manager.attachments_root), stored["path"])
+            self.assertIn(str(manager.attachments_root.resolve()), stored["path"])
             self.assertNotIn(".multiagent", stored["path"])
 
     def test_delete_run_removes_the_workspace_attachment_mirror(self) -> None:
