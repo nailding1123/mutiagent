@@ -1356,6 +1356,10 @@ class UIServerTests(unittest.TestCase):
             loaded = manager.get_settings()
             values = loaded["values"]
             values["token_api"]["enabled"] = True
+            # This test exercises credential persistence, not executable
+            # discovery. CI intentionally does not install either native CLI.
+            values["claude"]["command"] = [sys.executable]
+            values["codex"]["command"] = [sys.executable]
             values["claude"]["models"] = [
                 "claude-opus-5",
                 "gemini-3.5-flash",
