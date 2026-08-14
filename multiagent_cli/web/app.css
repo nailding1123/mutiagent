@@ -795,14 +795,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .send-button { min-height: 29px; padding: 0 13px; background: var(--pink-soft); border: 1.5px solid var(--ink); border-radius: 4px; font-family: var(--mono); font-size: 10px; font-weight: 750; }
 .send-button:hover { background: var(--pink); }
 
-/* Tasks */
-.tasks-view { flex: 1; min-height: 0; overflow: auto; }
-.tasks-header { display: flex; align-items: center; justify-content: space-between; min-height: 76px; padding: 12px 18px; background: var(--card); border-bottom: var(--border); }
-.tasks-header > div { display: flex; align-items: center; gap: 12px; }
-.tasks-header > div > span:last-child { display: flex; flex-direction: column; gap: 3px; }
-.tasks-header strong { font-size: 19px; }
-.tasks-header small { color: var(--muted); font-family: var(--mono); font-size: 11px; }
-.task-icon { background: var(--purple); }
 .primary-button,
 .secondary-button,
 .danger-button { min-height: 36px; padding: 0 13px; border: var(--border); border-radius: 5px; font-weight: 700; }
@@ -813,21 +805,6 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .secondary-button:hover { background: var(--sidebar); }
 .danger-button:hover { background: var(--danger-hover); }
 .danger-button:disabled { cursor: wait; opacity: .65; }
-
-.kanban-board { display: grid; grid-template-columns: repeat(4, minmax(180px, 1fr)); align-items: start; gap: 12px; min-width: 820px; padding: 18px; }
-.kanban-column { min-width: 0; }
-.kanban-column-header { display: flex; align-items: center; gap: 8px; margin-bottom: 9px; }
-.kanban-badge { padding: 4px 8px; border: var(--border); border-radius: 4px; font-family: var(--mono); font-size: 10px; font-weight: 800; }
-.kanban-badge.todo { background: var(--orange); }
-.kanban-badge.progress { background: var(--teal); }
-.kanban-badge.blocked { background: var(--danger-soft); }
-.kanban-badge.done { background: var(--success-soft); }
-.kanban-count { color: var(--muted); font-family: var(--mono); font-size: 11px; }
-.task-card { margin-bottom: 10px; padding: 10px; background: var(--card); border: var(--border); border-radius: 5px; }
-.task-card small { color: var(--muted); font-family: var(--mono); font-size: 9px; }
-.task-card strong { display: block; margin: 5px 0 8px; font-size: 12px; line-height: 1.45; }
-.task-card-meta { color: var(--muted); font-family: var(--mono); font-size: 10px; }
-.kanban-empty { padding: 12px; color: var(--muted); border: 1.5px dashed #999; border-radius: 5px; font-size: 11px; }
 
 /* Right detail panel — hidden until explicitly opened, like Slark threads/profile. */
 .detail-panel { display: flex; flex: 0 0 330px; min-width: 0; height: 100%; flex-direction: column; background: var(--main); border-left: var(--border); }

@@ -447,6 +447,14 @@ class UISession:
                 answers,
                 _optional_text(payload.get("text")),
             )
+            self._native_interactions.pop(interaction_id, None)
+            if self.status != "stopping":
+                self.status = (
+                    "awaiting_interaction"
+                    if self._native_interactions and len(self._active_chat_turns) <= 1
+                    else "running"
+                )
+            self.updated_at = _timestamp()
             self._condition.notify_all()
 
     def _cancel_native_interactions_locked(self) -> None:
