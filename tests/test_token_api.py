@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,8 +29,9 @@ class TokenAPICredentialsTests(unittest.TestCase):
             self.assertEqual(status["masked"], "••••1234")
             self.assertNotIn("sk-company-secret-1234", json.dumps(status))
             self.assertIn("sk-company-secret-1234", content)
-            self.assertEqual(credentials.directory.stat().st_mode & 0o777, 0o700)
-            self.assertEqual(credentials.path.stat().st_mode & 0o777, 0o600)
+            if sys.platform != "win32":
+                self.assertEqual(credentials.directory.stat().st_mode & 0o777, 0o700)
+                self.assertEqual(credentials.path.stat().st_mode & 0o777, 0o600)
 
     def test_environment_takes_precedence_over_private_file(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

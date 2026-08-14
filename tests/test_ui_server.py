@@ -503,7 +503,8 @@ class UIServerTests(unittest.TestCase):
             self.assertEqual(started["task"], "根据文档实现功能")
             self.assertEqual(attachment["name"], "requirements.md")
             self.assertEqual(attachment_path.read_bytes(), content)
-            self.assertEqual(attachment_path.stat().st_mode & 0o777, 0o400)
+            if sys.platform != "win32":
+                self.assertEqual(attachment_path.stat().st_mode & 0o777, 0o400)
             mirror_path = Path(attachment["workspace_path"])
             self.assertEqual(mirror_path.read_bytes(), content)
             self.assertIn(str(mirror_path), session.agent_task)
@@ -793,7 +794,7 @@ class UIServerTests(unittest.TestCase):
             self.assertTrue(mirror.is_file())
             self.assertEqual(mirror.read_bytes(), png)
             # The prompt hands the agent the in-workspace path it can open.
-            self.assertIn(str(mirror), prompt)
+            self.assertIn(str(mirror.resolve()), prompt)
             # The record stays on the store path so the download route keeps
             # working and no sandbox escape is implied.
             self.assertIn(str(manager.attachments_root), stored["path"])
@@ -1109,7 +1110,8 @@ class UIServerTests(unittest.TestCase):
             )
             self.assertEqual(persisted["ui"]["theme"], "ocean")
             self.assertTrue(persisted["ui"]["compact_sidebar"])
-            self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
+            if sys.platform != "win32":
+                self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
             defaults = manager.get_settings(defaults=True)
             self.assertEqual(defaults["values"]["ui"]["theme"], "paper")
             self.assertFalse(defaults["values"]["ui"]["compact_sidebar"])
@@ -1385,7 +1387,8 @@ class UIServerTests(unittest.TestCase):
         self.assertEqual(saved["token_api_credentials"]["masked"], "••••7890")
         self.assertEqual(saved["values"]["claude"]["models"][1], "gemini-3.5-flash")
         self.assertEqual(saved["values"]["codex"]["models"][1], "gpt-5.5")
-        self.assertEqual(credentials_mode, 0o600)
+        if sys.platform != "win32":
+            self.assertEqual(credentials_mode, 0o600)
 
     def test_directory_browser_lists_children_and_workspace_shortcuts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

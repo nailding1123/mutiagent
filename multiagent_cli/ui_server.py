@@ -2075,11 +2075,22 @@ def _save_uploaded_documents(
             # Roll back only this call's files; the directory predates us.
             for item in saved:
                 try:
-                    Path(item["path"]).unlink(missing_ok=True)
+                    path = Path(item["path"])
+                    # Windows maps chmod(0o400) to a read-only attribute, so
+                    # clear it before removing a file written by this call.
+                    try:
+                        path.chmod(0o600)
+                    except OSError:
+                        pass
+                    path.unlink(missing_ok=True)
                 except OSError:
                     pass
             try:
                 for leftover in list(run_directory.glob("*.tmp")):
+                    try:
+                        leftover.chmod(0o600)
+                    except OSError:
+                        pass
                     leftover.unlink(missing_ok=True)
             except OSError:
                 pass
