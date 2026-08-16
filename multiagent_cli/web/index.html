@@ -288,6 +288,10 @@
                     <ol id="settings-claude-model-order" class="model-order-list" aria-label="Claude Code 模型优先顺序"></ol>
                     <small>拖动模型或使用上移/下移调整顺序；第一个是首选，列表为空时使用 Claude Code 默认模型。</small>
                   </div>
+                  <div class="agent-identity-field">
+                    <label><span>群聊身份提示词</span><textarea id="settings-group-chat-agent-a-identity" rows="7" required></textarea></label>
+                    <small>只用于群聊协作；路由、只读讨论和写入规则由系统独立控制。</small>
+                  </div>
                   <label class="setting-switch compact-setting-switch"><input id="settings-claude-fallback" type="checkbox" /><span><strong>超时自动切换</strong><small>每个候选模型使用下方的单次超时。</small></span></label>
                   <label><span>单次调用超时（秒）</span><input id="settings-claude-timeout" type="number" min="1" step="1" required /></label>
                   <label><span>CLI 命令</span><input id="settings-claude-command" type="text" placeholder="自动发现 claude" /></label>
@@ -302,18 +306,14 @@
                     <ol id="settings-codex-model-order" class="model-order-list" aria-label="Codex 模型优先顺序"></ol>
                     <small>拖动模型或使用上移/下移调整顺序；第一个是首选，列表为空时使用 Codex CLI 默认模型。</small>
                   </div>
+                  <div class="agent-identity-field">
+                    <label><span>群聊身份提示词</span><textarea id="settings-group-chat-agent-b-identity" rows="7" required></textarea></label>
+                    <small>只用于群聊协作；路由、只读讨论和写入规则由系统独立控制。</small>
+                  </div>
                   <label class="setting-switch compact-setting-switch"><input id="settings-codex-fallback" type="checkbox" /><span><strong>超时自动切换</strong><small>每个候选模型使用下方的单次超时。</small></span></label>
                   <label><span>单次调用超时（秒）</span><input id="settings-codex-timeout" type="number" min="1" step="1" required /></label>
                   <label><span>CLI 命令</span><input id="settings-codex-command" type="text" placeholder="自动发现 codex" /></label>
                   <label><span>附加参数（每行一个）</span><textarea id="settings-codex-extra-args" rows="3"></textarea></label>
-                </article>
-              </div>
-              <div class="agent-settings-grid identity-settings-grid">
-                <article class="settings-card">
-                  <h4>群聊身份</h4>
-                  <p>只用于群聊协作；@ 路由、只读讨论和单写入者执行规则保持独立生效。</p>
-                  <label><span>Claude Code 群聊身份提示词</span><textarea id="settings-group-chat-agent-a-identity" rows="7" required></textarea></label>
-                  <label><span>Codex 群聊身份提示词</span><textarea id="settings-group-chat-agent-b-identity" rows="7" required></textarea></label>
                 </article>
               </div>
               <div class="settings-security-note">安全说明：仅把 Key 作为子进程环境变量传给 Claude Code/Codex；界面只显示是否已配置和末四位。</div>

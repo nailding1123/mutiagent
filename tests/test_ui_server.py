@@ -1643,6 +1643,15 @@ class UIServerTests(unittest.TestCase):
         self.assertIn('id="settings-codex-model-order"', html)
         self.assertIn('id="settings-group-chat-agent-a-identity"', html)
         self.assertIn('id="settings-group-chat-agent-b-identity"', html)
+        self.assertLess(
+            html.index('id="settings-claude-model-order"'),
+            html.index('id="settings-group-chat-agent-a-identity"'),
+        )
+        self.assertLess(
+            html.index('id="settings-codex-model-order"'),
+            html.index('id="settings-group-chat-agent-b-identity"'),
+        )
+        self.assertEqual(html.count('class="agent-identity-field"'), 2)
         self.assertIn('name="settings-theme"', html)
         self.assertIn('value="ocean"', html)
         self.assertIn('value="graphite"', html)
