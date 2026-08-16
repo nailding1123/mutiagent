@@ -16,6 +16,7 @@ from multiagent_cli.adapters import (
     _claude_interaction_response,
     _codex_interaction_request,
     _codex_interaction_response,
+    _codex_thread_params,
 )
 from multiagent_cli.bridge_models import (
     AgentCommandSettings,
@@ -117,9 +118,16 @@ class CommandBuilderTests(unittest.TestCase):
         validator = adapter.build_command(
             workspace=workspace, mode="read", session_id="session-1"
         )
+        interactive_reader = adapter.build_command(
+            workspace=workspace,
+            mode="read",
+            session_id=None,
+            interactive=True,
+        )
 
         self.assertIn("acceptEdits", writer)
         self.assertIn("plan", validator)
+        self.assertIn("manual", interactive_reader)
         self.assertIn("session-1", validator)
         self.assertIn("opus", writer)
 
@@ -147,6 +155,15 @@ class CommandBuilderTests(unittest.TestCase):
         self.assertIn("thread-1", resumed_write)
         self.assertIn("read-only", resumed_read)
         self.assertNotEqual(resumed_write, resumed_read)
+
+    def test_codex_routes_read_and_write_approvals_to_user(self) -> None:
+        workspace = Path("/tmp")
+
+        for mode in ("read", "write"):
+            with self.subTest(mode=mode):
+                params = _codex_thread_params(workspace, mode, None)
+                self.assertEqual(params["approvalPolicy"], "on-request")
+                self.assertEqual(params["approvalsReviewer"], "user")
 
     def test_token_api_provider_is_passed_without_putting_key_in_commands(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

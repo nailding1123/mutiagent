@@ -651,7 +651,7 @@ class ClaudeAdapter(BaseCLIAdapter):
         del workspace
         permission_mode = (
             "manual"
-            if mode == "write" and (interactive or self._interaction_handler is not None)
+            if interactive or self._interaction_handler is not None
             else "acceptEdits" if mode == "write" else "plan"
         )
         command = [
@@ -944,7 +944,7 @@ class CodexAdapter(BaseCLIAdapter):
                             "threadId": thread_id,
                             "input": [{"type": "text", "text": prompt}],
                             "cwd": str(workspace),
-                            "approvalPolicy": "on-request" if mode == "write" else "never",
+                            **_codex_approval_params(),
                             "sandboxPolicy": _codex_sandbox_policy(mode),
                             **({"model": model} if model else {}),
                         },
@@ -1212,7 +1212,7 @@ def _codex_thread_params(
 ) -> dict[str, Any]:
     params: dict[str, Any] = {
         "cwd": str(workspace),
-        "approvalPolicy": "on-request" if mode == "write" else "never",
+        **_codex_approval_params(),
         "sandbox": "workspace-write" if mode == "write" else "read-only",
     }
     if thread_id:
@@ -1220,6 +1220,10 @@ def _codex_thread_params(
     if model:
         params["model"] = model
     return params
+
+
+def _codex_approval_params() -> dict[str, str]:
+    return {"approvalPolicy": "on-request", "approvalsReviewer": "user"}
 
 
 def _codex_sandbox_policy(mode: str) -> dict[str, Any]:

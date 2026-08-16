@@ -142,7 +142,7 @@
               <div id="composer-mention-menu" class="mention-menu hidden" role="listbox" aria-label="选择要点名的成员">
                 <button type="button" role="option" data-mention="@Claude"><span class="mention-avatar mention-avatar-claude">CL</span><span><strong>Claude Code</strong><small>单独点名 · 可按消息需要讨论或修改</small></span></button>
                 <button type="button" role="option" data-mention="@Codex"><span class="mention-avatar mention-avatar-codex">CX</span><span><strong>Codex</strong><small>单独点名 · 可按消息需要讨论或修改</small></span></button>
-                <button type="button" role="option" data-mention="@all"><span class="mention-avatar mention-avatar-all">@</span><span><strong>所有成员</strong><small>邀请双方一起讨论 · 本轮保持只读</small></span></button>
+                <button type="button" role="option" data-mention="@all"><span class="mention-avatar mention-avatar-all">@</span><span><strong>所有成员</strong><small>邀请双方一起讨论 · 默认只读，可申请权限</small></span></button>
               </div>
               <div class="composer-toolbar">
                 <div class="composer-tools"><button id="quick-attach-button" type="button" title="添加附件" aria-label="添加附件"><span aria-hidden="true">＋</span><span>附件</span></button></div>
@@ -256,8 +256,8 @@
               <div data-collaboration-only="group_chat">
                 <label><span>未点名时响应者</span><select id="settings-group-chat-default-agent"><option value="both">Claude Code + Codex</option><option value="claude">仅 Claude Code</option><option value="codex">仅 Codex</option></select></label>
                 <div class="settings-switches">
-                  <label class="setting-switch"><input id="settings-group-chat-execution" type="checkbox" /><span><strong>允许 Agent 自主写入工作区</strong><small>单独点名一个 Agent 时，它会根据消息内容自行选择只读讨论或写入模式；纯提问、分析和审核保持只读，明确要求修改或隐含需要改动时才写入。“执行：”或 /exec 仍可明确表达执行意图；多人同时回复时所有 Agent 保持只读。</small></span></label>
-                  <div class="setting-switch setting-static"><span class="setting-static-icon">@</span><span><strong>点名路由</strong><small>@Claude（Claude Code）、@Codex 或 @all 会覆盖默认响应者；@all 会同时通知双方，并让本轮保持只读。</small></span></div>
+                  <label class="setting-switch"><input id="settings-group-chat-execution" type="checkbox" /><span><strong>允许 Agent 自主写入工作区</strong><small>单独点名一个 Agent 时，它会根据消息内容自行选择只读讨论或写入模式；纯提问、分析和审核默认只读，明确要求修改或隐含需要改动时才写入。“执行：”或 /exec 仍可明确表达执行意图；只读轮次需要额外权限时会弹窗申请。</small></span></label>
+                  <div class="setting-switch setting-static"><span class="setting-static-icon">@</span><span><strong>点名路由</strong><small>@Claude（Claude Code）、@Codex 或 @all 会覆盖默认响应者；@all 会同时通知双方并默认保持只读，额外权限由你审批。</small></span></div>
                   <div class="setting-switch setting-static"><span class="setting-static-icon">1</span><span><strong>单写入者与隔离</strong><small>同一时间最多一个 Agent 直接写入主工作区；主工作区被占用时，另一个写入 Agent 使用唯一临时 Worktree，完成后自动合并并清理。所有实际改动都会显示在变更面板中。</small></span></div>
                   <div class="setting-switch setting-static"><span class="setting-static-icon">!</span><span><strong>原生权限与提问</strong><small>Claude Code 或 Codex 请求执行命令、修改文件、扩展权限或补充信息时，会暂停对应 Agent 并在页面弹窗；群聊中的其他 Agent 仍可继续工作。</small></span></div>
                 </div>

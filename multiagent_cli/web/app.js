@@ -1781,7 +1781,8 @@ function connectEvents() {
           showToast('Agent 正在等待你的权限决定或补充信息。');
           scheduleRefresh(0);
         } else {
-          showToast('后台任务需要你的权限决定或补充信息。');
+          selectRun(update.run_id);
+          showToast('已切换到需要权限决定或补充信息的任务。');
         }
         notifyBrowser('Agent 需要你的操作', '请在页面中处理权限或补充问题。', update.run_id);
         markRunUnread(update.run_id, 'Agent 需要你的操作', '请在页面中处理权限或补充问题。');

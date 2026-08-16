@@ -1747,6 +1747,8 @@ class UIServerTests(unittest.TestCase):
         self.assertIn(".composer-attachment-list", style)
         self.assertIn("settings-browser-notifications", html)
         self.assertIn("function notifyBrowser", script)
+        self.assertIn("selectRun(update.run_id);", script)
+        self.assertIn("已切换到需要权限决定或补充信息的任务", script)
         self.assertIn("function saveDraftNow", script)
         self.assertIn("data-message-edit", script)
         self.assertIn("data-message-retry", script)
