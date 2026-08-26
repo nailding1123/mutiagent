@@ -62,10 +62,16 @@ def settings_snapshot(settings: BridgeSettings) -> dict[str, object]:
 
     resolved = {
         "group_chat_default_agent": settings.group_chat_default_agent,
-        "group_chat_execution": settings.group_chat_execution,
+        "worktree": settings.worktree,
         "group_chat_identities": {
             "agent_a": settings.group_chat_agent_a_identity,
             "agent_b": settings.group_chat_agent_b_identity,
+        },
+        "context_compaction": {
+            "enabled": settings.context_compaction.enabled,
+            "threshold_tokens": settings.context_compaction.threshold_tokens,
+            "target_tokens": settings.context_compaction.target_tokens,
+            "recent_messages": settings.context_compaction.recent_messages,
         },
         "token_api": {
             "enabled": settings.token_api.enabled,
@@ -77,7 +83,7 @@ def settings_snapshot(settings: BridgeSettings) -> dict[str, object]:
     return {
         "config_path": str(settings.config_path) if settings.config_path else "",
         "group_chat_default_agent": settings.group_chat_default_agent,
-        "group_chat_execution": settings.group_chat_execution,
+        "worktree": settings.worktree,
         "group_chat_agent_a_identity": settings.group_chat_agent_a_identity,
         "group_chat_agent_b_identity": settings.group_chat_agent_b_identity,
         "claude_model": settings.claude.model,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,8 @@ from urllib.request import Request, urlopen
 from multiagent_cli.bridge_models import (
     AgentEvent,
     AgentRunResult,
+    LEGACY_GROUP_CHAT_AGENT_A_IDENTITY,
+    LEGACY_GROUP_CHAT_AGENT_B_IDENTITY,
     NativeInteractionOption,
     NativeInteractionRequest,
 )
@@ -47,6 +50,678 @@ class FakeChatAdapter:
 
 
 class UIServerTests(unittest.TestCase):
+    def test_message_rollback_blocks_workspace_drift_and_can_retry(self) -> None:
+        class WritingAdapter(FakeChatAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                (Path(kwargs["workspace"]) / "agent.txt").write_text(
+                    "agent change",
+                    encoding="utf-8",
+                )
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "repo"
+            workspace.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=workspace, check=True)
+            (workspace / "tracked.txt").write_text("base", encoding="utf-8")
+            (workspace / ".multiagent.json").write_text(
+                json.dumps({"claude": {"command": "/bin/echo"}, "codex": {"command": "/bin/echo"}}),
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=workspace, check=True)
+            manager = UISessionManager(
+                store=RunStore(Path(directory) / "state"),
+                default_workspace=workspace,
+            )
+            adapter = WritingAdapter(
+                "Claude",
+                [AgentRunResult("Claude", "修改完成")],
+            )
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={"claude": adapter, "codex": FakeChatAdapter("Codex", [])},
+            ):
+                started = manager.start_task(
+                    {"task": "@Claude 执行：修改文件", "workspace": str(workspace)}
+                )
+                self._wait_for_status(
+                    manager,
+                    started["id"],
+                    "ready",
+                    message_count=2,
+                )
+                ready = manager.store.get(started["id"]) or {}
+                reply = ready["group_chat"]["messages"][-1]
+                self.assertEqual(reply["changes"]["rollback"]["status"], "available")
+
+                user_file = workspace / "user.txt"
+                user_file.write_text("keep me", encoding="utf-8")
+                conflict = manager.rollback_chat_message(started["id"], reply["id"])
+                self.assertEqual(conflict["rollback"]["status"], "conflict")
+                self.assertTrue((workspace / "agent.txt").exists())
+                self.assertTrue(user_file.exists())
+
+                user_file.unlink()
+                rolled_back = manager.rollback_chat_message(started["id"], reply["id"])
+                agent_exists_after_rollback = (workspace / "agent.txt").exists()
+
+            persisted = manager.store.get(started["id"]) or {}
+
+        self.assertEqual(rolled_back["rollback"]["status"], "rolled_back")
+        self.assertFalse(agent_exists_after_rollback)
+        persisted_reply = persisted["group_chat"]["messages"][-1]
+        self.assertEqual(persisted_reply["changes"]["rollback"]["status"], "rolled_back")
+
+    def test_comparison_manager_apply_persists_selected_candidate(self) -> None:
+        class WritingAdapter(FakeChatAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                (Path(kwargs["workspace"]) / f"{self.display_name.lower().replace(' ', '_')}.txt").write_text(
+                    self.display_name,
+                    encoding="utf-8",
+                )
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "repo"
+            workspace.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=workspace, check=True)
+            (workspace / "tracked.txt").write_text("base", encoding="utf-8")
+            (workspace / ".multiagent.json").write_text(
+                json.dumps({"claude": {"command": "/bin/echo"}, "codex": {"command": "/bin/echo"}}),
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=workspace, check=True)
+            manager = UISessionManager(
+                store=RunStore(Path(directory) / "state"),
+                default_workspace=workspace,
+            )
+            claude = WritingAdapter("Claude", [AgentRunResult("Claude", "A")])
+            codex = WritingAdapter("Codex", [AgentRunResult("Codex", "B")])
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={"claude": claude, "codex": codex},
+            ):
+                started = manager.start_task({"task": "@all 执行：分别实现", "workspace": str(workspace)})
+                self._wait_for_status(manager, started["id"], "ready", message_count=3)
+                before = manager.store.get(started["id"]) or {}
+                comparison_id = before["group_chat"]["comparison"]["id"]
+
+                with self.assertRaisesRegex(UIError, "ID 不匹配"):
+                    manager.apply_comparison(
+                        started["id"],
+                        "codex",
+                        "comparison-wrong",
+                    )
+                self.assertFalse((workspace / "codex.txt").exists())
+
+                result = manager.apply_comparison(
+                    started["id"],
+                    "codex",
+                    comparison_id,
+                )
+
+            persisted = manager.store.get(started["id"]) or {}
+            selected_exists = (workspace / "codex.txt").is_file()
+            other_exists = (workspace / "claude.txt").exists()
+
+        self.assertEqual(result["comparison"]["id"], comparison_id)
+        self.assertEqual(result["comparison"]["status"], "applied")
+        self.assertEqual(persisted["group_chat"]["comparison"]["selected_agent"], "codex")
+        self.assertFalse(other_exists)
+        self.assertTrue(selected_exists)
+
+    def test_non_git_comparison_is_rejected_before_creating_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "plain"
+            workspace.mkdir()
+            manager = UISessionManager(
+                store=RunStore(Path(directory) / "state"),
+                default_workspace=workspace,
+            )
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={
+                    "claude": FakeChatAdapter("Claude", []),
+                    "codex": FakeChatAdapter("Codex", []),
+                },
+            ):
+                with self.assertRaisesRegex(UIError, "需要 Git 工作区"):
+                    manager.start_task(
+                        {
+                            "task": "@all 执行：分别修复",
+                            "workspace": str(workspace),
+                        }
+                    )
+            self.assertEqual(manager.store.list(), [])
+
+    def test_agent_sidebar_only_animates_agents_active_in_current_turn(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend status test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+function extract(name, nextName) {
+  const start = source.indexOf(`function ${name}`);
+  const end = source.indexOf(`\nfunction ${nextName}`, start);
+  if (start < 0 || end < 0) throw new Error(`missing ${name}`);
+  return source.slice(start, end);
+}
+function escapeHtml(value) { return String(value || ''); }
+function agentKeyFromName(value) { return String(value || '').toLowerCase(); }
+eval(extract('statusKey', 'statusLabel'));
+eval(extract('fallbackAgentDetail', 'renderNativeInteraction'));
+eval(extract('renderAgentStatus', 'fallbackAgentDetail'));
+
+const session = {
+  active_agents: ['claude'],
+  agent_events: {
+    claude: {status: 'working', safe_summary: 'Claude 正在处理'},
+    codex: {status: 'working', safe_summary: 'Codex 上一轮已处理'},
+  },
+  native_interactions: [],
+};
+const claudeContainer = {};
+const codexContainer = {};
+const claudeDot = {};
+const codexDot = {};
+renderAgentStatus(claudeContainer, claudeDot, 'claude', 'Claude Code', session, 'running');
+renderAgentStatus(codexContainer, codexDot, 'codex', 'Codex', session, 'running');
+if (claudeDot.className !== 'status-dot status-running') throw new Error('active Agent did not animate');
+if (codexDot.className === 'status-dot status-running') throw new Error('inactive Agent still animates');
+if (codexDot.className !== 'status-dot status-waiting') throw new Error('inactive Agent is not static waiting');
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_comparison_review_falls_back_to_persisted_record_when_live_session_lags(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend comparison test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const start = source.indexOf('function groupChatState');
+const end = source.indexOf('\nasync function applyComparison', start);
+if (start < 0 || end < 0) throw new Error('groupChatState was not found');
+global.state = {
+  detail: {
+    session: {group_chat: {
+      messages: [],
+      comparison: {id: 'comparison-test', status: 'running', candidates: {
+        claude: {status: 'running'}, codex: {status: 'running'},
+      }},
+    }},
+    record: {group_chat: {
+      comparison: {
+        id: 'comparison-test',
+        status: 'review',
+        candidates: {claude: {status: 'ready'}, codex: {status: 'no_changes'}},
+      },
+    }},
+  },
+};
+eval(source.slice(start, end));
+const chat = groupChatState();
+if (chat.comparison?.id !== 'comparison-test') {
+  throw new Error('persisted review comparison was hidden by stale live session state');
+}
+if (chat.comparison.status !== 'review') throw new Error('review status was not preserved');
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_comparison_candidate_replies_remain_normal_bubbles_and_controls_follow_them(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend comparison feed test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const start = source.indexOf('function renderGroupChat');
+const end = source.indexOf('\nfunction comparisonMarkup', start);
+if (start < 0 || end < 0) throw new Error('renderGroupChat was not found');
+
+const state = {currentId: 'run-1', messageTexts: new Map()};
+const messages = [
+  {id: 'm1', sender: 'user', role: 'user', content: '@all 执行：分别实现', recipients: ['claude', 'codex'], action: 'execute'},
+  {id: 'm2', sender: 'claude', role: 'assistant', content: 'Claude result', reply_to: 'm1', action: 'execute'},
+  {id: 'm3', sender: 'codex', role: 'assistant', content: 'Codex result', reply_to: 'm1', action: 'execute'},
+  {id: 'm4', sender: 'user', role: 'user', content: '后续消息', recipients: ['claude'], action: 'discuss'},
+];
+function groupChatState() { return {messages, comparison: {
+  id: 'comparison-1', status: 'review', candidates: {
+    claude: {status: 'ready', response_message_id: 'm2'},
+    codex: {status: 'ready', response_message_id: 'm3'},
+  },
+}}; }
+function reconcilePendingChatMessages() { return []; }
+function dedupeGroupChatMessages(value) { return value; }
+function groupChatReplyKey(message) { return message.role === 'assistant' ? `${message.sender}:${message.reply_to}` : ''; }
+function reconcileStreamBuffers() {}
+function streamTextByAgent() { return new Map(); }
+function orderGroupChatMessages(value) { return value; }
+function agentName(agent) { return agent; }
+function messageCard(name, role, result) {
+  return `<article data-feed-key="${result.feed_key}">${name}:${result.final_text}</article>`;
+}
+function comparisonMarkup(comparison) {
+  return `<section data-feed-key="comparison-${comparison.id}">controls</section>`;
+}
+let rendered = [];
+function patchFeed(_runId, entries) { rendered = entries; }
+function appendStreamToFeed() {}
+
+eval(source.slice(start, end));
+renderGroupChat({id: 'run-1', status: 'ready'}, {status: 'ready', agent_events: {}});
+const keys = rendered.map((entry) => entry.key);
+for (const expected of ['msg-m1', 'msg-m2', 'msg-m3', 'msg-m4', 'comparison-comparison-1']) {
+  if (!keys.includes(expected)) throw new Error(`${expected} was omitted from the feed`);
+}
+if (keys.indexOf('comparison-comparison-1') !== keys.indexOf('msg-m3') + 1) {
+  throw new Error('comparison controls must follow the candidate reply bubbles');
+}
+if (keys.indexOf('msg-m4') < keys.indexOf('comparison-comparison-1')) {
+  throw new Error('later messages must render below the comparison controls');
+}
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_new_chat_dialog_creates_an_empty_chat_without_prompt_or_documents(self) -> None:
+        web_root = Path(ui_server.__file__).with_name("web")
+        html = (web_root / "index.html").read_text(encoding="utf-8")
+        script = (web_root / "app.js").read_text(encoding="utf-8")
+        submit_start = script.index("async function submitTask")
+        submit_end = script.index("\nasync function submitQuickTask", submit_start)
+        submit_source = script[submit_start:submit_end]
+        open_start = script.index("function openNewTask")
+        open_end = script.index("\nfunction addTaskFiles", open_start)
+        open_source = script[open_start:open_end]
+
+        self.assertIn("直接建立空群聊", html)
+        self.assertNotIn("添加参考文档或图片", html)
+        self.assertIn("task: ''", submit_source)
+        self.assertIn("attachments: []", submit_source)
+        self.assertNotIn("encodeTaskFiles('task')", submit_source)
+        self.assertNotIn("restoreNewTaskDraft()", open_source)
+
+    def test_applied_comparison_hides_cleaned_worktree_controls(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend comparison-state test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const start = source.indexOf('function comparisonMarkup');
+const end = source.indexOf('\nconst feedHtmlCache', start);
+if (start < 0 || end < 0) throw new Error('comparisonMarkup was not found');
+function escapeHtml(value) { return String(value || ''); }
+function agentName(value) { return value === 'claude' ? 'Claude Code' : 'Codex'; }
+function changeSummaryMarkup() { return ''; }
+const state = {detail: {session: {workspace: '/main'}, record: {workspace: '/main'}}};
+eval(source.slice(start, end));
+const html = comparisonMarkup({
+  id: 'comparison-applied', status: 'applied', selected_agent: 'claude',
+  candidates: {
+    claude: {status: 'ready', apply_status: 'applied', cleaned: true, workspace: '/tmp/claude', preview_commands: ['cd /tmp/claude']},
+    codex: {status: 'ready', apply_status: 'discarded', cleaned: true, workspace: '/tmp/codex', preview_commands: ['cd /tmp/codex']},
+  },
+}, 'run-1');
+if (!html.includes('已采用 Claude Code 方案')) throw new Error('selected Agent was not shown');
+if ((html.match(/临时工作区已删除/g) || []).length !== 2) throw new Error('cleaned worktrees were not explained');
+if (html.includes('如何查看实现效果')) throw new Error('stale worktree guide remained after apply');
+if (html.includes('data-comparison-action="copy-path" data-comparison-agent="claude">复制路径')) throw new Error('stale path copy control remained after apply');
+if (!html.includes('路径已清理')) throw new Error('cleaned path state was not visible');
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_running_comparison_allows_preview_of_finished_candidate_only(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend comparison-state test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const start = source.indexOf('function comparisonMarkup');
+const end = source.indexOf('\nconst feedHtmlCache', start);
+if (start < 0 || end < 0) throw new Error('comparisonMarkup was not found');
+function escapeHtml(value) { return String(value || ''); }
+function agentName(value) { return value === 'claude' ? 'Claude Code' : 'Codex'; }
+function changeSummaryMarkup() { return ''; }
+const state = {detail: {session: {workspace: '/main'}, record: {workspace: '/main'}}};
+eval(source.slice(start, end));
+const html = comparisonMarkup({
+  id: 'comparison-running', status: 'running',
+  candidates: {
+    claude: {status: 'ready', workspace: '/tmp/claude', preview_commands: ['cd /tmp/claude']},
+    codex: {status: 'running', workspace: '/tmp/codex'},
+  },
+}, 'run-1');
+const claudePreview = 'data-comparison-action="preview" data-comparison-agent="claude"';
+const codexPreview = 'data-comparison-action="preview" data-comparison-agent="codex"';
+if (!html.includes('已完成 · 可预览')) throw new Error('finished candidate did not show preview state');
+if (!html.includes(claudePreview)) throw new Error('finished candidate preview button missing');
+if (html.includes(`${claudePreview} disabled`)) throw new Error('finished candidate preview button was disabled');
+if (!html.includes(`${codexPreview} disabled`)) throw new Error('running candidate preview button was enabled');
+if (!html.includes('另一个 Agent 完成后，才可以正式采用方案')) throw new Error('running comparison guidance missing');
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_terminal_comparison_clears_composer_status_hint(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend comparison-state test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const start = source.indexOf('function updateComparisonComposeHint');
+const end = source.indexOf('\nfunction removePendingChatMessage', start);
+if (start < 0 || end < 0) throw new Error('updateComparisonComposeHint was not found');
+const input = {value: ''};
+const hint = {
+  textContent: '',
+  dataset: {},
+  classList: {toggle(_name, hidden) { hint.hidden = hidden; }},
+};
+const el = {comparisonComposeHint: hint, quickTaskInput: input};
+let comparison = null;
+function currentComparison() { return comparison; }
+function agentName(value) { return value === 'claude' ? 'Claude Code' : 'Codex'; }
+function isComparisonExecutionRequest() { return false; }
+eval(source.slice(start, end));
+
+comparison = {status: 'review'};
+updateComparisonComposeHint();
+if (hint.hidden || !hint.textContent.includes('候选待选择')) {
+  throw new Error('review state should keep the actionable composer hint');
+}
+for (const status of ['applied', 'discarded']) {
+  comparison = {status};
+  updateComparisonComposeHint();
+  if (!hint.hidden || hint.textContent !== '') {
+    throw new Error(`${status} state left a stale composer hint`);
+  }
+}
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_composer_paste_uses_files_fallback_and_renders_image_chip(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend paste test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+function extract(startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start);
+  if (start < 0 || end < 0) throw new Error(`missing ${startMarker}`);
+  return source.slice(start, end);
+}
+
+class BrowserFile {
+  constructor(parts, name, options = {}) {
+    this.name = name;
+    this.type = options.type || '';
+    this.size = parts.reduce((total, part) => total + Number(part.size || 0), 0);
+    this.lastModified = 0;
+  }
+}
+global.File = BrowserFile;
+const calls = [];
+function addTaskFiles(files, target) { calls.push({files: Array.from(files), target}); }
+function showToast() {}
+const el = {taskInput: {}, quickTaskInput: {}};
+eval(extract('function handleComposerPaste', '\nfunction resizeComposer'));
+
+const pasted = {name: '', type: 'image/png', size: 42, lastModified: 7};
+let prevented = false;
+handleComposerPaste({
+  currentTarget: el.quickTaskInput,
+  clipboardData: {items: [], files: [pasted]},
+  preventDefault() { prevented = true; },
+});
+if (!prevented || calls.length !== 1 || calls[0].target !== 'composer') {
+  throw new Error('clipboardData.files fallback was not accepted');
+}
+if (!calls[0].files[0].name.endsWith('.png')) {
+  throw new Error('unnamed screenshot did not receive a png filename');
+}
+
+handleComposerPaste({
+  currentTarget: el.quickTaskInput,
+  clipboardData: {items: [{kind: 'file', getAsFile: () => pasted}], files: [pasted]},
+  preventDefault() {},
+});
+if (calls[1].files.length !== 1) throw new Error('clipboard file was added twice');
+
+class Node {
+  constructor() {
+    this.children = [];
+    this.dataset = {};
+    this.classList = {toggle() {}, add() {}, contains() { return false; }};
+  }
+  append(...children) {
+    if (children.some((child) => child === undefined)) throw new Error('undefined child');
+    this.children.push(...children);
+  }
+  replaceChildren() { this.children = []; }
+  setAttribute() {}
+}
+global.document = {createElement: () => new Node()};
+const state = {newTaskFiles: [], composerFiles: [calls[0].files[0]]};
+el.documentList = new Node();
+el.composerAttachmentList = new Node();
+function isImageFile() { return true; }
+function appendImageThumbnail(parent) { parent.append(new Node()); }
+function formatBytes() { return '42 B'; }
+eval(extract('function renderTaskFiles', '\nasync function encodeTaskFiles'));
+renderTaskFiles();
+if (el.composerAttachmentList.children.length !== 1) {
+  throw new Error('image attachment chip did not render');
+}
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_settings_ui_normalizes_legacy_builtin_identities(self) -> None:
+        values = ui_server._config_for_ui(
+            {
+                "group_chat_identities": {
+                    "agent_a": LEGACY_GROUP_CHAT_AGENT_A_IDENTITY,
+                    "agent_b": LEGACY_GROUP_CHAT_AGENT_B_IDENTITY,
+                }
+            }
+        )
+
+        self.assertEqual(
+            values["group_chat_identities"]["agent_a"],
+            values["group_chat_identities"]["agent_b"],
+        )
+
+    def test_retry_reconciliation_removes_fast_server_reply_loading_bubble(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend reconciliation test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+function extract(name, nextName) {
+  const start = source.indexOf(`function ${name}`);
+  const end = source.indexOf(`\nfunction ${nextName}`, start);
+  if (start < 0 || end < 0) throw new Error(`missing ${name}`);
+  return source.slice(start, end);
+}
+const state = { pendingChatMessages: new Map() };
+const ACTIVE_RUN_STATUSES = new Set(['running', 'awaiting_interaction']);
+eval(extract('reconcilePendingChatMessages', 'groupChatMessageKey'));
+eval(extract('groupChatReplyKey', 'dedupeGroupChatMessages'));
+eval(extract('dedupeGroupChatMessages', 'orderGroupChatMessages'));
+state.pendingChatMessages.set('run-1', [{
+  client_id: 'client-1',
+  delivery_status: 'sending',
+  server_user_id: 'user-1',
+  server_message_count: 2,
+  retry_of: 'old-reply',
+  expected_recipients: ['claude'],
+  waiting_recipients: ['claude'],
+}]);
+const messages = [
+  { id: 'user-1', sender: 'user', role: 'user', content: 'question' },
+  { id: 'old-reply', sender: 'claude', role: 'assistant', reply_to: 'user-1', content: 'old' },
+  { id: 'new-reply', sender: 'claude', role: 'assistant', reply_to: 'user-1', retry_of: 'old-reply', content: 'new' },
+];
+const remaining = reconcilePendingChatMessages('run-1', messages, 'running');
+if (remaining.length !== 0) throw new Error('loading bubble was retained');
+const deduped = dedupeGroupChatMessages([...messages, {...messages[2]}]);
+if (deduped.filter((message) => message.id === 'new-reply').length !== 1) {
+  throw new Error('retry replies were not deduplicated');
+}
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_detail_refresh_reconciles_stale_stream_buffers(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend stream test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+function extract(name, nextName) {
+  const start = source.indexOf(`function ${name}`);
+  const end = source.indexOf(`\nfunction ${nextName}`, start);
+  if (start < 0 || end < 0) throw new Error(`missing ${name}`);
+  return source.slice(start, end);
+}
+const state = { streamBuffers: new Map([
+  ['run-1:claude:turn-1', 'final claude text'],
+  ['run-1:codex:turn-1', 'live codex text'],
+  ['other:claude:turn-1', 'other run'],
+]) };
+const ACTIVE_RUN_STATUSES = new Set(['running', 'awaiting_interaction']);
+eval(extract('streamBufferAgents', 'clearAgentStreamBuffers'));
+eval(extract('clearAgentStreamBuffers', 'agentEventIsTerminal'));
+eval(extract('agentEventIsTerminal', 'reconcileStreamBuffers'));
+eval(extract('reconcileStreamBuffers', 'streamTextByAgent'));
+
+if (!pendingReplyIsFinalizing({codex: {kind: 'text', status: 'completed'}}, 'codex')) {
+  throw new Error('completed final output was not recognized as finalizing');
+}
+if (pendingReplyIsFinalizing({codex: {kind: 'text', status: 'completed'}}, 'codex', ['claude'])) {
+  throw new Error('stale Codex final output was treated as the current turn');
+}
+if (!pendingReplyIsFinalizing({codex: {kind: 'text', status: 'completed'}}, 'codex', ['codex'])) {
+  throw new Error('current Codex final output was not recognized');
+}
+if (pendingReplyIsFinalizing({codex: {kind: 'progress', status: 'working'}}, 'codex')) {
+  throw new Error('working progress was incorrectly recognized as finalizing');
+}
+
+reconcileStreamBuffers(
+  'run-1',
+  [{sender: 'codex'}],
+  'running',
+  {
+    claude: {kind: 'metric', status: 'completed'},
+    codex: {kind: 'progress', status: 'working'},
+  },
+);
+if (state.streamBuffers.has('run-1:claude:turn-1')) {
+  throw new Error('completed Claude preview was retained');
+}
+if (!state.streamBuffers.has('run-1:codex:turn-1')) {
+  throw new Error('pending Codex preview was removed');
+}
+if (!state.streamBuffers.has('other:claude:turn-1')) {
+  throw new Error('another run was modified');
+}
+
+state.streamBuffers.set('run-1:claude:turn-2', 'reconnected stream');
+reconcileStreamBuffers(
+  'run-1',
+  [],
+  'running',
+  {claude: {kind: 'progress', status: 'working'}},
+);
+if (!state.streamBuffers.has('run-1:claude:turn-2')) {
+  throw new Error('active reconnected stream was removed');
+}
+
+reconcileStreamBuffers('run-1', [], 'ready', {});
+if ([...state.streamBuffers.keys()].some((key) => key.startsWith('run-1:'))) {
+  throw new Error('terminal run retained stale previews');
+}
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_native_interaction_round_trip_does_not_block_other_session_state(self) -> None:
         published: list[tuple[str, Any]] = []
         with tempfile.TemporaryDirectory() as directory:
@@ -84,6 +759,128 @@ class UIServerTests(unittest.TestCase):
             self.assertEqual(result[0].action, "approve")
             self.assertEqual(session.to_dict()["native_interactions"], [])
             self.assertIn(("native_interaction", {"interaction_id": public_id}), published)
+
+    def test_terminal_chat_turn_hides_and_cancels_late_native_interaction(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = UISession(
+                run_id="native-late",
+                task="task",
+                workspace=Path(directory),
+                notify=lambda *_args: None,
+            )
+            session.status = "running"
+            token = session.begin_chat_turn("turn-1", ("claude",))
+            request = NativeInteractionRequest(
+                id="provider-late",
+                source="Claude",
+                kind="command_approval",
+                title="请求执行命令",
+                command="pytest -q",
+                options=(NativeInteractionOption("approve", "允许一次"),),
+            )
+            result: list[Any] = []
+            worker = threading.Thread(
+                target=lambda: result.append(session.wait_for_native_interaction(request)),
+                daemon=True,
+            )
+            worker.start()
+            deadline = time.monotonic() + 1
+            while not session.to_dict()["native_interactions"] and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(session.to_dict()["native_interactions"])
+            session.finish_chat_turn(state={}, status="ready", token=token)
+            self.assertEqual(session.to_dict()["native_interactions"], [])
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result[0].action, "cancel")
+
+    def test_new_chat_turn_clears_previous_live_agent_events(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = UISession(
+                run_id="turn-status-reset",
+                task="task",
+                workspace=Path(directory),
+                notify=lambda *_args: None,
+            )
+            session.on_event(AgentEvent(
+                "Claude", "text", "上一轮最终回复", status="completed",
+                step_id="group_chat_turn_1_claude",
+            ))
+            session.on_event(AgentEvent(
+                "Codex", "progress", "上一轮处理中", status="working",
+                step_id="group_chat_turn_1_codex",
+            ))
+            self.assertIn("claude", session.to_dict()["agent_events"])
+            self.assertIn("codex", session.to_dict()["agent_events"])
+
+            session.begin_chat_turn("turn-2", ("claude", "codex"))
+            live_events = session.to_dict()["agent_events"]
+            self.assertNotIn("claude", live_events)
+            self.assertNotIn("codex", live_events)
+
+            session.on_event(AgentEvent(
+                "Codex", "text", "本轮最终回复", status="completed",
+                step_id="group_chat_turn_2_codex",
+            ))
+            self.assertEqual(
+                session.to_dict()["agent_events"]["codex"]["step_id"],
+                "group_chat_turn_2_codex",
+            )
+
+    def test_finishing_one_turn_keeps_other_agent_approval_alive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = UISession(
+                run_id="native-concurrent",
+                task="task",
+                workspace=Path(directory),
+                notify=lambda *_args: None,
+            )
+            claude_token = session.begin_chat_turn("claude-turn", ("claude",))
+            codex_token = session.begin_chat_turn("codex-turn", ("codex",))
+            requests = {
+                "Claude": NativeInteractionRequest(
+                    id="claude-provider",
+                    source="Claude",
+                    kind="command_approval",
+                    title="Claude 请求执行命令",
+                    options=(NativeInteractionOption("approve", "允许一次"),),
+                ),
+                "Codex": NativeInteractionRequest(
+                    id="codex-provider",
+                    source="Codex",
+                    kind="command_approval",
+                    title="Codex 请求执行命令",
+                    options=(NativeInteractionOption("approve", "允许一次"),),
+                ),
+            }
+            results: dict[str, list[Any]] = {"Claude": [], "Codex": []}
+            workers = [
+                threading.Thread(
+                    target=lambda source=source: results[source].append(
+                        session.wait_for_native_interaction(requests[source])
+                    ),
+                    daemon=True,
+                )
+                for source in requests
+            ]
+            for worker in workers:
+                worker.start()
+            deadline = time.monotonic() + 1
+            while len(session.to_dict()["native_interactions"]) < 2 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(len(session.to_dict()["native_interactions"]), 2)
+            session.finish_chat_turn(state={}, status="ready", token=claude_token)
+            visible = session.to_dict()["native_interactions"]
+            self.assertEqual(len(visible), 1)
+            self.assertEqual(visible[0]["source"], "Codex")
+            public_codex_id = visible[0]["id"]
+            session.submit_native_interaction(public_codex_id, {"action": "approve"})
+            for worker in workers:
+                worker.join(1)
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+            self.assertEqual(results["Claude"][0].action, "cancel")
+            self.assertEqual(results["Codex"][0].action, "approve")
+            session.finish_chat_turn(state={}, status="ready", token=codex_token)
 
     def test_stopping_session_releases_pending_native_interaction(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -291,6 +1088,208 @@ class UIServerTests(unittest.TestCase):
         self.assertEqual(len(codex.calls), 2)
         self.assertIn("Claude 初始回答", codex.calls[1]["prompt"])
         self.assertIn("@Codex 请审核", codex.calls[1]["prompt"])
+
+    def test_agent_reply_context_choice_persists_and_controls_future_prompts(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".multiagent.json").write_text(
+                json.dumps(
+                    {
+                        "claude": {"command": "/bin/echo"},
+                        "codex": {"command": "/bin/echo"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            claude = FakeChatAdapter(
+                "Claude",
+                [AgentRunResult("Claude", "PRIVATE_AGENT_REPLY", session_id="ca")],
+            )
+            codex = FakeChatAdapter(
+                "Codex",
+                [AgentRunResult("Codex", "已检查", session_id="cb")],
+            )
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={"claude": claude, "codex": codex},
+            ):
+                started = manager.start_task({"task": "@Claude 给出候选回答"})
+                run_id = started["id"]
+                self._wait_for_status(manager, run_id, "ready", message_count=2)
+                record = manager.store.get(run_id) or {}
+                reply_id = record["group_chat"]["messages"][-1]["id"]
+
+                session = manager.session(run_id)
+                self.assertIsNotNone(session)
+                active_token = session.begin_chat_turn("context-active")
+                with self.assertRaisesRegex(UIError, "Agent 正在回复"):
+                    manager.set_chat_message_context(run_id, reply_id, False)
+                session.finish_chat_turn(
+                    state=session.chat_engine().to_dict(),
+                    token=active_token,
+                )
+
+                changed = manager.set_chat_message_context(
+                    run_id,
+                    reply_id,
+                    False,
+                )
+                manager.send_chat_message(run_id, {"message": "@Codex 继续检查"})
+                self._wait_for_status(manager, run_id, "ready", message_count=4)
+
+                persisted = manager.store.get(run_id) or {}
+                manager.set_chat_message_context(run_id, reply_id, True)
+                restored = manager.store.get(run_id) or {}
+
+        self.assertFalse(changed["message"]["include_in_context"])
+        self.assertFalse(
+            persisted["group_chat"]["messages"][1]["include_in_context"]
+        )
+        self.assertNotIn("PRIVATE_AGENT_REPLY", codex.calls[0]["prompt"])
+        self.assertNotIn(
+            "include_in_context",
+            restored["group_chat"]["messages"][1],
+        )
+
+    def test_recall_chat_message_persists_placeholder_and_hides_replies(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".multiagent.json").write_text(
+                json.dumps(
+                    {
+                        "claude": {"command": "/bin/echo"},
+                        "codex": {"command": "/bin/echo"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={
+                    "claude": FakeChatAdapter(
+                        "Claude",
+                        [AgentRunResult("Claude", "需要撤回的回答", session_id="ca")],
+                    ),
+                    "codex": FakeChatAdapter("Codex", []),
+                },
+            ):
+                started = manager.start_task({"task": "@Claude 原始问题"})
+                run_id = started["id"]
+                self._wait_for_status(manager, run_id, "ready", message_count=2)
+                before = manager.store.get(run_id) or {}
+                user_id = before["group_chat"]["messages"][0]["id"]
+
+                result = manager.recall_chat_message(run_id, user_id)
+                persisted = manager.store.get(run_id) or {}
+                messages = persisted["group_chat"]["messages"]
+
+        self.assertTrue(result["message"]["recalled"])
+        self.assertEqual(messages[0]["content"], "消息已撤回")
+        self.assertTrue(messages[0]["recalled"])
+        self.assertTrue(messages[1]["hidden"])
+        self.assertTrue(messages[1]["recalled"])
+
+    def test_retry_replaces_old_reply_while_continue_keeps_current_reply(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".multiagent.json").write_text(
+                json.dumps(
+                    {
+                        "claude": {"command": "/bin/echo"},
+                        "codex": {"command": "/bin/echo"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            claude = FakeChatAdapter(
+                "Claude",
+                [
+                    AgentRunResult("Claude", "旧回复", session_id="ca-old"),
+                    AgentRunResult("Claude", "替代回复", session_id="ca-new"),
+                    AgentRunResult("Claude", "继续内容", session_id="ca-new"),
+                ],
+            )
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={
+                    "claude": claude,
+                    "codex": FakeChatAdapter("Codex", []),
+                },
+            ):
+                started = manager.start_task({"task": "@Claude 原问题"})
+                run_id = started["id"]
+                self._wait_for_status(manager, run_id, "ready", message_count=2)
+                first_record = manager.store.get(run_id) or {}
+                old_reply = first_record["group_chat"]["messages"][-1]
+
+                manager.send_chat_message(
+                    run_id,
+                    {
+                        "message": "原问题",
+                        "retry_of": old_reply["id"],
+                        "retry_mode": "regenerate",
+                        "agent": "claude",
+                    },
+                )
+                self._wait_for_status(manager, run_id, "ready", message_count=3)
+                replaced_record = manager.store.get(run_id) or {}
+                replaced_messages = replaced_record["group_chat"]["messages"]
+                replacement = next(
+                    message
+                    for message in replaced_messages
+                    if message.get("role") == "assistant"
+                )
+
+                manager.send_chat_message(
+                    run_id,
+                    {
+                        "message": "原问题",
+                        "retry_of": replacement["id"],
+                        "retry_mode": "continue",
+                        "agent": "claude",
+                    },
+                )
+                self._wait_for_status(manager, run_id, "ready", message_count=5)
+                continued_record = manager.store.get(run_id) or {}
+
+        replaced_assistants = [
+            message
+            for message in replaced_messages
+            if message.get("role") == "assistant"
+        ]
+        continued_assistants = [
+            message
+            for message in continued_record["group_chat"]["messages"]
+            if message.get("role") == "assistant"
+        ]
+        self.assertNotIn(
+            old_reply["id"],
+            [message["id"] for message in replaced_messages],
+        )
+        self.assertEqual(
+            [message["content"] for message in replaced_assistants],
+            ["替代回复"],
+        )
+        self.assertEqual(
+            [message["content"] for message in continued_assistants],
+            ["替代回复", "继续内容"],
+        )
 
     def test_group_chat_can_start_empty_and_wait_for_first_message(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1043,6 +2042,7 @@ class UIServerTests(unittest.TestCase):
                 json.dumps(
                     {
                         "custom_extension": {"enabled": True},
+                        "group_chat_execution": False,
                         "consensus": True,
                         "verification": {"commands": [["python3", "-m", "unittest"]]},
                         "api_key": "never-return-this-value",
@@ -1063,9 +2063,15 @@ class UIServerTests(unittest.TestCase):
             self.assertNotIn("never-return-this-value", json.dumps(loaded))
             values = loaded["values"]
             values["group_chat_default_agent"] = "codex"
-            values["group_chat_execution"] = False
+            self.assertNotIn("group_chat_execution", values)
             values["group_chat_identities"]["agent_a"] = "群聊 Claude 身份"
             values["group_chat_identities"]["agent_b"] = "群聊 Codex 身份"
+            values["context_compaction"] = {
+                "enabled": True,
+                "threshold_tokens": 12000,
+                "target_tokens": 6000,
+                "recent_messages": 6,
+            }
             values["claude"]["model"] = "claude-test"
             values["codex"]["model"] = "codex-test"
             values["ui"] = {
@@ -1085,6 +2091,17 @@ class UIServerTests(unittest.TestCase):
                 )
             values["ui"]["theme"] = "ocean"
 
+            values["context_compaction"]["target_tokens"] = 12000
+            with self.assertRaisesRegex(UIError, "target_tokens"):
+                manager.save_settings(
+                    {
+                        "workspace": str(workspace),
+                        "revision": loaded["revision"],
+                        "values": values,
+                    }
+                )
+            values["context_compaction"]["target_tokens"] = 6000
+
             saved = manager.save_settings(
                 {
                     "workspace": str(workspace),
@@ -1095,7 +2112,7 @@ class UIServerTests(unittest.TestCase):
             persisted = json.loads(config_path.read_text(encoding="utf-8"))
 
             self.assertEqual(saved["values"]["group_chat_default_agent"], "codex")
-            self.assertFalse(saved["values"]["group_chat_execution"])
+            self.assertNotIn("group_chat_execution", saved["values"])
             self.assertEqual(Path(saved["source_path"]), config_path.resolve())
             self.assertEqual(persisted["custom_extension"], {"enabled": True})
             self.assertNotIn("consensus", persisted)
@@ -1103,7 +2120,16 @@ class UIServerTests(unittest.TestCase):
             self.assertEqual(persisted["api_key"], "never-return-this-value")
             self.assertEqual(persisted["claude"]["custom_agent_field"], "keep-me")
             self.assertEqual(persisted["group_chat_default_agent"], "codex")
-            self.assertFalse(persisted["group_chat_execution"])
+            self.assertEqual(
+                persisted["context_compaction"],
+                {
+                    "enabled": True,
+                    "threshold_tokens": 12000,
+                    "target_tokens": 6000,
+                    "recent_messages": 6,
+                },
+            )
+            self.assertNotIn("group_chat_execution", persisted)
             self.assertEqual(
                 persisted["group_chat_identities"]["agent_a"],
                 "群聊 Claude 身份",
@@ -1115,6 +2141,11 @@ class UIServerTests(unittest.TestCase):
             defaults = manager.get_settings(defaults=True)
             self.assertEqual(defaults["values"]["ui"]["theme"], "paper")
             self.assertFalse(defaults["values"]["ui"]["compact_sidebar"])
+            self.assertTrue(defaults["values"]["context_compaction"]["enabled"])
+            self.assertEqual(
+                defaults["values"]["group_chat_identities"]["agent_a"],
+                defaults["values"]["group_chat_identities"]["agent_b"],
+            )
 
             with self.assertRaisesRegex(UIError, "已被其他程序修改"):
                 manager.save_settings(
@@ -1627,6 +2658,10 @@ class UIServerTests(unittest.TestCase):
         self.assertEqual(runs["runs"][0]["id"], "run-http")
         self.assertIn("MultiAgent 工作台", html)
         self.assertIn("<strong>Claude Code</strong>", html)
+        self.assertIn('<strong>Claude Code</strong><small>群聊协作</small>', html)
+        self.assertIn('<strong>Codex</strong><small>群聊协作</small>', html)
+        self.assertNotIn("需求分析与协作", html)
+        self.assertNotIn("工程实现与验证", html)
         self.assertNotIn("<strong>Claude</strong>", html)
         self.assertIn("新建任务", html)
         self.assertIn('data-context-action="rename"', html)
@@ -1638,6 +2673,10 @@ class UIServerTests(unittest.TestCase):
         self.assertIn('id="shutdown-ui-button"', html)
         self.assertIn('id="settings-workspace-browse"', html)
         self.assertIn('id="settings-group-chat-default-agent"', html)
+        self.assertIn('id="settings-context-compaction-enabled"', html)
+        self.assertIn('id="settings-context-compaction-threshold"', html)
+        self.assertIn('id="settings-context-compaction-target"', html)
+        self.assertIn('id="settings-context-compaction-recent"', html)
         self.assertIn('id="settings-token-api-key"', html)
         self.assertIn('id="settings-claude-model-order"', html)
         self.assertIn('id="settings-codex-model-order"', html)
@@ -1671,8 +2710,16 @@ class UIServerTests(unittest.TestCase):
         self.assertNotIn("function renderKanban", script)
         self.assertNotIn(".kanban-board", style)
         self.assertIn("return 'Claude Code';", script)
+        self.assertIn("const role = '群聊协作';", script)
+        self.assertNotIn("需求分析与协作伙伴", script)
+        self.assertNotIn("工程实现与验证协作伙伴", script)
         self.assertIn("function renderTimeline", script)
         self.assertIn("function renderActivityEvent", script)
+        self.assertIn("function coalesceActivityEvents", script)
+        self.assertIn("function activityStepKey", script)
+        self.assertIn("function normalizedActivityStatus", script)
+        self.assertIn("terminalByStep", script)
+        self.assertIn("activity.result_detail", script)
         self.assertIn("activity-card", script)
         self.assertIn("实时回复预览", html)
         self.assertNotIn("function eventMessage", script)
@@ -1709,7 +2756,9 @@ class UIServerTests(unittest.TestCase):
         self.assertIn("saveInterfacePreferences(defaults.values?.ui || {})", script)
         self.assertIn("document.body.dataset.theme = theme", script)
         self.assertIn("el.taskInput.required = false", script)
-        self.assertIn("第一条消息（可选）", script)
+        self.assertNotIn("第一条消息（可选）", script)
+        self.assertIn("直接建立空群聊", html)
+        self.assertNotIn("添加参考文档或图片", html)
         self.assertIn("update.type === 'workspace'", script)
         self.assertIn("run.workspace === workspace", script)
         self.assertIn("scrollChatToBottom", script)
@@ -1736,8 +2785,10 @@ class UIServerTests(unittest.TestCase):
         self.assertIn(".message-row.message-pending", style)
         self.assertIn(".message-row.message-loading", style)
         self.assertIn(".message-row.message-failed", style)
+        self.assertIn(".message-row.message-recalled", style)
         self.assertIn("message.failure_reason", script)
         self.assertIn("failureReason === 'timeout' ? '响应超时'", script)
+        self.assertIn("failureReason === 'model_incompatible' ? '模型不兼容'", script)
         self.assertIn("orderGroupChatMessages", script)
         self.assertIn("reply_to: turn.server_user_id || turn.client_id", script)
         self.assertIn("max-width: min(78%, 820px)", style)
@@ -1749,9 +2800,35 @@ class UIServerTests(unittest.TestCase):
         self.assertIn("function notifyBrowser", script)
         self.assertIn("selectRun(update.run_id);", script)
         self.assertIn("已切换到需要权限决定或补充信息的任务", script)
+        self.assertIn("function dedupeGroupChatMessages", script)
+        self.assertIn("function groupChatReplyKey", script)
+        self.assertIn("serverMessages.slice(optimistic.server_message_count)", script)
+        self.assertIn("!serverReplyKeys.has(groupChatReplyKey(reply))", script)
+        self.assertNotIn("if (optimistic.delivery_status === 'sending') return true", script)
+        self.assertIn("replacedMessageIds", script)
+        self.assertIn("optimistic.delivery_status === 'sending'", script)
+        self.assertIn("state.currentId === runId", script)
+        self.assertIn("state.detail.session = acceptedSession", script)
+        self.assertIn("旧回复已删除，正在重新生成", script)
+        self.assertIn("node.remove();", script)
+        self.assertIn("function streamTextByAgent", script)
+        self.assertIn("data-loading-agent", script)
+        self.assertIn("loadingNode?.dataset.feedKey", script)
+        self.assertIn("loading && !streaming", script)
         self.assertIn("function saveDraftNow", script)
         self.assertIn("data-message-edit", script)
         self.assertIn("data-message-retry", script)
+        self.assertIn("data-message-context", script)
+        self.assertIn("data-message-recall", script)
+        self.assertIn("function recallMessage", script)
+        self.assertIn("function latestRecallableUserMessage", script)
+        self.assertIn("event.key === 'Escape'", script)
+        self.assertIn("el.quickTaskInput.value = restoredText", script)
+        self.assertIn("function toggleMessageContext", script)
+        self.assertIn("include_in_context", script)
+        self.assertIn("未加入共同上下文", script)
+        self.assertIn("detailRequestSequence", script)
+        self.assertIn("requestSequence !== state.detailRequestSequence", script)
         self.assertIn(".message-tools", style)
         self.assertIn(".message-attachment-image", style)
         self.assertIn(".markdown-body .code-block", style)

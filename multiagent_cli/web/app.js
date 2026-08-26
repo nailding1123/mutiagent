@@ -28,6 +28,7 @@ const state = {
   pendingChatMessages: new Map(),
   pendingChatSequence: 0,
   messageTexts: new Map(),
+  detailRequestSequence: 0,
   feedPinnedToBottom: true,
   streamBuffers: new Map(),
   streamModelText: false,
@@ -105,6 +106,7 @@ const el = {
   quickTaskInput: document.querySelector('#quick-task-input'),
   quickTaskSubmit: document.querySelector('#quick-task-submit'),
   mentionMenu: document.querySelector('#composer-mention-menu'),
+  comparisonComposeHint: document.querySelector('#comparison-compose-hint'),
   quickAttach: document.querySelector('#quick-attach-button'),
   quickSettings: document.querySelector('#quick-settings-button'),
   detailPanel: document.querySelector('#detail-panel'),
@@ -278,6 +280,29 @@ function bindEvents() {
       quoteMessage(quote.dataset.messageQuote);
       return;
     }
+    const contextToggle = event.target.closest('[data-message-context]');
+    if (contextToggle) {
+      void toggleMessageContext(
+        contextToggle.dataset.messageContext,
+        contextToggle,
+      );
+      return;
+    }
+    const recall = event.target.closest('[data-message-recall]');
+    if (recall) {
+      void recallMessage(recall.dataset.messageRecall);
+      return;
+    }
+    const rollback = event.target.closest('[data-message-rollback]');
+    if (rollback) {
+      void rollbackMessage(rollback.dataset.messageRollback, rollback);
+      return;
+    }
+    const rollbackCopy = event.target.closest('[data-change-rollback-copy]');
+    if (rollbackCopy) {
+      void copyText(rollbackCopy.dataset.changeRollbackCopy || '', '回撤补丁路径');
+      return;
+    }
     const edit = event.target.closest('[data-message-edit]');
     if (edit) {
       editMessage(edit.dataset.messageEdit);
@@ -285,6 +310,30 @@ function bindEvents() {
     }
     const retry = event.target.closest('[data-message-retry]');
     if (retry) void retryMessage(retry.dataset.messageRetry, retry.dataset.retryMode || 'regenerate');
+    const comparisonAction = event.target.closest('[data-comparison-action]');
+    if (comparisonAction) {
+      const action = comparisonAction.dataset.comparisonAction;
+      if (action === 'apply') void applyComparison(comparisonAction.dataset.comparisonAgent || '');
+      else if (action === 'preview') void previewComparison(comparisonAction.dataset.comparisonAgent || '');
+      else if (action === 'discard') void discardComparison();
+      else if (action === 'copy-path' || action === 'copy-commands') {
+        const comparison = currentComparison();
+        const candidate = comparison?.candidates?.[comparisonAction.dataset.comparisonAgent || ''];
+        const value = action === 'copy-path'
+          ? candidate?.workspace || ''
+          : Array.isArray(candidate?.preview_commands) ? candidate.preview_commands.join('\n') : '';
+        void copyText(value, action === 'copy-path' ? '工作区路径' : '查看命令');
+      }
+      else if (action === 'copy-recovery') {
+        void copyText(currentComparison()?.recovery_patch || '', '恢复补丁路径');
+      }
+      else if (action === 'copy-main-path') {
+        const workspace = state.detail?.session?.workspace || state.detail?.record?.workspace || '';
+        void copyText(workspace, '主工作区路径');
+      }
+      else if (action === 'refresh') void refreshAll();
+      return;
+    }
   });
   el.artifactFeed.addEventListener('toggle', handleChangeToggle, true);
   el.artifactFeed.addEventListener('scroll', () => {
@@ -302,6 +351,7 @@ function bindEvents() {
     void submitQuickTask();
   });
   el.quickTaskInput.addEventListener('input', updateMentionMenu);
+  el.quickTaskInput.addEventListener('input', updateComparisonComposeHint);
   el.quickTaskInput.addEventListener('input', resizeComposer);
   el.quickTaskInput.addEventListener('input', scheduleDraftSave);
   el.quickTaskInput.addEventListener('keydown', handleComposerKeydown);
@@ -370,7 +420,14 @@ function bindEvents() {
       el.messageForm.classList.remove('composer-dragging');
     });
   });
-  el.messageForm.addEventListener('drop', (event) => addTaskFiles(event.dataTransfer?.files, 'composer'));
+  el.messageForm.addEventListener('drop', (event) => {
+    if (comparisonBlocksComposer()) {
+      event.preventDefault();
+      showToast('请先完成 A/B 方案的预览、采用或放弃，再添加附件。', true);
+      return;
+    }
+    addTaskFiles(event.dataTransfer?.files, 'composer');
+  });
 
   el.newTaskForm.addEventListener('submit', (event) => {
     event.preventDefault();
@@ -418,6 +475,7 @@ function bindEvents() {
       renderModelOrder(agent);
     });
   });
+  document.querySelector('#settings-context-compaction-enabled').addEventListener('change', updateSettingsDependencies);
   document.querySelectorAll('[data-add-model]').forEach((button) => {
     button.addEventListener('click', () => addSelectedModel(button.dataset.addModel));
   });
@@ -529,6 +587,20 @@ function handleComposerKeydown(event) {
       return;
     }
   }
+  if (event.key === 'Escape') {
+    // With an empty composer, Esc recalls the latest sent user turn and puts
+    // its text back into the draft. Keep Esc as the normal cancel/close key
+    // when the user is already editing a draft or has attached files.
+    if (!el.quickTaskInput.value.trim() && !state.composerFiles.length) {
+      const latest = latestRecallableUserMessage();
+      if (latest) {
+        event.preventDefault();
+        event.stopPropagation();
+        void recallMessage(latest.id);
+        return;
+      }
+    }
+  }
   if (event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
     hideMentionMenu();
@@ -542,16 +614,43 @@ function handleComposerKeydown(event) {
 }
 
 function handleComposerPaste(event) {
-  const items = Array.from(event.clipboardData?.items || []);
-  const files = items
+  const clipboard = event.clipboardData;
+  if (!clipboard) return;
+  const itemFiles = Array.from(clipboard.items || [])
     .filter((item) => item.kind === 'file')
-    .map((item) => item.getAsFile())
-    .filter(Boolean)
+    .map((item) => {
+      try {
+        return item.getAsFile();
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+  // Finder and some desktop apps expose a copied file through files rather
+  // than DataTransferItem.getAsFile(). Read both sources and de-duplicate the
+  // same clipboard entry when a browser exposes it through both APIs.
+  const seen = new Set();
+  const files = [...itemFiles, ...Array.from(clipboard.files || [])]
+    .filter((file) => {
+      const key = [file.name || '', file.size || 0, file.lastModified || 0, file.type || ''].join('|');
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
     .map((file) => {
-      if (file.name && file.name.includes('.')) return file;
-      const extension = (file.type.split('/')[1] || 'png').toLowerCase().replace(/[^a-z0-9]/g, '') || 'png';
+      const name = String(file.name || '');
+      if (name.includes('.')) return file;
+      const mime = String(file.type || '').toLowerCase();
+      const extension = ({
+        'image/jpeg': 'jpg',
+        'image/jpg': 'jpg',
+        'image/png': 'png',
+        'image/gif': 'gif',
+        'image/webp': 'webp',
+        'image/bmp': 'bmp',
+      })[mime] || 'png';
       const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      return new File([file], `paste-${stamp}.${extension}`, { type: file.type || 'image/png' });
+      return new File([file], `paste-${stamp}.${extension}`, { type: file.type || `image/${extension}` });
     });
   if (!files.length) return;
   event.preventDefault();
@@ -671,7 +770,11 @@ function populateSettingsForm(settings) {
   };
   setValue('settings-workspace', settings.workspace);
   setValue('settings-group-chat-default-agent', values.group_chat_default_agent || 'both');
-  setChecked('settings-group-chat-execution', values.group_chat_execution !== false);
+  const contextCompaction = values.context_compaction || {};
+  setChecked('settings-context-compaction-enabled', contextCompaction.enabled !== false);
+  setValue('settings-context-compaction-threshold', contextCompaction.threshold_tokens ?? 16000);
+  setValue('settings-context-compaction-target', contextCompaction.target_tokens ?? 8000);
+  setValue('settings-context-compaction-recent', contextCompaction.recent_messages ?? 8);
   state.modelCatalog = settings.model_catalog || { claude: [], codex: [], defaults: {} };
   const credentials = settings.token_api_credentials || {};
   setChecked('settings-token-api-enabled', values.token_api?.enabled);
@@ -866,6 +969,10 @@ function updateSettingsDependencies() {
   document.querySelectorAll('[data-collaboration-only]').forEach((item) => {
     if (item.dataset.settingsPanel) return;
     item.classList.toggle('hidden', item.dataset.collaborationOnly !== 'group_chat');
+  });
+  const compactionEnabled = document.querySelector('#settings-context-compaction-enabled')?.checked === true;
+  document.querySelectorAll('[data-context-compaction-setting]').forEach((input) => {
+    input.disabled = !compactionEnabled;
   });
   const activeTab = document.querySelector('[data-settings-tab].active')?.dataset.settingsTab || 'general';
   setSettingsTab(activeTab);
@@ -1068,6 +1175,11 @@ function collectSettingsValues() {
     if (!Number.isFinite(value) || value <= 0) throw new Error(`${label}必须是正数。`);
     return value;
   };
+  const positiveInteger = (id, label) => {
+    const value = positive(id, label);
+    if (!Number.isInteger(value)) throw new Error(`${label}必须是整数。`);
+    return value;
+  };
   const agent = (name) => ({
     command: parseCommandSetting(get(`settings-${name}-command`).value, name),
     model: state.modelOrders[name][0] || '',
@@ -1076,12 +1188,20 @@ function collectSettingsValues() {
     timeout: positive(`settings-${name}-timeout`, `${agentName(name)} 超时`),
     extra_args: get(`settings-${name}-extra-args`).value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
   });
+  const compactionThreshold = positiveInteger('settings-context-compaction-threshold', '上下文压缩触发预算');
+  const compactionTarget = positiveInteger('settings-context-compaction-target', '上下文压缩目标预算');
+  if (compactionTarget >= compactionThreshold) throw new Error('上下文压缩目标预算必须小于触发预算。');
   return {
     group_chat_default_agent: get('settings-group-chat-default-agent').value,
-    group_chat_execution: get('settings-group-chat-execution').checked,
     group_chat_identities: {
       agent_a: get('settings-group-chat-agent-a-identity').value.trim(),
       agent_b: get('settings-group-chat-agent-b-identity').value.trim(),
+    },
+    context_compaction: {
+      enabled: get('settings-context-compaction-enabled').checked,
+      threshold_tokens: compactionThreshold,
+      target_tokens: compactionTarget,
+      recent_messages: positiveInteger('settings-context-compaction-recent', '最近原文消息数'),
     },
     token_api: {
       enabled: get('settings-token-api-enabled').checked,
@@ -1169,8 +1289,8 @@ function renderTaskDefaults() {
 
 function updateNewTaskMode() {
   el.taskInput.required = false;
-  el.taskInputLabel.textContent = '第一条消息（可选）';
-  el.taskInput.placeholder = '可以留空，创建群聊后再从底部发送第一条消息…';
+  el.taskInputLabel.textContent = '第一条消息（创建后发送）';
+  el.taskInput.placeholder = '创建后在群聊底部发送提示词…';
   el.taskSubmit.textContent = '创建群聊';
   hideFormError(el.formError);
   renderTaskDefaults();
@@ -1242,12 +1362,16 @@ function closeRunSearch() {
 function openNewTask() {
   hideFormError(el.formError);
   state.draftTaskMode = null;
+  // A new group chat starts empty. The first prompt and documents belong in
+  // the chat composer after creation, not in this dialog.
+  el.taskInput.value = '';
+  clearTaskFiles('task');
+  try { localStorage.removeItem(`${NEW_TASK_DRAFT_KEY}:${state.health?.workspace || 'default'}`); } catch {}
   updateNewTaskMode();
   renderTaskFiles();
-  restoreNewTaskDraft();
   el.newTaskDialog.showModal();
   window.setTimeout(() => {
-    (selectedTaskMode() === 'group_chat' ? el.taskSubmit : el.taskInput).focus();
+    el.taskSubmit.focus();
   }, 0);
 }
 
@@ -1381,7 +1505,7 @@ function renderTaskFiles() {
     remove.setAttribute('aria-label', `移除 ${file.name}`);
     remove.title = '移除附件';
     remove.textContent = '×';
-    chip.append(label, remove);
+    chip.append(remove);
     el.composerAttachmentList.append(chip);
   });
 }
@@ -1425,20 +1549,16 @@ function clearTaskFiles(target = 'all') {
 }
 
 async function submitTask() {
-  let task = el.taskInput.value.trim();
-  if (!task && state.newTaskFiles.length) task = '请查看并分析附件。';
   setButtonBusy(el.taskSubmit, true, '正在启动…');
   hideFormError(el.formError);
   try {
-    const attachments = await encodeTaskFiles('task');
     await startTask({
-      task,
-      attachments,
+      task: '',
+      attachments: [],
       ...taskSettingsPayload(),
     });
     el.newTaskDialog.close();
     el.taskInput.value = '';
-    try { localStorage.removeItem(`${NEW_TASK_DRAFT_KEY}:${state.health?.workspace || 'default'}`); } catch {}
     el.quickTaskInput.value = '';
     clearTaskFiles('task');
   } catch (error) {
@@ -1456,6 +1576,11 @@ async function submitQuickTask() {
   }
   if (!task && state.composerFiles.length) task = '请查看并分析附件。';
   const inGroupChat = Boolean(state.currentId);
+  if (inGroupChat && isComparisonExecutionRequest(task) && !comparisonSupported()) {
+    showToast('双 Agent 对比执行需要有初始提交的 Git 工作区；请先初始化 Git 仓库，或改用单 Agent 执行。', true);
+    updateComparisonComposeHint();
+    return;
+  }
   const editedMessage = state.editingMessageId ? findGroupChatMessage(state.editingMessageId) : null;
   const options = editedMessage
     ? {
@@ -1540,7 +1665,7 @@ async function sendGroupChatMessage(message, attachments = [], options = {}) {
 }
 
 function queuePendingChatMessage(runId, content, attachments = [], options = {}) {
-  const chat = state.detail?.session?.group_chat || state.detail?.record?.group_chat || {};
+  const chat = groupChatState();
   const serverMessageCount = Array.isArray(chat.messages) ? chat.messages.length : 0;
   const pending = {
     client_id: `pending-${Date.now()}-${state.pendingChatSequence += 1}`,
@@ -1597,6 +1722,54 @@ function optimisticChatRecipients(content) {
   return fallback === 'both' ? ['claude', 'codex'] : [fallback];
 }
 
+function isComparisonExecutionRequest(content) {
+  const recipients = optimisticChatRecipients(content);
+  if (recipients.length !== 2 || !recipients.includes('claude') || !recipients.includes('codex')) return false;
+  const stripped = String(content || '')
+    .replace(/@(?:all|both|everyone|claude|codex|a|b|agent-a|agent-b|agenta|agentb)\b/gi, '')
+    .trim();
+  return /^(?:\/(?:exec|run)(?:\s|$)|(?:(?:请|让|现在)\s*)?[,，:：]?\s*执行(?:一下|任务)?(?:\s|[:：,，]|$))/i.test(stripped);
+}
+
+function comparisonSupported() {
+  const configured = state.settings?.comparison_supported;
+  return typeof configured === 'boolean' ? configured : state.health?.comparison_supported !== false;
+}
+
+function updateComparisonComposeHint() {
+  if (!el.comparisonComposeHint) return;
+  const comparison = currentComparison();
+  let message = '';
+  let kind = '';
+  if (comparison?.status === 'running') {
+    message = 'A/B 对比执行中：两个 Agent 正在各自的隔离 Worktree 中工作；完成前暂不能发送下一条群聊消息。';
+  } else if (['review', 'conflict'].includes(comparison?.status)) {
+    message = comparison.status === 'conflict'
+      ? '候选应用已停止：主工作区发生变化。候选补丁仍保留，可处理后重试或放弃。'
+      : 'A/B 候选待选择：请先查看方案 A 和 B，再采用其中一个或放弃全部。';
+  } else if (comparison?.status === 'previewing') {
+    message = '主工作区正在预览一个候选方案；请先切换预览、正式采用或放弃全部，再发送新的执行请求。';
+  } else if (comparison?.status === 'applying') {
+    message = '正在把候选方案应用到主工作区，请等待完成后再发送消息。';
+  } else if (['applied', 'discarded'].includes(comparison?.status)) {
+    // Terminal comparison states are already represented by the comparison
+    // panel and the one-shot toast.  Do not leave a stale status strip in the
+    // composer on every refresh; the input area should return to its normal
+    // state once the user can send the next message.
+    message = '';
+  } else if (isComparisonExecutionRequest(el.quickTaskInput.value)) {
+    if (comparisonSupported()) {
+      message = 'A/B 对比执行：Claude 和 Codex 将从同一快照分别修改；选择方案前不会写入主工作区。';
+    } else {
+      message = '当前目录不是有初始提交的 Git 工作区，无法进行双 Agent 隔离对比。请初始化 Git，或只点名一个 Agent 执行。';
+      kind = 'error';
+    }
+  }
+  el.comparisonComposeHint.textContent = message;
+  el.comparisonComposeHint.dataset.kind = kind;
+  el.comparisonComposeHint.classList.toggle('hidden', !message);
+}
+
 function removePendingChatMessage(runId, clientId) {
   const remaining = (state.pendingChatMessages.get(runId) || [])
     .filter((message) => message.client_id !== clientId);
@@ -1604,9 +1777,13 @@ function removePendingChatMessage(runId, clientId) {
   else state.pendingChatMessages.delete(runId);
 }
 
-function reconcilePendingChatMessages(runId, serverMessages, runStatus) {
+function reconcilePendingChatMessages(runId, serverMessages, runStatus, session = null) {
   const pending = state.pendingChatMessages.get(runId) || [];
   const active = ACTIVE_RUN_STATUSES.has(String(runStatus || '').toLowerCase());
+  const activeAgents = new Set(
+    (Array.isArray(session?.active_agents) ? session.active_agents : [])
+      .map((agent) => agentKeyFromName(agent)),
+  );
   const remaining = pending.filter((optimistic) => {
     if (!optimistic.server_user_id) {
       const serverUser = serverMessages
@@ -1614,7 +1791,7 @@ function reconcilePendingChatMessages(runId, serverMessages, runStatus) {
         .find((message) => message.sender === 'user' && message.content === optimistic.content);
       if (serverUser) optimistic.server_user_id = serverUser.id || '';
     }
-    const responded = new Set(serverMessages
+    const responded = new Set(serverMessages.slice(optimistic.server_message_count)
       .filter((message) => (
         message.role === 'assistant'
         && optimistic.server_user_id
@@ -1625,6 +1802,15 @@ function reconcilePendingChatMessages(runId, serverMessages, runStatus) {
     optimistic.waiting_recipients = optimistic.expected_recipients
       .filter((agent) => !responded.has(agent));
     if (!optimistic.waiting_recipients.length) return false;
+    // A later directed turn can keep the session running while an earlier
+    // optimistic bubble has already lost its Agent. Do not keep that stale
+    // bubble merely because another Agent is active.
+    if (optimistic.server_user_id) {
+      const waitingAgentIsActive = optimistic.waiting_recipients.some((agent) => (
+        activeAgents.has(agent)
+      ));
+      if (!waitingAgentIsActive) return false;
+    }
     return !optimistic.server_user_id || active;
   });
   if (remaining.length) state.pendingChatMessages.set(runId, remaining);
@@ -1634,6 +1820,26 @@ function reconcilePendingChatMessages(runId, serverMessages, runStatus) {
 
 function groupChatMessageKey(message) {
   return String(message?.id || message?.client_id || '');
+}
+
+function groupChatReplyKey(message) {
+  if (message?.role !== 'assistant') return '';
+  const sender = String(message.sender || '');
+  const parent = String(message.reply_to || '');
+  if (!sender || !parent) return '';
+  return `${sender}:${parent}:${String(message.retry_of || '')}`;
+}
+
+function dedupeGroupChatMessages(messages) {
+  const seenReplies = new Set();
+  return messages.filter((message) => {
+    const key = groupChatReplyKey(message);
+    if (!key) return true;
+    const contentKey = `${key}:${String(message.content || '')}`;
+    if (seenReplies.has(contentKey)) return false;
+    seenReplies.add(contentKey);
+    return true;
+  });
 }
 
 // Keep each Agent reply beside the user message that caused it. The server
@@ -1710,10 +1916,27 @@ function quoteMessage(feedKey) {
 }
 
 function findGroupChatMessage(messageId) {
-  const chat = state.detail?.session?.group_chat || state.detail?.record?.group_chat || {};
-  return (Array.isArray(chat.messages) ? chat.messages : []).find(
-    (message) => String(message.id || '') === String(messageId),
-  ) || null;
+  const sessionChat = state.detail?.session?.group_chat;
+  const recordChat = state.detail?.record?.group_chat;
+  for (const chat of [sessionChat, recordChat]) {
+    const found = (Array.isArray(chat?.messages) ? chat.messages : []).find(
+      (message) => String(message.id || '') === String(messageId),
+    );
+    if (found) return found;
+  }
+  return null;
+}
+
+function latestRecallableUserMessage() {
+  const chat = groupChatState();
+  const messages = Array.isArray(chat?.messages) ? chat.messages : [];
+  return [...messages].reverse().find((message) => (
+    message?.sender === 'user'
+    && message?.role === 'user'
+    && !message.hidden
+    && !message.recalled
+    && !message.optimistic
+  )) || null;
 }
 
 function editMessage(messageId) {
@@ -1727,9 +1950,48 @@ function editMessage(messageId) {
   showToast('已载入消息编辑内容；发送后会创建新的尝试，原消息仍会保留。');
 }
 
+async function recallMessage(messageId) {
+  const message = findGroupChatMessage(messageId);
+  if (!message || message.sender !== 'user' || message.recalled || !state.currentId) return;
+  const restoredText = String(message.content || message.agent_content || '');
+  const active = ACTIVE_RUN_STATUSES.has(
+    String(state.detail?.session?.status || '').toLowerCase(),
+  );
+  const notice = active
+    ? '撤回会请求停止当前 Agent 回复；原生进程已经看到的内容无法从其当前进程内抹除，但不会进入后续共同上下文。'
+    : '这条消息及其 Agent 回复将不再进入后续共同上下文。';
+  if (!window.confirm(`确认撤回这条消息？\n\n${notice}`)) return;
+  try {
+    const payload = await api(
+      `/api/sessions/${encodeURIComponent(state.currentId)}/messages/${encodeURIComponent(message.id)}/recall`,
+      { method: 'POST', body: JSON.stringify({}) },
+    );
+    if (state.detail && payload?.session) state.detail.session = payload.session;
+    if (state.detail && payload?.group_chat) {
+      state.detail.session = state.detail.session || {};
+      state.detail.session.group_chat = payload.group_chat;
+    }
+    state.editingMessageId = null;
+    el.quickTaskInput.value = restoredText;
+    resizeComposer();
+    el.quickTaskInput.focus();
+    el.quickTaskInput.setSelectionRange(
+      el.quickTaskInput.value.length,
+      el.quickTaskInput.value.length,
+    );
+    scheduleDraftSave();
+    renderDetail();
+    showToast(active ? '消息已撤回，当前 Agent 回复已请求停止。' : '消息已撤回，并从后续共同上下文排除。');
+    await refreshAll();
+  } catch (error) {
+    showToast(error.message, true);
+  }
+}
+
 async function retryMessage(messageId, retryMode = 'regenerate') {
   const message = findGroupChatMessage(messageId);
   if (!message || message.role !== 'assistant' || !state.currentId) return;
+  const runId = state.currentId;
   const parent = findGroupChatMessage(message.reply_to);
   if (!parent) {
     showToast('找不到这条回复对应的用户问题。', true);
@@ -1741,21 +2003,232 @@ async function retryMessage(messageId, retryMode = 'regenerate') {
     agent: message.sender,
     reply_to: parent.id,
   };
-  const pending = queuePendingChatMessage(state.currentId, parent.content, [], options);
+  const pending = queuePendingChatMessage(runId, parent.content, [], options);
   renderDetail();
   scrollChatToBottom();
   try {
-    await api(`/api/sessions/${encodeURIComponent(state.currentId)}/messages`, {
+    const acceptedSession = await api(`/api/sessions/${encodeURIComponent(runId)}/messages`, {
       method: 'POST',
       body: JSON.stringify({ message: parent.content, attachments: [], ...options }),
     });
     pending.delivery_status = 'accepted';
-    renderDetail();
-    showToast(retryMode === 'continue' ? '已要求 Agent 继续回复。' : '已要求 Agent 重新生成回复。');
+    if (state.detail && state.currentId === runId) {
+      state.detail.session = acceptedSession;
+      renderDetail();
+    }
+    showToast(
+      retryMode === 'continue'
+        ? '已要求 Agent 继续回复。'
+        : '旧回复已删除，正在重新生成。',
+    );
     await refreshAll();
   } catch (error) {
-    removePendingChatMessage(state.currentId, pending.client_id);
+    removePendingChatMessage(runId, pending.client_id);
+    if (state.currentId === runId) renderDetail();
+    showToast(error.message, true);
+  }
+}
+
+async function toggleMessageContext(messageId, button = null) {
+  const message = findGroupChatMessage(messageId);
+  if (!message || message.role !== 'assistant' || !state.currentId) return;
+  const included = message.include_in_context === false;
+  if (button) button.disabled = true;
+  try {
+    await api(
+      `/api/sessions/${encodeURIComponent(state.currentId)}/messages/${encodeURIComponent(message.id)}/context`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ included }),
+      },
+    );
+    showToast(included ? '已加入共同上下文。' : '已从共同上下文中排除。');
+    await refreshAll();
+  } catch (error) {
+    if (button) button.disabled = false;
+    showToast(error.message, true);
+  }
+}
+
+async function rollbackMessage(messageId, button = null) {
+  const message = findGroupChatMessage(messageId);
+  if (!message || message.role !== 'assistant' || !state.currentId) return;
+  const rollback = message.changes?.rollback;
+  if (!rollback || rollback.status === 'rolled_back') return;
+  const confirmed = window.confirm(
+    '确认回撤这条 Agent 回复产生的本轮代码改动？\n\n'
+      + '系统只会反向应用本轮记录的完整补丁；如果主工作区已经发生其他变化，回撤会停止并保留补丁。',
+  );
+  if (!confirmed) return;
+  if (button) button.disabled = true;
+  try {
+    const payload = await api(
+      `/api/sessions/${encodeURIComponent(state.currentId)}/messages/${encodeURIComponent(message.id)}/rollback`,
+      { method: 'POST', body: JSON.stringify({}) },
+    );
+    if (state.detail && payload?.session) state.detail.session = payload.session;
+    if (state.detail && payload?.group_chat) {
+      state.detail.session = state.detail.session || {};
+      state.detail.session.group_chat = payload.group_chat;
+    }
     renderDetail();
+    if (payload.rollback?.status === 'rolled_back') {
+      showToast('本轮代码改动已回撤，主工作区已恢复到 Agent 执行前。');
+    } else {
+      showToast(payload.rollback?.error || '回撤未完成，补丁已保留。', true);
+    }
+  } catch (error) {
+    if (button) button.disabled = false;
+    showToast(error.message, true);
+  }
+}
+
+function currentComparison() {
+  const chat = groupChatState();
+  return chat.comparison && typeof chat.comparison === 'object' ? chat.comparison : null;
+}
+
+function comparisonBlocksComposer(comparison = currentComparison()) {
+  return ['running', 'review', 'previewing', 'applying', 'conflict']
+    .includes(String(comparison?.status || ''));
+}
+
+function groupChatState(record = state.detail?.record, session = state.detail?.session) {
+  const sessionChat = session?.group_chat && typeof session.group_chat === 'object'
+    ? session.group_chat : null;
+  const recordChat = record?.group_chat && typeof record.group_chat === 'object'
+    ? record.group_chat : null;
+  if (!sessionChat) return recordChat || {};
+  if (!recordChat) return sessionChat;
+  const mergedMessages = mergeGroupChatMessages(sessionChat.messages, recordChat.messages);
+
+  const sessionComparison = sessionChat.comparison;
+  const recordComparison = recordChat.comparison;
+  if (!sessionComparison && recordComparison) {
+    return { ...sessionChat, messages: mergedMessages, comparison: recordComparison };
+  }
+  if (!recordComparison || typeof recordComparison !== 'object') return sessionChat;
+
+  // Session and record are updated by different paths. A browser refresh can
+  // therefore observe a live snapshot from before the last candidate finished,
+  // while the durable record already says "review". Prefer the more advanced
+  // comparison state so the selection controls cannot remain hidden/disabled.
+  const rank = { running: 0, applying: 1, review: 2, conflict: 3, applied: 4, discarded: 4 };
+  const sessionRank = rank[String(sessionComparison?.status || '')] ?? -1;
+  const recordRank = rank[String(recordComparison.status || '')] ?? -1;
+  if (recordRank > sessionRank) {
+    return { ...sessionChat, messages: mergedMessages, comparison: recordComparison };
+  }
+  if (recordRank === sessionRank && typeof sessionComparison === 'object') {
+    const candidates = { ...(recordComparison.candidates || {}) };
+    for (const agent of ['claude', 'codex']) {
+      const live = sessionComparison.candidates?.[agent];
+      const durable = candidates[agent];
+      const candidateRank = { running: 0, failed: 1, unavailable: 1, no_changes: 2, ready: 2 };
+      if ((candidateRank[String(live?.status || '')] ?? -1) > (candidateRank[String(durable?.status || '')] ?? -1)) {
+        candidates[agent] = live;
+      }
+    }
+    return {
+      ...sessionChat,
+      messages: mergedMessages,
+      comparison: { ...recordComparison, candidates },
+    };
+  }
+  return sessionChat;
+}
+
+function mergeGroupChatMessages(liveMessages, durableMessages) {
+  const live = Array.isArray(liveMessages) ? liveMessages : [];
+  const durable = Array.isArray(durableMessages) ? durableMessages : [];
+  if (!live.length) return durable;
+  if (!durable.length) return live;
+  const durableIds = new Set(durable.map((message) => String(message?.id || '')));
+  return [
+    ...durable,
+    ...live.filter((message) => !durableIds.has(String(message?.id || ''))),
+  ];
+}
+
+async function applyComparison(agent) {
+  const comparison = currentComparison();
+  if (!comparison || !state.currentId || !['claude', 'codex'].includes(agent)) return;
+  const candidate = comparison.candidates?.[agent];
+  if (!candidate || !['ready', 'no_changes'].includes(candidate.status)) return;
+  const name = agentName(agent);
+  const confirmed = window.confirm(
+    `确认采用 ${name} 的方案？\n\n`
+      + '将把该候选 Worktree 的修改应用到主工作区，保留为未提交修改，'
+      + '并清理另一候选。',
+  );
+  if (!confirmed) return;
+  const button = document.querySelector(`[data-comparison-action="apply"][data-comparison-agent="${cssEscape(agent)}"]`);
+  if (button) button.disabled = true;
+  try {
+    const payload = await api(
+      `/api/sessions/${encodeURIComponent(state.currentId)}/comparisons/${encodeURIComponent(comparison.id)}/apply`,
+      { method: 'POST', body: JSON.stringify({ agent }) },
+    );
+    if (state.detail && payload?.session) state.detail.session = payload.session;
+    if (state.detail && payload?.group_chat) {
+      state.detail.session = state.detail.session || {};
+      state.detail.session.group_chat = payload.group_chat;
+    }
+    renderDetail();
+    if (payload.comparison?.status === 'conflict') {
+      showToast(payload.comparison.error || '候选方案应用冲突，修改已保留。', true);
+    } else {
+      showToast(`已采用 ${name} 方案，修改已写入主工作区。`);
+    }
+  } catch (error) {
+    if (button) button.disabled = false;
+    showToast(error.message, true);
+  }
+}
+
+async function previewComparison(agent) {
+  const comparison = currentComparison();
+  if (!comparison || !state.currentId || !['claude', 'codex'].includes(agent)) return;
+  const candidate = comparison.candidates?.[agent];
+  if (!candidate || !['ready', 'no_changes'].includes(candidate.status)) return;
+  const button = document.querySelector(`[data-comparison-action="preview"][data-comparison-agent="${cssEscape(agent)}"]`);
+  if (button) button.disabled = true;
+  try {
+    const payload = await api(
+      `/api/sessions/${encodeURIComponent(state.currentId)}/comparisons/${encodeURIComponent(comparison.id)}/preview`,
+      { method: 'POST', body: JSON.stringify({ agent }) },
+    );
+    if (state.detail && payload?.session) state.detail.session = payload.session;
+    if (state.detail && payload?.group_chat) {
+      state.detail.session = state.detail.session || {};
+      state.detail.session.group_chat = payload.group_chat;
+    }
+    renderDetail();
+    showToast(`已在主工作区预览 ${agentName(agent)} 方案；可切换预览另一方案。`);
+  } catch (error) {
+    showToast(error.message, true);
+  } finally {
+    if (button?.isConnected) button.disabled = false;
+  }
+}
+
+async function discardComparison() {
+  const comparison = currentComparison();
+  if (!comparison || !state.currentId) return;
+  if (!window.confirm('确认放弃 A/B 候选方案？如果当前正在预览，会先恢复预览前的主工作区状态；两个候选 Worktree 将被清理。')) return;
+  try {
+    const payload = await api(
+      `/api/sessions/${encodeURIComponent(state.currentId)}/comparisons/${encodeURIComponent(comparison.id)}/discard`,
+      { method: 'POST', body: JSON.stringify({}) },
+    );
+    if (state.detail && payload?.session) state.detail.session = payload.session;
+    if (state.detail && payload?.group_chat) {
+      state.detail.session = state.detail.session || {};
+      state.detail.session.group_chat = payload.group_chat;
+    }
+    renderDetail();
+    showToast('已放弃 A/B 候选方案，主工作区未修改。');
+  } catch (error) {
     showToast(error.message, true);
   }
 }
@@ -1778,14 +2251,10 @@ function connectEvents() {
           state.currentId = update.run_id;
           state.detail = null;
           state.mainView = 'chat';
-          showToast('Agent 正在等待你的权限决定或补充信息。');
           scheduleRefresh(0);
         } else {
           selectRun(update.run_id);
-          showToast('已切换到需要权限决定或补充信息的任务。');
         }
-        notifyBrowser('Agent 需要你的操作', '请在页面中处理权限或补充问题。', update.run_id);
-        markRunUnread(update.run_id, 'Agent 需要你的操作', '请在页面中处理权限或补充问题。');
         return;
       }
       if (update.type === 'event' && update.stream_text) {
@@ -1853,24 +2322,86 @@ function handleStreamUpdate(update) {
 
 function clearStreamBuffers(runId) {
   if (!runId) return;
+  streamBufferAgents(runId).forEach((agent) => clearAgentStreamBuffers(runId, agent));
+  const feedPrefix = `stream-${runId}-`;
+  Array.from(el.artifactFeed.querySelectorAll('[data-feed-key]')).forEach((node) => {
+    const key = node.dataset.feedKey || '';
+    if (!key.startsWith(feedPrefix)) return;
+    node.remove();
+    feedHtmlCache.delete(key);
+  });
+}
+
+function streamBufferAgents(runId) {
+  const agents = new Set();
   const prefix = `${runId}:`;
+  state.streamBuffers.forEach((_text, key) => {
+    if (!key.startsWith(prefix)) return;
+    const agent = key.slice(prefix.length).split(':', 1)[0];
+    if (agent) agents.add(agent);
+  });
+  return agents;
+}
+
+function clearAgentStreamBuffers(runId, agent) {
+  const prefix = `${runId}:${agent}:`;
   Array.from(state.streamBuffers.keys()).forEach((key) => {
     if (key.startsWith(prefix)) state.streamBuffers.delete(key);
   });
 }
 
+function agentEventIsTerminal(event) {
+  const kind = String(event?.kind || '').toLowerCase();
+  const status = String(event?.status || '').toLowerCase();
+  if (kind === 'text' || kind === 'metric') return true;
+  return kind === 'lifecycle'
+    && ['completed', 'complete', 'failed', 'interrupted', 'timed_out'].includes(status);
+}
+
+function pendingReplyIsFinalizing(agentEvents, agent, activeAgents = null) {
+  if (Array.isArray(activeAgents)) {
+    const active = activeAgents.some((value) => {
+      const normalized = String(value || '').toLowerCase();
+      return normalized.includes(String(agent || '').toLowerCase());
+    });
+    if (!active) return false;
+  }
+  return agentEventIsTerminal(agentEvents?.[agent]);
+}
+
+// A chat_message SSE normally clears previews immediately. Detail polling is
+// the recovery path when that event is dropped or the browser reconnects.
+function reconcileStreamBuffers(runId, pendingReplies, runStatus, agentEvents = {}) {
+  const waiting = new Set(pendingReplies.map((reply) => String(reply.sender || '')));
+  const runActive = ACTIVE_RUN_STATUSES.has(String(runStatus || '').toLowerCase());
+  streamBufferAgents(runId).forEach((agent) => {
+    if (waiting.has(agent)) return;
+    const event = agentEvents?.[agent];
+    if (runActive && !agentEventIsTerminal(event)) return;
+    clearAgentStreamBuffers(runId, agent);
+  });
+}
+
+function streamTextByAgent(runId) {
+  const combined = new Map();
+  state.streamBuffers.forEach((text, key) => {
+    const [run, agent] = key.split(':');
+    if (run !== String(runId) || !agent || !text) return;
+    const previous = combined.get(agent) || '';
+    combined.set(agent, previous ? `${previous}\n\n${text}` : text);
+  });
+  return combined;
+}
+
 function appendStreamToFeed(runId) {
   if (String(feedCacheRunId) !== String(runId)) return;
-  const latest = new Map();
-  state.streamBuffers.forEach((text, key) => {
-    const [run, agent, step] = key.split(':');
-    if (run !== String(runId) || !text) return;
-    latest.set(`${agent}:${step || agent}`, { agent, text });
-  });
-  latest.forEach(({ agent, text }, streamKey) => {
-    const feedKey = `stream-${runId}-${streamKey.replace(':', '-')}`;
+  streamTextByAgent(runId).forEach((text, agent) => {
+    const loadingNode = el.artifactFeed.querySelector(
+      `[data-loading-agent="${cssEscape(agent)}"]`,
+    );
+    const feedKey = loadingNode?.dataset.feedKey || `stream-${runId}-${agent}`;
     const existing = el.artifactFeed.querySelector(`[data-feed-key="${feedKey}"]`);
-    const html = streamCardMarkup(feedKey, agent, text);
+    const html = streamCardMarkup(feedKey, agent, text, loadingNode ? agent : '');
     if (existing) {
       const replacement = nodeFromMarkup(html);
       if (replacement) existing.replaceWith(replacement);
@@ -1883,20 +2414,21 @@ function appendStreamToFeed(runId) {
   if (state.feedPinnedToBottom) scrollChatToBottom();
 }
 
-function streamCardMarkup(feedKey, agent, text) {
+function streamCardMarkup(feedKey, agent, text, loadingAgent = '') {
   const name = agentName(agent);
-  return `<article class="message-row message-${escapeHtml(agent)} message-loading message-streaming" data-feed-key="${escapeHtml(feedKey)}">
-    ${avatarMarkup(agent)}
-    <div class="message-main">
-      <div class="message-header">
-        <strong>${escapeHtml(name)}</strong>
-        <span class="message-role">正在生成 · 流式预览</span>
-        <span class="message-time"></span>
-      </div>
-      <span class="message-tag">实时</span>
-      <div class="markdown-body">${renderMarkdown(normalizeContent(text))}</div>
-    </div>
-  </article>`;
+  return messageCard(
+    name,
+    '正在生成 · 流式预览',
+    {
+      final_text: text,
+      loading: true,
+      streaming: true,
+      loading_agent: loadingAgent,
+      feed_key: feedKey,
+    },
+    agent,
+    '实时',
+  );
 }
 
 async function refreshAll() {
@@ -1942,9 +2474,10 @@ async function loadRuns(selectNewest = true, loadSelected = true) {
 }
 
 async function loadDetail(runId) {
+  const requestSequence = state.detailRequestSequence += 1;
   try {
     const detail = await api(`/api/runs/${encodeURIComponent(runId)}`);
-    if (state.currentId !== runId) return;
+    if (state.currentId !== runId || requestSequence !== state.detailRequestSequence) return;
     clearRunUnread(runId);
     state.detail = detail;
     restoreDraft(runId);
@@ -2405,6 +2938,13 @@ function renderEmpty() {
   el.statusBadge.textContent = '等待任务';
   el.statusBadge.dataset.status = 'waiting';
   document.title = 'MultiAgent 工作台';
+  el.quickTaskInput.disabled = false;
+  el.quickTaskSubmit.disabled = false;
+  el.quickAttach.disabled = false;
+  el.quickTaskInput.removeAttribute('aria-disabled');
+  el.quickTaskSubmit.title = '';
+  el.quickAttach.title = '为新任务添加附件';
+  el.quickAttach.setAttribute('aria-label', el.quickAttach.title);
   closeNativeInteractionDialog();
   restoreDraft(null);
 }
@@ -2433,6 +2973,27 @@ function renderDetail() {
   el.quickTaskSubmit.textContent = groupChat ? '发送消息' : '发送';
   el.quickAttach.title = groupChat ? '为这条消息添加附件' : '为新任务添加附件';
   el.quickAttach.setAttribute('aria-label', el.quickAttach.title);
+  const comparison = currentComparison();
+  const comparisonInputHint = comparison?.status === 'running'
+    ? 'A/B 对比执行中；请等待两个候选完成后再发送新执行请求。'
+    : ['review', 'previewing'].includes(comparison?.status)
+      ? 'A/B 候选待选择；可先查看两个隔离工作区，再采用其中一个。'
+      : '';
+  if (comparisonInputHint) el.quickTaskInput.placeholder = comparisonInputHint;
+  const comparisonLocksComposer = comparisonBlocksComposer(comparison);
+  el.quickTaskInput.disabled = comparisonLocksComposer;
+  el.quickTaskSubmit.disabled = comparisonLocksComposer;
+  el.quickAttach.disabled = comparisonLocksComposer;
+  el.quickTaskInput.setAttribute('aria-disabled', String(comparisonLocksComposer));
+  el.quickTaskSubmit.title = comparisonLocksComposer
+    ? '请先完成 A/B 方案的预览、采用或放弃'
+    : '';
+  el.quickAttach.title = comparisonLocksComposer
+    ? '请先完成 A/B 方案的预览、采用或放弃'
+    : groupChat ? '为这条消息添加附件' : '为新任务添加附件';
+  el.quickAttach.setAttribute('aria-label', el.quickAttach.title);
+  if (comparisonLocksComposer) hideMentionMenu();
+  updateComparisonComposeHint();
   if (!groupChat) hideMentionMenu();
 
   const error = detached
@@ -2462,17 +3023,34 @@ function renderAgentStatus(container, navDot, key, name, session, runStatus) {
   const interaction = (session?.native_interactions || []).find(
     (request) => agentKeyFromName(request.source) === key,
   );
+  const activeAgents = Array.isArray(session?.active_agents)
+    ? session.active_agents.map((agent) => String(agent).toLowerCase())
+    : [];
+  const agentActive = activeAgents.includes(key);
+  const eventValue = String(event?.status || '').toLowerCase();
+  const terminalEvent = eventValue && (
+    eventValue.includes('complete')
+    || eventValue.includes('fail')
+    || eventValue.includes('error')
+    || eventValue.includes('cancel')
+    || eventValue.includes('interrupt')
+    || eventValue === 'done'
+    || eventValue === 'resolved'
+    || eventValue === 'rejected'
+    || eventValue === 'skipped'
+  );
   const stopping = runStatus === 'stopping';
   const eventStatus = stopping
     ? 'stopping'
     : interaction ? 'waiting_user'
-      : runStatus === 'awaiting_interaction' ? event?.status || 'waiting'
-        : event?.status || (runStatus === 'complete' ? 'complete' : runStatus);
+      : agentActive ? terminalEvent ? event.status : 'working'
+        : terminalEvent ? event.status : 'waiting';
   const detail = stopping
     ? fallbackAgentDetail(name, runStatus)
     : interaction ? `${name} 正在等待你的权限决定或补充信息`
-      : runStatus === 'awaiting_interaction' && !event ? `${name} 当前未被此请求阻塞`
-        : event?.safe_summary || fallbackAgentDetail(name, runStatus);
+      : agentActive ? event?.safe_summary || fallbackAgentDetail(name, runStatus)
+        : terminalEvent ? event?.safe_summary || fallbackAgentDetail(name, runStatus)
+          : `${name} 当前未参与本轮回复`;
   const elapsed = Number(event?.elapsed_seconds);
   container.innerHTML = `
     <div class="agent-status-title">
@@ -2498,7 +3076,16 @@ function renderNativeInteraction(session) {
     ? session.native_interactions
     : [];
   const request = requests[0];
-  if (!request) {
+  const activeAgents = Array.isArray(session?.active_agents)
+    ? session.active_agents.map((agent) => String(agent).toLowerCase())
+    : [];
+  const requestAgent = agentKeyFromName(request?.source);
+  const requestIsLive = Boolean(
+    request
+    && ACTIVE_RUN_STATUSES.has(String(session?.status || '').toLowerCase())
+    && (!activeAgents.length || !requestAgent || activeAgents.includes(requestAgent))
+  );
+  if (!requestIsLive) {
     closeNativeInteractionDialog();
     return;
   }
@@ -2511,10 +3098,13 @@ function renderNativeInteraction(session) {
     && el.nativeInteractionDialog.open
   ) return;
 
+  const requestLabel = request.title || '等待你的确认';
+  showToast(`${request.source || 'Agent'} 正在等待你的权限决定或补充信息。`);
+  notifyBrowser('Agent 需要你的操作', requestLabel, state.currentId || '');
   state.nativeInteractionId = request.id;
   state.nativeInteractionRunId = state.currentId;
   el.nativeInteractionSource.textContent = `${request.source || 'Agent'} · 原生交互请求`;
-  el.nativeInteractionTitle.textContent = request.title || '等待你的确认';
+  el.nativeInteractionTitle.textContent = requestLabel;
   el.nativeInteractionQueue.textContent = requests.length > 1
     ? `还有 ${requests.length - 1} 个请求正在排队`
     : '';
@@ -2616,12 +3206,25 @@ function renderArtifacts(record, session) {
 }
 
 function renderGroupChat(record, session) {
-  const chat = session?.group_chat || record.group_chat || {};
-  const serverMessages = Array.isArray(chat.messages) ? chat.messages : [];
+  const chat = groupChatState(record, session);
+  const rawServerMessages = Array.isArray(chat.messages) ? chat.messages : [];
+  const runId = record.id || state.currentId || 'current';
+  const runStatus = session?.status || record.status;
   const pendingTurns = reconcilePendingChatMessages(
-    record.id || state.currentId || 'current',
-    serverMessages,
-    session?.status || record.status,
+    runId,
+    rawServerMessages,
+    runStatus,
+    session,
+  );
+  const replacedMessageIds = new Set(
+    pendingTurns
+      .filter((turn) => turn.retry_of && turn.retry_mode === 'regenerate')
+      .map((turn) => String(turn.retry_of)),
+  );
+  const serverMessages = dedupeGroupChatMessages(rawServerMessages)
+    .filter((message) => !replacedMessageIds.has(String(message.id || '')));
+  const serverReplyKeys = new Set(
+    serverMessages.map(groupChatReplyKey).filter(Boolean),
   );
   const pendingUsers = pendingTurns.filter((message) => !message.server_user_id && !message.hidden);
   const pendingReplies = pendingTurns.flatMap((turn) => (
@@ -2633,15 +3236,30 @@ function renderGroupChat(record, session) {
       recipients: ['user'],
       created_at: turn.created_at,
       action: turn.action,
+      retry_of: turn.retry_of || '',
+      retry_mode: turn.retry_mode || '',
       loading_reply: true,
       reply_to: turn.server_user_id || turn.client_id,
-    }))
+    })).filter((reply) => !serverReplyKeys.has(groupChatReplyKey(reply)))
   ));
+  reconcileStreamBuffers(
+    runId,
+    pendingReplies,
+    runStatus,
+    session?.agent_events || {},
+  );
+  const streamedReplies = streamTextByAgent(runId);
   const messages = orderGroupChatMessages(serverMessages, pendingUsers, pendingReplies)
     .filter((message) => !message.hidden);
-  const runId = record.id || state.currentId || 'current';
   state.messageTexts.clear();
-  const entries = messages.map((message, index) => {
+  const entries = [];
+  const comparison = chat.comparison;
+  // Candidate final replies are ordinary group-chat messages.  They must stay in
+  // the feed even when an A/B comparison exists; filtering them by
+  // response_message_id made completed Claude/Codex turns disappear whenever the
+  // comparison panel was scrolled out of view.  The comparison panel below is
+  // only for status, diff and preview/apply actions.
+  const messageEntries = messages.map((message, index) => {
     const sender = message.sender || 'system';
     const user = sender === 'user';
     const recipients = Array.isArray(message.recipients) ? message.recipients : [];
@@ -2652,26 +3270,46 @@ function renderGroupChat(record, session) {
     const execution = message.action === 'execute';
     const optimistic = message.optimistic === true;
     const loadingReply = message.loading_reply === true;
+    const streamText = loadingReply ? streamedReplies.get(sender) || '' : '';
+    const streamingReply = Boolean(streamText);
+    const finalizingReply = loadingReply
+      && pendingReplyIsFinalizing(
+        session?.agent_events || {},
+        sender,
+        session?.active_agents,
+      );
+    const confirmingStream = streamingReply
+      && finalizingReply;
     const failureReason = String(message.failure_reason || '');
     const failedReply = message.status === 'failed' || Boolean(failureReason);
+    const recalled = message.recalled === true;
+    const contextStatus = message.include_in_context === false
+      ? '未加入共同上下文'
+      : '共享给所有成员';
     const feedKey = `msg-${message.id || message.client_id || `${sender}-${index}`}`;
-    const role = loadingReply
+    const role = recalled
+      ? '消息已撤回'
+      : streamingReply
+      ? confirmingStream ? '回复已生成 · 正在确认文件变更' : '正在生成 · 文件变更待确认'
+      : finalizingReply
+      ? '回复已生成 · 正在确认文件变更'
+      : loadingReply
       ? '正在回复 · 等待内容'
       : failedReply
-      ? `${failureReason === 'timeout' ? '响应超时' : '回复失败'} · 共享给所有成员`
+      ? `${failureReason === 'timeout' ? '响应超时' : failureReason === 'model_incompatible' ? '模型不兼容' : '回复失败'} · ${contextStatus}`
       : optimistic
       ? message.delivery_status === 'accepted' ? '已发送 · 等待 Agent 回复' : '正在发送到群聊'
       : user
       ? `${message.edited_from ? '编辑后重新发送' : execution ? '执行请求' : '讨论消息'} · 发送给 ${recipientNames || '群聊'}`
       : message.retry_of
-      ? `${message.retry_mode === 'continue' ? '继续回复' : '重新生成'} · 共享给所有成员`
-      : execution ? '目标工作区执行结果 · 共享给所有成员' : '群聊回复 · 共享给所有成员';
+      ? `${message.retry_mode === 'continue' ? '继续回复' : '重新生成'} · ${contextStatus}`
+      : execution ? `目标工作区执行结果 · ${contextStatus}` : `群聊回复 · ${contextStatus}`;
     const html = messageCard(
       user ? '你' : agentName(sender),
       role,
       {
-        final_text: message.content || '',
-        attachments: message.attachments || [],
+        final_text: recalled ? '消息已撤回' : streamText || message.content || '',
+        attachments: recalled ? [] : message.attachments || [],
         duration_seconds: message.duration_seconds || 0,
         created_at: message.created_at || '',
         workspace: message.workspace || '',
@@ -2681,28 +3319,189 @@ function renderGroupChat(record, session) {
         retry_of: message.retry_of || '',
         pending: optimistic,
         loading: loadingReply,
+        finalizing: finalizingReply,
+        streaming: streamingReply,
+        loading_agent: loadingReply ? sender : '',
         failed: failedReply,
+        recalled,
+        context_included: message.include_in_context !== false,
         feed_key: feedKey,
-        quotable: !optimistic && !loadingReply && !failedReply,
+        quotable: !recalled && !optimistic && !loadingReply && !failedReply,
         run_id: runId,
       },
       user ? 'user' : sender,
-      loadingReply
+      streamingReply
+        ? confirmingStream ? '确认中' : '实时'
+        : finalizingReply
+        ? '确认中'
+        : loadingReply
         ? '回复中'
         : failedReply
-        ? failureReason === 'timeout' ? '超时' : '失败'
+        ? failureReason === 'timeout' ? '超时' : failureReason === 'model_incompatible' ? '不兼容' : '失败'
         : optimistic
         ? message.delivery_status === 'accepted' ? '已发送' : '发送中'
         : execution ? (user ? '执行' : '执行结果') : (user ? '消息' : '回复'),
     );
-    return { key: feedKey, html };
+    return { key: feedKey, html, message };
   });
+  entries.push(...messageEntries.map(({ key, html }) => ({ key, html })));
+  // Keep the review controls after the candidate response bubbles, rather than
+  // after the entire feed. Later messages must appear below the large panel.
+  if (comparison && typeof comparison === 'object') {
+    const candidateIds = new Set(
+      Object.values(comparison.candidates || {})
+        .map((candidate) => String(candidate?.response_message_id || ''))
+        .filter(Boolean),
+    );
+    const triggerId = String(comparison.trigger_message_id || '');
+    let afterIndex = -1;
+    messageEntries.forEach((entry, index) => {
+      const message = entry.message || {};
+      const isCandidateReply = candidateIds.has(String(message.id || ''));
+      const isTurnReply = !candidateIds.size
+        && triggerId
+        && String(message.reply_to || '') === triggerId
+        && ['claude', 'codex'].includes(String(message.sender || ''));
+      if (isCandidateReply || isTurnReply || String(message.id || '') === triggerId) {
+        afterIndex = index;
+      }
+    });
+    // A stale live snapshot can contain the comparison record before the
+    // corresponding reply messages arrive. Never put the large panel at the
+    // top in that case; keep it after the trigger or at the end of the feed.
+    if (afterIndex < 0 && triggerId) {
+      afterIndex = messageEntries.findIndex(
+        (entry) => String(entry.message?.id || '') === triggerId,
+      );
+    }
+    if (afterIndex < 0) afterIndex = messageEntries.length - 1;
+    entries.splice(afterIndex + 1, 0, {
+      key: `comparison-${comparison.id || runId}`,
+      html: comparisonMarkup(comparison, runId),
+    });
+  }
   patchFeed(runId, entries, `<div class="chat-empty">
     <span class="chat-empty-mark" aria-hidden="true">@</span>
     <strong>发送第一条消息开始群聊</strong>
     <small>输入 @ 可选择响应者，也可以直接发送给默认成员；附件支持点击、拖放或粘贴图片。</small>
   </div>`);
   appendStreamToFeed(runId);
+}
+
+function comparisonMarkup(comparison, runId) {
+  const candidates = comparison?.candidates && typeof comparison.candidates === 'object'
+    ? comparison.candidates : {};
+  const status = String(comparison?.status || 'running');
+  const terminal = ['review', 'previewing', 'applied', 'conflict', 'discarded'].includes(status);
+  const statusLabelText = {
+    running: '正在执行 · 主工作区尚未修改',
+    review: '两个候选已完成 · 等待你选择',
+    applying: '正在应用所选方案',
+    previewing: `正在主工作区预览 ${agentName(comparison?.preview?.active_agent || '')} 方案`,
+    applied: `已采用 ${agentName(comparison?.selected_agent || '')} 方案`,
+    conflict: '应用冲突 · 主工作区未被覆盖',
+    discarded: '已放弃 · 主工作区未修改',
+  }[status] || '处理中';
+  const mainWorkspace = state.detail?.session?.workspace || state.detail?.record?.workspace || '';
+  const conflictNotice = status === 'conflict'
+    ? `<div class="comparison-panel-notice comparison-panel-conflict"><strong>无法安全应用候选方案</strong><span>${escapeHtml(comparison?.error || '主工作区已经发生变化，为避免覆盖现有文件，本次应用已停止。')}</span>${comparison?.recovery_patch ? `<code>${escapeHtml(comparison.recovery_patch)}</code><button class="secondary-button" type="button" data-comparison-action="copy-recovery">复制恢复补丁路径</button>` : ''}</div>`
+    : status === 'applied'
+      ? `<div class="comparison-panel-notice comparison-panel-success"><strong>已采用 ${escapeHtml(agentName(comparison?.selected_agent || ''))} 方案，修改已写入主工作区</strong><span>当前仍是未提交 Git 的修改；未选中的候选 Worktree 已清理。</span>${mainWorkspace ? `<code>${escapeHtml(mainWorkspace)}</code>` : ''}</div>`
+      : '';
+  const previewNotice = status === 'previewing'
+    ? `<div class="comparison-panel-notice comparison-panel-preview"><strong>当前主工作区正在显示 ${escapeHtml(agentName(comparison?.preview?.active_agent || ''))} 方案</strong><span>切换预览会先恢复对比基线，再应用另一套候选修改；主工作区未正式采用任何方案。</span></div>`
+    : '';
+  const selectableAgents = ['claude', 'codex'].filter((agent) => {
+    const candidate = candidates[agent];
+    return candidate && ['ready', 'no_changes'].includes(String(candidate.status || ''));
+  });
+  const candidatesFinished = ['claude', 'codex'].every((agent) => {
+    const candidate = candidates[agent];
+    return candidate && ['ready', 'no_changes', 'failed', 'unavailable'].includes(String(candidate.status || ''));
+  });
+  const selectionNotice = ['running', 'review', 'previewing'].includes(status) && selectableAgents.length
+    ? `<div class="comparison-selection-notice"><strong>${status === 'running' ? '已完成的候选可以先预览' : status === 'previewing' ? '可以切换预览或正式采用当前实现' : '先在主工作区查看 A/B 效果'}</strong><span>${status === 'running' ? '预览会临时替换主工作区；另一个 Agent 完成后，才可以正式采用方案。' : '预览只临时替换主工作区文件，不会自动提交；确认后再点击“采用”。'}</span><div class="comparison-selection-actions">${selectableAgents.map((agent) => `<button class="secondary-button" type="button" data-comparison-action="preview" data-comparison-agent="${agent}">预览 ${escapeHtml(agentName(agent))}</button>${candidatesFinished ? `<button class="primary-button" type="button" data-comparison-action="apply" data-comparison-agent="${agent}">采用 ${escapeHtml(agentName(agent))}</button>` : ''}`).join('')}${status !== 'running' ? '<button class="secondary-button" type="button" data-comparison-action="discard">放弃全部</button>' : ''}</div></div>`
+    : '';
+  const headerNotice = status === 'previewing'
+    ? '当前只是临时预览，确认采用后才会结束对比。'
+    : '主工作区在你选择前不会被修改。';
+  const cards = ['claude', 'codex'].map((agent) => {
+    const candidate = candidates[agent] && typeof candidates[agent] === 'object'
+      ? candidates[agent] : {};
+    const candidateStatus = String(candidate.status || 'running');
+    const candidateLabel = candidate.apply_status === 'applied'
+      ? '已采用'
+      : candidate.apply_status === 'discarded'
+        ? '已清理 · 未采用'
+        : status === 'running' && ['ready', 'no_changes'].includes(candidateStatus)
+          ? candidateStatus === 'no_changes' ? '已完成 · 可预览（无文件修改）' : '已完成 · 可预览'
+        : {
+      running: '正在执行',
+      ready: '可以查看和采用',
+      no_changes: '已完成 · 没有文件修改',
+      failed: '执行失败',
+      unavailable: '候选不可用',
+        }[candidateStatus] || candidateStatus;
+    const changes = candidate.changes;
+    const usable = ['ready', 'no_changes'].includes(candidateStatus);
+    const applyDisabled = !usable || !terminal || !['review', 'previewing', 'conflict'].includes(status);
+    const previewDisabled = !usable || !['running', 'review', 'previewing'].includes(status);
+    const isPreviewed = comparison?.preview?.active_agent === agent;
+    const commands = Array.isArray(candidate.preview_commands)
+      ? candidate.preview_commands.join('\n') : '';
+    const error = candidate.error ? `<div class="comparison-error">${escapeHtml(candidate.error)}</div>` : '';
+    const candidateCleaned = candidate.cleaned === true
+      || ['applied', 'discarded'].includes(status)
+      || ['applied', 'discarded'].includes(String(candidate.apply_status || ''));
+    const workspaceLabel = candidateCleaned
+      ? '已清理（临时工作区已删除）'
+      : candidate.workspace || '准备中';
+    const workspaceTitle = candidateCleaned ? '' : candidate.workspace || '';
+    const copyPathDisabled = candidateCleaned || !candidate.workspace;
+    const copyCommandsDisabled = candidateCleaned || !commands;
+    const canInspectCandidate = usable
+      && !candidateCleaned
+      && ['running', 'review', 'previewing', 'conflict'].includes(status);
+    const previewLabel = candidateCleaned
+      ? '候选已清理'
+      : isPreviewed ? '已在主工作区预览' : '在主工作区预览';
+    const applyLabel = candidateCleaned
+      ? candidate.apply_status === 'applied' ? '已采用' : '已清理'
+      : '采用此方案';
+    // The final answer is rendered once as a normal group-chat bubble above.
+    // Keeping a second copy inside the candidate card caused confusing duplicate
+    // bubbles and made it look as if one agent had not replied.  The card now
+    // focuses on the candidate's workspace, diff and preview/apply controls.
+    return `<article class="comparison-candidate comparison-${agent}">
+      <header class="comparison-candidate-header">
+        <div><span class="comparison-kicker">方案 ${agent === 'claude' ? 'A' : 'B'}</span><strong>${escapeHtml(agentName(agent))}</strong></div>
+        <span class="comparison-candidate-status status-${escapeHtml(candidateStatus)}">${escapeHtml(candidateLabel)}</span>
+      </header>
+      <div class="comparison-workspace"><span>隔离工作区</span><code title="${escapeHtml(workspaceTitle)}">${escapeHtml(workspaceLabel)}</code></div>
+      ${isPreviewed ? '<div class="comparison-preview-active">当前主工作区正在显示此方案</div>' : ''}
+      ${changes ? changeSummaryMarkup(changes, `comparison-${runId}-${agent}`) : ''}
+      ${error}
+      ${canInspectCandidate ? `<details class="comparison-guide" open>
+        <summary>如何查看实现效果</summary>
+        <ol><li>打开终端进入上面的隔离工作区。</li><li>执行项目自己的测试或预览命令。</li><li>确认效果后回到这里选择采用方案。</li></ol>
+        <pre><code>${escapeHtml(commands || 'git status --short\ngit diff --stat\ngit diff\ngit diff --check')}</code></pre>
+      </details>` : ''}
+      <div class="comparison-actions">
+        <button class="secondary-button" type="button" data-comparison-action="copy-path" data-comparison-agent="${agent}"${copyPathDisabled ? ' disabled' : ''}>${candidateCleaned ? '路径已清理' : '复制路径'}</button>
+        <button class="secondary-button" type="button" data-comparison-action="copy-commands" data-comparison-agent="${agent}"${copyCommandsDisabled ? ' disabled' : ''}>${candidateCleaned ? '命令已失效' : '复制查看命令'}</button>
+        <button class="secondary-button" type="button" data-comparison-action="preview" data-comparison-agent="${agent}"${previewDisabled ? ' disabled' : ''}>${previewLabel}</button>
+        <button class="primary-button" type="button" data-comparison-action="apply" data-comparison-agent="${agent}"${applyDisabled ? ' disabled' : ''}>${applyLabel}</button>
+      </div>
+    </article>`;
+  }).join('');
+  return `<section class="comparison-panel" data-feed-key="comparison-${escapeHtml(comparison?.id || runId)}">
+    <header class="comparison-panel-header"><div><span class="comparison-kicker">A/B 对比执行</span><strong>两个候选都从同一工作区快照开始</strong><small>${escapeHtml(headerNotice)}</small></div><span class="comparison-panel-status">${escapeHtml(statusLabelText)}</span></header>
+    ${conflictNotice}
+    ${previewNotice}
+    ${selectionNotice}
+    <div class="comparison-candidates">${cards}</div>
+    <footer class="comparison-panel-footer"><span>${status === 'review' ? '可分别预览 A、B 的实现效果，再决定采用哪一个。' : status === 'previewing' ? '主工作区当前只临时显示一个候选方案，切换不会提交 Git。' : status === 'applied' ? '所选方案已保留为主工作区中的未提交修改。' : status === 'discarded' ? '两个候选已清理，主工作区未修改。' : '候选工作区只在采用或放弃后清理。'}</span><div class="comparison-footer-actions">${mainWorkspace ? '<button class="secondary-button" type="button" data-comparison-action="copy-main-path">复制主工作区路径</button>' : ''}<button class="secondary-button" type="button" data-comparison-action="refresh">重新检查</button><button class="secondary-button" type="button" data-comparison-action="discard"${['running', 'applying', 'applied', 'discarded'].includes(status) ? ' disabled' : ''}>放弃全部方案</button></div></footer>
+  </section>`;
 }
 
 const feedHtmlCache = new Map();
@@ -2792,11 +3591,16 @@ function messageCard(name, role, result, agent, tag, details = false, highlight 
   const changes = result.changes;
   const pending = result.pending === true;
   const loading = result.loading === true;
+  const finalizing = result.finalizing === true;
+  const streaming = result.streaming === true;
   const failed = result.failed === true;
+  const recalled = result.recalled === true;
+  const contextIncluded = result.context_included !== false;
   const feedKey = String(result.feed_key || '');
+  const loadingAgent = String(result.loading_agent || '');
   if (feedKey && text) state.messageTexts.set(feedKey, String(text));
   const tools = loading || !text ? '' : messageToolsMarkup(feedKey, result.quotable === true, result.message_id || '');
-  return `<article class="message-row message-${speaker}${highlight ? ' message-highlight' : ''}${pending ? ' message-pending' : ''}${loading ? ' message-loading' : ''}${failed ? ' message-failed' : ''}"${feedKey ? ` data-feed-key="${escapeHtml(feedKey)}"` : ''}>
+  return `<article class="message-row message-${speaker}${highlight ? ' message-highlight' : ''}${pending ? ' message-pending' : ''}${loading ? ' message-loading' : ''}${streaming ? ' message-streaming' : ''}${failed ? ' message-failed' : ''}${recalled ? ' message-recalled' : ''}${!contextIncluded && speaker !== 'user' ? ' message-context-excluded' : ''}"${feedKey ? ` data-feed-key="${escapeHtml(feedKey)}"` : ''}${loadingAgent ? ` data-loading-agent="${escapeHtml(loadingAgent)}"` : ''}>
     ${avatarMarkup(agent)}
     <div class="message-main">
       <div class="message-header">
@@ -2806,8 +3610,8 @@ function messageCard(name, role, result, agent, tag, details = false, highlight 
       </div>
       ${tag ? `<span class="message-tag">${escapeHtml(tag)}</span>` : ''}
       ${workspace ? `<div class="execution-workspace"><strong>写入工作区</strong><code title="${escapeHtml(workspace)}">${escapeHtml(workspace)}</code></div>` : ''}
-      ${loading ? replyLoadingMarkup(name) : `<div class="markdown-body">${renderMarkdown(normalizeContent(text))}</div>`}
-      ${changeSummaryMarkup(changes, result.changes_key)}
+      ${loading && !streaming ? replyLoadingMarkup(name, finalizing) : `<div class="markdown-body">${renderMarkdown(normalizeContent(text))}</div>`}
+      ${changeSummaryMarkup(changes, result.changes_key, result.message_id || '')}
       ${attachmentMarkup(attachments, result.run_id)}
       ${details ? '<div class="message-actions"><button class="thread-button" data-open-detail="overview" type="button">▢ 查看详情</button></div>' : ''}
       ${tools}
@@ -2818,32 +3622,43 @@ function messageCard(name, role, result, agent, tag, details = false, highlight 
 function messageToolsMarkup(feedKey, quotable, messageId = '') {
   if (!feedKey) return '';
   const message = findGroupChatMessage(messageId || feedKey.replace(/^msg-/, ''));
+  if (message?.recalled) return '';
   const quote = quotable
     ? `<button class="message-tool" data-message-quote="${escapeHtml(feedKey)}" type="button" title="引用这条消息回复">❝ 引用</button>`
     : '';
   const edit = message?.sender === 'user' && !message.hidden
     ? `<button class="message-tool" data-message-edit="${escapeHtml(message.id)}" type="button" title="编辑后重新发送">✎ 编辑</button>`
     : '';
+  const recall = message?.sender === 'user' && !message.hidden && !message.recalled
+    ? `<button class="message-tool message-recall-tool" data-message-recall="${escapeHtml(message.id)}" type="button" title="撤回这条消息">↩ 撤回</button>`
+    : '';
   const retry = message?.role === 'assistant' && !message.hidden
     ? `<button class="message-tool" data-message-retry="${escapeHtml(message.id)}" data-retry-mode="regenerate" type="button" title="重新生成这条回复">↻ 重试</button>
        <button class="message-tool" data-message-retry="${escapeHtml(message.id)}" data-retry-mode="continue" type="button" title="继续生成这条回复">⋯ 继续</button>`
     : '';
+  const contextToggle = message?.role === 'assistant' && !message.hidden
+    ? message.include_in_context === false
+      ? `<button class="message-tool message-context-tool is-excluded" data-message-context="${escapeHtml(message.id)}" type="button" aria-pressed="false" title="重新加入共同上下文">⊘ 已排除</button>`
+      : `<button class="message-tool message-context-tool is-included" data-message-context="${escapeHtml(message.id)}" type="button" aria-pressed="true" title="从共同上下文中排除">◎ 上下文</button>`
+    : '';
   return `<div class="message-tools">
     <button class="message-tool" data-message-copy="${escapeHtml(feedKey)}" type="button" title="复制这条消息的原文">⧉ 复制</button>
+    ${contextToggle}
     ${edit}
+    ${recall}
     ${retry}
     ${quote}
   </div>`;
 }
 
-function replyLoadingMarkup(name) {
+function replyLoadingMarkup(name, finalizing = false) {
   return `<div class="reply-loading" role="status" aria-label="${escapeHtml(name)} 正在回复">
     <span class="reply-loading-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-    <span>${escapeHtml(name)} 正在思考并组织回复…</span>
+    <span>${escapeHtml(name)} ${finalizing ? '已生成最终输出，正在确认文件变更并保存回复…' : '正在思考并组织回复…'}</span>
   </div>`;
 }
 
-function changeSummaryMarkup(summary, rawKey) {
+function changeSummaryMarkup(summary, rawKey, messageId = '') {
   if (!summary || typeof summary !== 'object') return '';
   const key = String(rawKey || 'changes');
   const available = summary.available !== false;
@@ -2851,9 +3666,30 @@ function changeSummaryMarkup(summary, rawKey) {
   const fileCount = Math.max(0, Number(summary.file_count) || files.length);
   const additions = Math.max(0, Number(summary.additions) || 0);
   const deletions = Math.max(0, Number(summary.deletions) || 0);
-  const title = available
+  // A merge marker without an actual file diff is a coordinator cleanup
+  // failure, not a user-visible code conflict. Keep the UI aligned with the
+  // Agent's statement that no files were changed.
+  const hasFileChanges = available && (fileCount > 0 || files.length > 0 || additions > 0 || deletions > 0);
+  if (available && !hasFileChanges) return '';
+  const mergeConflict = summary.merge_status === 'conflict' && hasFileChanges;
+  const title = mergeConflict
+    ? 'Agent 已完成，修改未合并'
+    : available
     ? fileCount ? `已修改 ${fileCount} 个文件` : '未检测到文件修改'
     : '无法生成变更预览';
+  const mergeWarning = mergeConflict
+    ? `<div class="change-warning">隔离工作区的修改与主工作区冲突，未覆盖现有文件。已保留恢复补丁。${summary.merge_error ? `<br>${escapeHtml(summary.merge_error)}` : ''}</div>`
+    : '';
+  const rollback = summary.rollback && typeof summary.rollback === 'object'
+    ? summary.rollback : null;
+  const rollbackStatus = String(rollback?.status || 'available');
+  const rollbackControl = rollbackStatus === 'rolled_back'
+    ? `<div class="change-rollback-status">本轮代码改动已回撤。${rollback?.path ? `<button class="change-action" data-change-rollback-copy="${escapeHtml(rollback.path)}" type="button">复制回撤补丁路径</button>` : ''}</div>`
+    : rollbackStatus === 'conflict'
+      ? `<div class="change-warning">主工作区已发生变化，回撤已停止；完整补丁仍保留。${rollback?.error ? `<br>${escapeHtml(rollback.error)}` : ''}<div class="change-actions">${messageId ? `<button class="change-action change-action-danger" data-message-rollback="${escapeHtml(messageId)}" type="button">重新尝试回撤</button>` : ''}${rollback?.path ? `<button class="change-action" data-change-rollback-copy="${escapeHtml(rollback.path)}" type="button">复制回撤补丁路径</button>` : ''}</div></div>`
+      : rollback?.available && messageId
+        ? `<div class="change-actions"><button class="change-action change-action-danger" data-message-rollback="${escapeHtml(messageId)}" type="button">↶ 回撤本轮改动</button><span>仅回撤此条 Agent 回复实际写入的文件</span></div>`
+        : '';
   const body = available
     ? files.map((file) => changeFileMarkup(file, key)).join('') || '<div class="change-empty">本次执行没有产生可见的文件变化。</div>'
     : `<div class="change-empty">${escapeHtml(summary.reason || '当前工作区无法计算文件差异。')}</div>`;
@@ -2867,7 +3703,7 @@ function changeSummaryMarkup(summary, rawKey) {
       <span class="change-summary-title"><strong>${escapeHtml(title)}</strong><small><span class="change-add">+${additions}</span> <span class="change-delete">-${deletions}</span></small></span>
       <span class="change-summary-toggle">展开</span>
     </summary>
-    <div class="change-files">${truncated}${body}</div>
+    <div class="change-files">${mergeWarning}${truncated}${body}${rollbackControl}</div>
   </details>`;
 }
 
@@ -2959,7 +3795,7 @@ function renderOverview(record, session, status) {
     ['工作区', compactPath(session?.workspace || record.workspace || '')],
     ['协作模式', '群聊协作'],
     ['执行方式', '按消息中的 @ 动态指定'],
-    ['流程细节', '讨论只读 · 单 Agent 写目标工作区 · 全员共享上下文'],
+    ['流程细节', '原生 Agent 自主读写 · 并发写入自动隔离 · 全员共享上下文'],
     ['累计耗时', formatDuration(summary.elapsed_seconds || 0)],
     ['运行次数', String(record.attempts || 1)],
     ['输入令牌数', formatNumber(summary.input_tokens || 0)],
@@ -2973,12 +3809,13 @@ function renderOverview(record, session, status) {
 function renderTimeline(record, session) {
   const combined = [...(Array.isArray(record.events) ? record.events : []), ...(Array.isArray(session?.events) ? session.events : [])];
   const seen = new Set();
-  const events = combined.filter((event) => {
+  const deduped = combined.filter((event) => {
     const key = `${event.timestamp || ''}|${event.source || ''}|${event.step_id || ''}|${event.safe_summary || ''}`;
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
+  const events = coalesceActivityEvents(deduped);
   const visibleEvents = events.slice(-80).reverse();
   el.runTimeline.classList.toggle('hidden', !events.length);
   el.runTimelineCount.textContent = events.length > visibleEvents.length
@@ -2991,6 +3828,105 @@ function renderTimeline(record, session) {
   el.eventTimeline.innerHTML = visibleEvents.map(renderActivityEvent).join('');
 }
 
+function activityEventKey(event) {
+  const id = String(event?.activity?.id || '');
+  if (!id) return '';
+  return `${event.source || ''}:${event.step_id || ''}:${id}`;
+}
+
+function activityFallbackKey(event) {
+  const type = String(event?.activity?.type || 'tool');
+  return `${event?.source || ''}:${event?.step_id || ''}:${type}`;
+}
+
+function activityStepKey(event) {
+  return `${event?.source || ''}:${event?.step_id || ''}`;
+}
+
+function normalizedActivityStatus(event) {
+  const status = String(event?.status || '').toLowerCase();
+  if (
+    event?.kind === 'tool_result'
+    && ['working', 'starting', 'waiting_model', 'in_progress', ''].includes(status)
+  ) return 'completed';
+  return status || 'completed';
+}
+
+function coalesceActivityEvents(events) {
+  const merged = [];
+  const startsById = new Map();
+  const startsByType = new Map();
+  const startsByStep = new Map();
+  const terminalByStep = new Map();
+  events.forEach((event) => {
+    const status = String(event?.status || '').toLowerCase();
+    if (
+      ['completed', 'failed', 'interrupted', 'cancelled', 'canceled'].includes(status)
+      && ['lifecycle', 'text', 'error'].includes(event?.kind)
+    ) terminalByStep.set(activityStepKey(event), status);
+    if (!event?.activity || !['tool', 'tool_result'].includes(event.kind)) {
+      merged.push(event);
+      return;
+    }
+    const exactKey = activityEventKey(event);
+    const fallbackKey = activityFallbackKey(event);
+    if (event.kind === 'tool') {
+      const index = merged.length;
+      merged.push(event);
+      if (exactKey) startsById.set(exactKey, index);
+      const queue = startsByType.get(fallbackKey) || [];
+      queue.push(index);
+      startsByType.set(fallbackKey, queue);
+      const stepKey = activityStepKey(event);
+      const stepQueue = startsByStep.get(stepKey) || [];
+      stepQueue.push(index);
+      startsByStep.set(stepKey, stepQueue);
+      return;
+    }
+
+    let startIndex = exactKey ? startsById.get(exactKey) : undefined;
+    if (startIndex === undefined) {
+      const queue = startsByType.get(fallbackKey) || [];
+      while (queue.length && merged[queue[0]]?.kind !== 'tool') queue.shift();
+      startIndex = queue.shift();
+    }
+    if (startIndex === undefined) {
+      const queue = startsByStep.get(activityStepKey(event)) || [];
+      while (queue.length && merged[queue[0]]?.kind !== 'tool') queue.shift();
+      startIndex = queue.shift();
+    }
+    if (startIndex === undefined) {
+      merged.push(event);
+      return;
+    }
+    const start = merged[startIndex];
+    merged[startIndex] = {
+      ...start,
+      kind: 'tool_result',
+      status: normalizedActivityStatus(event),
+      timestamp: event.timestamp || start.timestamp,
+      elapsed_seconds: event.elapsed_seconds ?? start.elapsed_seconds,
+      safe_summary: event.safe_summary || start.safe_summary,
+      activity: {
+        ...start.activity,
+        result_detail: event.activity.detail || '',
+        result_label: event.activity.detail_label || '结果',
+      },
+    };
+    if (exactKey) startsById.delete(exactKey);
+  });
+  return merged.map((event) => {
+    if (event?.kind !== 'tool') return event;
+    const terminal = terminalByStep.get(activityStepKey(event));
+    if (!terminal) return event;
+    return {
+      ...event,
+      kind: 'tool_result',
+      status: terminal === 'completed' ? 'completed' : 'failed',
+    };
+  });
+}
+
 function renderActivityEvent(event) {
   const activity = event.activity && typeof event.activity === 'object' ? event.activity : null;
   if (!activity) {
@@ -3000,11 +3936,16 @@ function renderActivityEvent(event) {
       <small>${escapeHtml(stepLabel(event.step_id) || eventKindLabel(event.kind, ''))} · ${escapeHtml(formatEventTime(event.timestamp))}</small>
     </div>`;
   }
+  const eventStatus = normalizedActivityStatus(event);
   const type = ['command', 'file_change', 'read', 'search', 'tool'].includes(activity.type) ? activity.type : 'tool';
   const detail = String(activity.detail || '').trim();
-  const open = detail && ['working', 'starting', 'waiting_model'].includes(String(event.status || '')) ? ' open' : '';
+  const open = detail && ['working', 'starting', 'waiting_model'].includes(eventStatus) ? ' open' : '';
   const detailMarkup = detail
     ? `<div class="activity-card-body"><span>${escapeHtml(activity.detail_label || '详情')}</span><pre><code>${escapeHtml(detail)}</code></pre></div>`
+    : '';
+  const resultDetail = String(activity.result_detail || '').trim();
+  const resultMarkup = resultDetail
+    ? `<div class="activity-card-body activity-card-result"><span>${escapeHtml(activity.result_label || '结果')}</span><pre><code>${escapeHtml(resultDetail)}</code></pre></div>`
     : '';
   const toolName = activity.tool_name ? `<span class="activity-tool-name">${escapeHtml(activity.tool_name)}</span>` : '';
   return `<details class="activity-card activity-${type} ${detail ? 'activity-expandable' : 'activity-static'}"${open}>
@@ -3012,9 +3953,9 @@ function renderActivityEvent(event) {
       <span class="activity-icon" aria-hidden="true">${activityIcon(type)}</span>
       <span class="activity-heading"><strong>${escapeHtml(activity.title || eventKindLabel(event.kind))}</strong><small>${escapeHtml(eventSourceLabel(event.source))} · ${escapeHtml(formatEventTime(event.timestamp))}</small></span>
       ${toolName}
-      <span class="activity-state"><span class="status-dot status-${statusKey(event.status)}"></span>${escapeHtml(activityStatusLabel(event.status))}</span>
+      <span class="activity-state"><span class="status-dot status-${statusKey(eventStatus)}"></span>${escapeHtml(activityStatusLabel(eventStatus))}</span>
     </summary>
-    ${detailMarkup}
+    ${detailMarkup}${resultMarkup}
   </details>`;
 }
 
@@ -3039,10 +3980,8 @@ function renderAgentProfile() {
   const persistedEvent = persistedEvents.filter((item) => agentKeyFromName(item.source) === key).at(-1);
   const event = session.agent_events?.[key] || persistedEvent;
   const status = event?.status || session.status || record.status || 'waiting';
-  const role = key === 'claude'
-    ? '需求分析与协作伙伴'
-    : '工程实现与验证协作伙伴';
-  const coordinator = '按消息点名参与，写权限随本轮动态授予';
+  const role = '群聊协作';
+  const coordinator = '按消息点名参与，Agent 自行决定读取、修改与验证范围';
   el.agentProfile.innerHTML = `<div class="agent-profile-card">
     ${avatarMarkup(key)}
     <h2>${escapeHtml(name)} <span class="status-dot status-${statusKey(status)}"></span></h2>
@@ -3181,6 +4120,7 @@ function statusKey(status) {
   if (value.includes('interrupt')) return 'interrupted';
   if (value.includes('cancel') || value === 'blocked') return 'cancelled';
   if (value === 'awaiting_interaction' || value === 'waiting_user') return 'awaiting_interaction';
+  if (value === 'waiting_model') return 'running';
   if (value.includes('await')) return 'working';
   if (value === 'stopping') return 'cancelled';
   if (value.includes('run') || value.includes('work') || value.includes('progress') || value === 'starting') return 'running';

@@ -88,6 +88,7 @@ class AgentEventProtocolTests(unittest.TestCase):
             safe_summary="Codex · 正在执行命令",
             metadata={
                 "activity_type": "command",
+                "activity_id": "tool-123",
                 "tool_name": "Bash",
                 "command": "OPENAI_API_KEY=sk-live-secret pytest -q",
             },
@@ -97,6 +98,7 @@ class AgentEventProtocolTests(unittest.TestCase):
 
         self.assertEqual(payload["text"], "Codex · 正在执行命令")
         self.assertEqual(payload["activity"]["title"], "执行命令")
+        self.assertEqual(payload["activity"]["id"], "tool-123")
         self.assertIn("pytest -q", payload["activity"]["detail"])
         self.assertNotIn("sk-live-secret", payload["activity"]["detail"])
         self.assertNotIn("OPENAI_API_KEY=sk-live-secret", payload["activity"]["detail"])

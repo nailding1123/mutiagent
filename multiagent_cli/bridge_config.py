@@ -14,6 +14,8 @@ from .bridge_models import (
     DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY,
     AgentCommandSettings,
     BridgeSettings,
+    ContextCompactionSettings,
+    normalize_group_chat_identity,
 )
 from .token_api import (
     DEFAULT_TOKEN_API_BASE_URL,
@@ -78,18 +80,20 @@ def resolve_bridge_settings(
         raise ConfigError(
             "group_chat_default_agent 必须是 both、claude 或 codex"
         )
-    group_chat_execution = data.get("group_chat_execution", True)
-    if not isinstance(group_chat_execution, bool):
-        raise ConfigError("group_chat_execution 必须是布尔值")
-
     group_chat_agent_a_identity, group_chat_agent_b_identity = _resolve_identities(
         data.get("group_chat_identities", {}),
         section="group_chat_identities",
         default_a=DEFAULT_GROUP_CHAT_AGENT_A_IDENTITY,
         default_b=DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY,
     )
+    worktree = data.get("worktree", False)
+    if not isinstance(worktree, bool):
+        raise ConfigError("worktree 必须是布尔值")
     claude = _resolve_agent_settings("claude", data.get("claude", {}))
     codex = _resolve_agent_settings("codex", data.get("codex", {}))
+    context_compaction = _resolve_context_compaction_settings(
+        data.get("context_compaction", {})
+    )
     token_api = _resolve_token_api_settings(data.get("token_api", {}))
     return BridgeSettings(
         workspace=workspace_path,
@@ -99,7 +103,8 @@ def resolve_bridge_settings(
         group_chat_agent_a_identity=group_chat_agent_a_identity,
         group_chat_agent_b_identity=group_chat_agent_b_identity,
         group_chat_default_agent=group_chat_default_agent,
-        group_chat_execution=group_chat_execution,
+        worktree=worktree,
+        context_compaction=context_compaction,
         token_api=token_api,
     )
 
@@ -121,7 +126,10 @@ def _resolve_identities(
         raise ConfigError(f"{section}.agent_a 必须是非空字符串")
     if not isinstance(agent_b, str) or not agent_b.strip():
         raise ConfigError(f"{section}.agent_b 必须是非空字符串")
-    return agent_a.strip(), agent_b.strip()
+    return (
+        normalize_group_chat_identity(agent_a),
+        normalize_group_chat_identity(agent_b),
+    )
 
 
 def _resolve_agent_settings(name: str, raw: Any) -> AgentCommandSettings:
@@ -203,6 +211,39 @@ def _resolve_token_api_settings(raw: Any) -> TokenAPISettings:
     ):
         raise ConfigError("token_api.base_url 必须是无账号、查询参数和片段的 HTTP(S) URL")
     return TokenAPISettings(enabled=enabled, base_url=normalized)
+
+
+def _resolve_context_compaction_settings(raw: Any) -> ContextCompactionSettings:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("context_compaction 必须是 JSON 对象")
+    defaults = ContextCompactionSettings()
+    enabled = raw.get("enabled", defaults.enabled)
+    threshold_tokens = raw.get("threshold_tokens", defaults.threshold_tokens)
+    target_tokens = raw.get("target_tokens", defaults.target_tokens)
+    recent_messages = raw.get("recent_messages", defaults.recent_messages)
+    if not isinstance(enabled, bool):
+        raise ConfigError("context_compaction.enabled 必须是布尔值")
+    for name, value in (
+        ("threshold_tokens", threshold_tokens),
+        ("target_tokens", target_tokens),
+        ("recent_messages", recent_messages),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ConfigError(f"context_compaction.{name} 必须是正整数")
+    if target_tokens >= threshold_tokens:
+        raise ConfigError(
+            "context_compaction.target_tokens 必须小于 threshold_tokens"
+        )
+    if recent_messages > 100:
+        raise ConfigError("context_compaction.recent_messages 不能超过 100")
+    return ContextCompactionSettings(
+        enabled=enabled,
+        threshold_tokens=threshold_tokens,
+        target_tokens=target_tokens,
+        recent_messages=recent_messages,
+    )
 
 
 def _parse_command(raw: Any) -> tuple[str, ...] | None:

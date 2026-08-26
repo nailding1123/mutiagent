@@ -44,12 +44,12 @@
             <div class="section-label"><span>▼ 智能体 <em>2</em></span></div>
             <button class="dm-item" data-agent="claude" type="button">
               <span class="avatar avatar-claude avatar-small">CL</span>
-              <span class="dm-copy"><strong>Claude Code</strong><small>需求分析与协作</small></span>
+              <span class="dm-copy"><strong>Claude Code</strong><small>群聊协作</small></span>
               <span id="claude-nav-dot" class="status-dot status-waiting"></span>
             </button>
             <button class="dm-item" data-agent="codex" type="button">
               <span class="avatar avatar-codex avatar-small">CX</span>
-              <span class="dm-copy"><strong>Codex</strong><small>工程实现与验证</small></span>
+              <span class="dm-copy"><strong>Codex</strong><small>群聊协作</small></span>
               <span id="codex-nav-dot" class="status-dot status-waiting"></span>
             </button>
           </div>
@@ -72,11 +72,11 @@
           <div class="member-heading">智能体</div>
           <button class="member-card" data-agent="claude" type="button">
             <span class="avatar avatar-claude">CL</span>
-            <span><strong>Claude Code</strong><small>群聊协作者 · 需求分析</small></span>
+            <span><strong>Claude Code</strong><small>群聊协作</small></span>
           </button>
           <button class="member-card" data-agent="codex" type="button">
             <span class="avatar avatar-codex">CX</span>
-            <span><strong>Codex</strong><small>群聊协作者 · 工程验证</small></span>
+            <span><strong>Codex</strong><small>群聊协作</small></span>
           </button>
           <div class="member-heading">本地运行环境</div>
           <div class="runtime-card"><span class="status-dot status-complete"></span><span>Claude Code + Codex CLI</span></div>
@@ -117,7 +117,7 @@
             <span class="avatar avatar-codex avatar-large">CX</span>
           </div>
           <h1>在协作大厅发起一个任务</h1>
-          <p>进入群聊按 @ 点名讨论或执行；写入时始终只有一个 Agent 直接修改目标工作区。</p>
+          <p>进入群聊按 @ 点名讨论或执行；每个原生 Agent 自行判断是否需要读取、修改和验证。</p>
           <button id="empty-new-task-button" class="primary-button" type="button">＋ 新建任务</button>
         </section>
 
@@ -142,8 +142,9 @@
               <div id="composer-mention-menu" class="mention-menu hidden" role="listbox" aria-label="选择要点名的成员">
                 <button type="button" role="option" data-mention="@Claude"><span class="mention-avatar mention-avatar-claude">CL</span><span><strong>Claude Code</strong><small>单独点名 · 可按消息需要讨论或修改</small></span></button>
                 <button type="button" role="option" data-mention="@Codex"><span class="mention-avatar mention-avatar-codex">CX</span><span><strong>Codex</strong><small>单独点名 · 可按消息需要讨论或修改</small></span></button>
-                <button type="button" role="option" data-mention="@all"><span class="mention-avatar mention-avatar-all">@</span><span><strong>所有成员</strong><small>邀请双方一起讨论 · 默认只读，可申请权限</small></span></button>
+                <button type="button" role="option" data-mention="@all"><span class="mention-avatar mention-avatar-all">@</span><span><strong>所有成员</strong><small>普通消息并行讨论 · 明确执行时进入 A/B 对比</small></span></button>
               </div>
+              <div id="comparison-compose-hint" class="comparison-compose-hint hidden" role="status" aria-live="polite"></div>
               <div class="composer-toolbar">
                 <div class="composer-tools"><button id="quick-attach-button" type="button" title="添加附件" aria-label="添加附件"><span aria-hidden="true">＋</span><span>附件</span></button></div>
                 <button id="quick-settings-button" class="composer-settings" type="button">⚙ 任务设置</button>
@@ -203,13 +204,10 @@
           <div><span class="dialog-kicker">新建协作</span><h2>创建任务</h2></div>
           <button class="dialog-close" value="cancel" aria-label="关闭" type="submit" formnovalidate>×</button>
         </div>
-        <label id="task-input-field"><span id="task-input-label">第一条消息（可选）</span><textarea id="task-input" rows="6" placeholder="可以留空，创建群聊后再从底部发送第一条消息…"></textarea></label>
-        <div id="document-drop-zone" class="document-drop-zone">
+        <div class="task-create-note"><strong>直接建立空群聊</strong><span>创建后可在对话中发送消息，并按需添加附件。</span></div>
+        <label id="task-input-field" class="hidden" aria-hidden="true"><span id="task-input-label">第一条消息（已移至群聊输入框）</span><textarea id="task-input" rows="1" tabindex="-1"></textarea></label>
+        <div id="document-drop-zone" class="document-drop-zone hidden" aria-hidden="true">
           <input id="task-document-input" type="file" multiple accept=".pdf,.doc,.docx,.txt,.md,.rtf,.csv,.json,.html,.xml,.yaml,.yml,.odt,.xls,.xlsx,.ppt,.pptx,.png,.jpg,.jpeg,.gif,.webp,.bmp" />
-          <label for="task-document-input">
-            <span class="document-upload-icon" aria-hidden="true">▧</span>
-            <span><strong>添加参考文档或图片</strong><small>点击选择或拖放文件；最多 5 个，单个 10 MB，合计 20 MB</small></span>
-          </label>
         </div>
         <div id="selected-document-list" class="selected-document-list hidden" aria-live="polite"></div>
         <div class="task-defaults">
@@ -255,10 +253,16 @@
               </div>
               <div data-collaboration-only="group_chat">
                 <label><span>未点名时响应者</span><select id="settings-group-chat-default-agent"><option value="both">Claude Code + Codex</option><option value="claude">仅 Claude Code</option><option value="codex">仅 Codex</option></select></label>
+                <label class="setting-switch compact-setting-switch"><input id="settings-context-compaction-enabled" type="checkbox" /><span><strong>自动压缩共同上下文</strong><small>完整群聊仍保存在本地；达到预算后会摘要较早记录，Claude 会自动切换到承接压缩上下文的新原生会话。</small></span></label>
+                <div class="settings-number-grid">
+                  <label><span>触发预算（估算 token）</span><input id="settings-context-compaction-threshold" data-context-compaction-setting type="number" min="2" step="1" required /></label>
+                  <label><span>目标预算（估算 token）</span><input id="settings-context-compaction-target" data-context-compaction-setting type="number" min="1" step="1" required /></label>
+                  <label><span>最近原文消息数</span><input id="settings-context-compaction-recent" data-context-compaction-setting type="number" min="1" max="100" step="1" required /></label>
+                </div>
                 <div class="settings-switches">
-                  <label class="setting-switch"><input id="settings-group-chat-execution" type="checkbox" /><span><strong>允许 Agent 自主写入工作区</strong><small>单独点名一个 Agent 时，它会根据消息内容自行选择只读讨论或写入模式；纯提问、分析和审核默认只读，明确要求修改或隐含需要改动时才写入。“执行：”或 /exec 仍可明确表达执行意图；只读轮次需要额外权限时会弹窗申请。</small></span></label>
-                  <div class="setting-switch setting-static"><span class="setting-static-icon">@</span><span><strong>点名路由</strong><small>@Claude（Claude Code）、@Codex 或 @all 会覆盖默认响应者；@all 会同时通知双方并默认保持只读，额外权限由你审批。</small></span></div>
-                  <div class="setting-switch setting-static"><span class="setting-static-icon">1</span><span><strong>单写入者与隔离</strong><small>同一时间最多一个 Agent 直接写入主工作区；主工作区被占用时，另一个写入 Agent 使用唯一临时 Worktree，完成后自动合并并清理。所有实际改动都会显示在变更面板中。</small></span></div>
+                  <div class="setting-switch setting-static"><span class="setting-static-icon">@</span><span><strong>点名路由</strong><small>@Claude（Claude Code）、@Codex 或 @all 会覆盖默认响应者；@all 会同时通知双方，由各自的原生 Agent 判断是否需要修改。</small></span></div>
+                  <div class="setting-switch setting-static"><span class="setting-static-icon">A</span><span><strong>原生读写决策</strong><small>MultiAgent 不再按消息关键词切换只读或写入模式。每个 Agent 根据用户请求和自身原生规则决定读取、修改与验证范围。</small></span></div>
+                  <div class="setting-switch setting-static"><span class="setting-static-icon">1</span><span><strong>Git 写入隔离</strong><small>Git 工作区已有 Agent 写入时，另一 Agent 使用唯一临时 Worktree，完成后自动合并并清理。非 Git 目录无法隔离，并发 Agent 会共享目标目录。</small></span></div>
                   <div class="setting-switch setting-static"><span class="setting-static-icon">!</span><span><strong>原生权限与提问</strong><small>Claude Code 或 Codex 请求执行命令、修改文件、扩展权限或补充信息时，会暂停对应 Agent 并在页面弹窗；群聊中的其他 Agent 仍可继续工作。</small></span></div>
                 </div>
               </div>
@@ -290,10 +294,10 @@
                   </div>
                   <div class="agent-identity-field">
                     <label><span>群聊身份提示词</span><textarea id="settings-group-chat-agent-a-identity" rows="7" required></textarea></label>
-                    <small>只用于群聊协作；路由、只读讨论和写入规则由系统独立控制。</small>
+                    <small>只用于群聊协作；路由由系统控制，是否读取或修改由 Claude Code 自行判断。</small>
                   </div>
-                  <label class="setting-switch compact-setting-switch"><input id="settings-claude-fallback" type="checkbox" /><span><strong>超时自动切换</strong><small>每个候选模型使用下方的单次超时。</small></span></label>
-                  <label><span>单次调用超时（秒）</span><input id="settings-claude-timeout" type="number" min="1" step="1" required /></label>
+                  <label class="setting-switch compact-setting-switch"><input id="settings-claude-fallback" type="checkbox" /><span><strong>异常自动切换</strong><small>候选模型超时或请求协议不兼容时自动尝试下一个。</small></span></label>
+                  <label><span>连续无活动超时（秒）</span><input id="settings-claude-timeout" type="number" min="1" step="1" required /></label>
                   <label><span>CLI 命令</span><input id="settings-claude-command" type="text" placeholder="自动发现 claude" /></label>
                   <label><span>附加参数（每行一个）</span><textarea id="settings-claude-extra-args" rows="3"></textarea></label>
                 </article>
@@ -308,12 +312,12 @@
                   </div>
                   <div class="agent-identity-field">
                     <label><span>群聊身份提示词</span><textarea id="settings-group-chat-agent-b-identity" rows="7" required></textarea></label>
-                    <small>只用于群聊协作；路由、只读讨论和写入规则由系统独立控制。</small>
+                    <small>只用于群聊协作；路由由系统控制，是否读取或修改由 Codex 自行判断。</small>
                   </div>
                   <label class="setting-switch compact-setting-switch"><input id="settings-codex-fallback" type="checkbox" /><span><strong>超时自动切换</strong><small>每个候选模型使用下方的单次超时。</small></span></label>
                   <label><span>单次调用超时（秒）</span><input id="settings-codex-timeout" type="number" min="1" step="1" required /></label>
                   <label><span>CLI 命令</span><input id="settings-codex-command" type="text" placeholder="自动发现 codex" /></label>
-                  <label><span>附加参数（每行一个）</span><textarea id="settings-codex-extra-args" rows="3"></textarea></label>
+                  <label><span>附加参数（每行一个）</span><textarea id="settings-codex-extra-args" rows="3"></textarea><small>网页审批模式支持 -c/--config、--enable、--disable 与 --strict-config；其他仅适用于 codex exec 的参数会明确报错。</small></label>
                 </article>
               </div>
               <div class="settings-security-note">安全说明：仅把 Key 作为子进程环境变量传给 Claude Code/Codex；界面只显示是否已配置和末四位。</div>

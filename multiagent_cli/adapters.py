@@ -3,7 +3,10 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import secrets
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -14,6 +17,7 @@ from typing import Any
 from .bridge_models import (
     AgentCommandSettings,
     AgentEvent,
+    AgentModelCompatibilityError,
     AgentRunResult,
     AgentTimeoutError,
     BridgeError,
@@ -28,6 +32,178 @@ from .process_control import isolated_process_kwargs, signal_process_tree, stop_
 
 EventCallback = Callable[[AgentEvent], None]
 InteractionCallback = Callable[[NativeInteractionRequest], NativeInteractionResponse]
+
+
+class _InactivityTimeout:
+    """Kill one process after a continuous period without Agent activity."""
+
+    def __init__(self, seconds: float, on_expire: Callable[[], None]) -> None:
+        self._seconds = seconds
+        self._on_expire = on_expire
+        self._lock = threading.RLock()
+        self._timer: threading.Timer | None = None
+        self._paused = False
+        self._closed = False
+
+    def start(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            if self._closed or self._paused:
+                return
+            if self._timer is not None:
+                self._timer.cancel()
+            timer = threading.Timer(self._seconds, self._expire)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
+
+    def pause(self) -> None:
+        with self._lock:
+            self._paused = True
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+
+    def resume(self) -> None:
+        with self._lock:
+            if self._closed or not self._paused:
+                return
+            self._paused = False
+        self.reset()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+
+    def _expire(self) -> None:
+        with self._lock:
+            if self._closed or self._paused:
+                return
+            self._timer = None
+            self._closed = True
+        self._on_expire()
+
+
+class _TimeoutBridge:
+    """Pause a run timeout while Claude's MCP permission broker waits for UI."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._timeout: _InactivityTimeout | None = None
+        self._waiting = 0
+
+    def bind(self, timeout: _InactivityTimeout) -> None:
+        with self._lock:
+            self._timeout = timeout
+            waiting = self._waiting > 0
+        if waiting:
+            timeout.pause()
+
+    def unbind(self, timeout: _InactivityTimeout) -> None:
+        with self._lock:
+            if self._timeout is timeout:
+                self._timeout = None
+
+    def begin_wait(self) -> None:
+        with self._lock:
+            self._waiting += 1
+            timeout = self._timeout
+        if timeout is not None:
+            timeout.pause()
+
+    def end_wait(self) -> None:
+        with self._lock:
+            self._waiting = max(0, self._waiting - 1)
+            timeout = self._timeout if self._waiting == 0 else None
+        if timeout is not None:
+            timeout.resume()
+
+
+class _ClaudePermissionBroker:
+    def __init__(self, resolver: InteractionCallback) -> None:
+        self._resolver = resolver
+        self._temporary_directory: tempfile.TemporaryDirectory[str] | None = None
+        self._directory: Path | None = None
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+
+    def __enter__(self) -> "_ClaudePermissionBroker":
+        self._temporary_directory = tempfile.TemporaryDirectory(
+            prefix="multiagent-claude-permission-"
+        )
+        self._directory = Path(self._temporary_directory.name)
+        self._thread = threading.Thread(
+            target=self._serve,
+            name="multiagent-claude-permission",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        del exc_type
+        del exc
+        del traceback
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        if self._temporary_directory is not None:
+            self._temporary_directory.cleanup()
+
+    def command_args(self) -> tuple[str, ...]:
+        if self._directory is None:
+            raise BridgeError("Claude 权限代理尚未启动")
+        config = {
+            "mcpServers": {
+                "multiagent_permission": {
+                    "command": sys.executable,
+                    "args": ["-m", "multiagent_cli.claude_permission_mcp"],
+                    "env": {
+                        "MULTIAGENT_CLAUDE_PERMISSION_DIR": str(self._directory),
+                    },
+                }
+            }
+        }
+        return (
+            "--mcp-config",
+            json.dumps(config, ensure_ascii=False, separators=(",", ":")),
+            "--permission-prompt-tool",
+            "mcp__multiagent_permission__approve",
+        )
+
+    def _serve(self) -> None:
+        assert self._directory is not None
+        while not self._stop.is_set():
+            for request_path in self._directory.glob("request-*.json"):
+                request_id = request_path.stem.removeprefix("request-")
+                processing_path = self._directory / f"processing-{request_id}.json"
+                try:
+                    request_path.replace(processing_path)
+                except FileNotFoundError:
+                    continue
+                try:
+                    payload = json.loads(processing_path.read_text(encoding="utf-8"))
+                    if not isinstance(payload, dict):
+                        raise ValueError("permission payload must be an object")
+                    request = _claude_permission_prompt_request(payload, "Claude")
+                    response = self._resolver(request)
+                    result = _claude_permission_prompt_response(payload, response)
+                except Exception as exc:
+                    result = {"behavior": "deny", "message": str(exc)}
+                response_path = self._directory / f"response-{request_id}.json"
+                pending_path = self._directory / f".response-{request_id}.tmp"
+                pending_path.write_text(
+                    json.dumps(result, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                os.replace(pending_path, response_path)
+                processing_path.unlink(missing_ok=True)
+            self._stop.wait(0.05)
 
 
 class CodexEventParser:
@@ -90,6 +266,7 @@ class CodexEventParser:
                         "Codex",
                         "tool_result",
                         str(status),
+                        status=_tool_result_event_status(item),
                         metadata=_tool_event_metadata(item_type, item),
                     )
                 ]
@@ -109,6 +286,8 @@ class ClaudeEventParser:
         self.errors: list[str] = []
         self.input_tokens = 0
         self.output_tokens = 0
+        self._stream_prefix = ""
+        self._stream_blocks: dict[int, str] = {}
 
     def feed(self, line: str) -> list[AgentEvent]:
         data = _json_line(line)
@@ -132,6 +311,9 @@ class ClaudeEventParser:
                 return [AgentEvent("Claude", "error", text)]
             return []
 
+        if event_type == "stream_event":
+            return self._stream_events(data.get("event"))
+
         message = data.get("message")
         if not isinstance(message, dict):
             return []
@@ -146,10 +328,17 @@ class ClaudeEventParser:
                     continue
                 block_type = block.get("type")
                 if block_type == "text" and isinstance(block.get("text"), str):
-                    text = block["text"].strip()
-                    if text:
-                        self.final_text = text
-                        events.append(AgentEvent("Claude", "progress", text))
+                    text = block["text"]
+                    if text.strip():
+                        if self._stream_blocks:
+                            current = self._join_stream_text(
+                                self._stream_prefix,
+                                text,
+                            )
+                        else:
+                            current = text.strip()
+                        self.final_text = current
+                        events.append(AgentEvent("Claude", "progress", current))
                 elif block_type == "tool_use":
                     name = str(block.get("name") or "tool")
                     tool_input = block.get("input")
@@ -188,11 +377,140 @@ class ClaudeEventParser:
                     )
         return events
 
+    def _stream_events(self, raw_event: object) -> list[AgentEvent]:
+        """Convert Claude's partial-message protocol into cumulative text.
+
+        The UI session computes network deltas from cumulative progress events.
+        Keeping that contract here also makes completed assistant messages
+        harmless duplicates instead of rendering every token as a new block.
+        """
+
+        if not isinstance(raw_event, dict):
+            return []
+        stream_type = str(raw_event.get("type") or "")
+        if stream_type == "message_start":
+            current = self._current_stream_text()
+            if current:
+                self._stream_prefix = self._join_stream_text(
+                    self._stream_prefix,
+                    current,
+                )
+            self._stream_blocks.clear()
+            return []
+        if stream_type == "content_block_start":
+            index = _stream_block_index(raw_event)
+            block = raw_event.get("content_block")
+            if index is None or not isinstance(block, dict):
+                return []
+            if block.get("type") == "text":
+                text = str(block.get("text") or "")
+                self._stream_blocks[index] = text
+                if text:
+                    cumulative = self._join_stream_text(
+                        self._stream_prefix,
+                        self._current_stream_text(),
+                    )
+                    self.final_text = cumulative
+                    return [AgentEvent("Claude", "progress", cumulative)]
+            return []
+        if stream_type != "content_block_delta":
+            return []
+        index = _stream_block_index(raw_event)
+        delta = raw_event.get("delta")
+        if index is None or not isinstance(delta, dict):
+            return []
+        if delta.get("type") != "text_delta":
+            return []
+        text = delta.get("text")
+        if not isinstance(text, str) or not text:
+            return []
+        self._stream_blocks[index] = self._stream_blocks.get(index, "") + text
+        cumulative = self._join_stream_text(
+            self._stream_prefix,
+            self._current_stream_text(),
+        )
+        if not cumulative:
+            return []
+        self.final_text = cumulative
+        return [AgentEvent("Claude", "progress", cumulative)]
+
+    def _current_stream_text(self) -> str:
+        return "".join(
+            self._stream_blocks[index]
+            for index in sorted(self._stream_blocks)
+        )
+
+    @staticmethod
+    def _join_stream_text(prefix: str, current: str) -> str:
+        if not prefix:
+            return current
+        if not current:
+            return prefix
+        return f"{prefix}\n\n{current}"
+
     def _capture_usage(self, usage: object) -> None:
         if not isinstance(usage, dict):
             return
         self.input_tokens = _token_value(usage, "input_tokens", "inputTokens")
         self.output_tokens = _token_value(usage, "output_tokens", "outputTokens")
+
+
+class _CodexMessageCollector:
+    """Separate transient Codex commentary from the final chat answer."""
+
+    def __init__(self) -> None:
+        self._phases: dict[str, str] = {}
+        self._parts: dict[str, list[str]] = {}
+        self._completed: set[str] = set()
+        self._final_text = ""
+        self._legacy_texts: list[str] = []
+
+    def start(self, item: dict[str, Any]) -> None:
+        if str(item.get("type") or "") != "agentMessage":
+            return
+        item_id = str(item.get("id") or "")
+        if not item_id:
+            return
+        self._phases[item_id] = _codex_message_phase(item)
+        self._parts.setdefault(item_id, [])
+
+    def delta(self, params: dict[str, Any]) -> str:
+        item_id = str(params.get("itemId") or params.get("item_id") or "")
+        delta = str(params.get("delta") or "")
+        if not item_id or not delta:
+            return ""
+        self._parts.setdefault(item_id, []).append(delta)
+        phase = self._phases.get(item_id, "")
+        if phase == "commentary":
+            return ""
+        current = "".join(self._parts[item_id])
+        if phase == "final_answer":
+            return current
+        return "".join((*self._legacy_texts, current))
+
+    def complete(self, item: dict[str, Any]) -> str:
+        if str(item.get("type") or "") != "agentMessage":
+            return ""
+        item_id = str(item.get("id") or "")
+        if item_id in self._completed:
+            return ""
+        if item_id:
+            self._completed.add(item_id)
+        phase = _codex_message_phase(item) or self._phases.get(item_id, "")
+        text = _first_text(item, "text", "content")
+        if not text and item_id:
+            text = "".join(self._parts.get(item_id, ())).strip()
+        if not text or phase == "commentary":
+            return ""
+        if phase == "final_answer":
+            self._final_text = text
+            return text
+        self._legacy_texts.append(text)
+        return "".join(self._legacy_texts)
+
+    @property
+    def final_text(self) -> str:
+        return (self._final_text or "".join(self._legacy_texts)).strip()
 
 
 class BaseCLIAdapter:
@@ -210,6 +528,8 @@ class BaseCLIAdapter:
         self._process_lock = threading.Lock()
         self._active_processes: set[subprocess.Popen] = set()
         self._interaction_handler: InteractionCallback | None = None
+        self._incompatible_models: dict[str, str] = {}
+        self._model_lock = threading.Lock()
 
     @property
     def stop_requested(self) -> bool:
@@ -291,10 +611,25 @@ class BaseCLIAdapter:
         step_id: str = "",
     ) -> AgentRunResult:
         interaction_handler = on_interaction or self._interaction_handler
-        candidates: tuple[str | None, ...] = self.settings.models or (
+        configured_candidates: tuple[str | None, ...] = self.settings.models or (
             (self.settings.model,) if self.settings.model else (None,)
         )
+        with self._model_lock:
+            candidates = tuple(
+                candidate
+                for candidate in configured_candidates
+                if candidate is None or candidate not in self._incompatible_models
+            )
+            disabled = dict(self._incompatible_models)
+        if not candidates:
+            model = configured_candidates[0] if configured_candidates else None
+            raise AgentModelCompatibilityError(
+                self.display_name,
+                model,
+                disabled.get(str(model), "本次服务中已确认该模型不兼容"),
+            )
         multi_model = not self.session_resume_enabled
+        compatibility_failures: list[AgentModelCompatibilityError] = []
         for index, model in enumerate(candidates):
             try:
                 result = self._run_once(
@@ -327,9 +662,37 @@ class BaseCLIAdapter:
                                 "timeout_seconds": self.settings.timeout,
                             },
                         )
-                    )
+                )
+                continue
+            except AgentModelCompatibilityError as exc:
+                compatibility_failures.append(exc)
+                if model is not None:
+                    with self._model_lock:
+                        self._incompatible_models[model] = exc.reason
+                has_fallback = (
+                    self.settings.fallback_on_timeout and index + 1 < len(candidates)
+                )
+                if not has_fallback:
+                    raise
+                next_model = candidates[index + 1]
+                if on_event is not None:
+                    on_event(
+                        AgentEvent(
+                            self.display_name,
+                            "warning",
+                            f"模型 {model or 'CLI 默认'} 与当前接口不兼容，切换到 {next_model or 'CLI 默认'}",
+                            step_id=step_id,
+                            safe_summary=f"{self.display_name} · 模型协议不兼容，正在切换备用模型",
+                            metadata={"attempt": index + 1},
+                        )
+                )
                 continue
             return replace(result, session_id=None) if multi_model else result
+        if len(compatibility_failures) == len(candidates):
+            # Do not collapse an all-model protocol rejection into the generic
+            # "no available model" error; the UI can then explain the gateway
+            # shape problem and the user can change provider/model settings.
+            raise compatibility_failures[-1]
         raise BridgeError(f"{self.display_name} 没有可用模型")
 
     def _run_once(
@@ -343,6 +706,7 @@ class BaseCLIAdapter:
         on_interaction: InteractionCallback | None,
         step_id: str,
         model: str | None,
+        timeout_bridge: _TimeoutBridge | None = None,
     ) -> AgentRunResult:
         if self.stop_requested:
             raise KeyboardInterrupt
@@ -418,9 +782,10 @@ class BaseCLIAdapter:
             timed_out.set()
             signal_process_tree(process, force=True)
 
-        timer = threading.Timer(self.settings.timeout, stop_on_timeout)
-        timer.daemon = True
-        timer.start()
+        inactivity_timeout = _InactivityTimeout(self.settings.timeout, stop_on_timeout)
+        if timeout_bridge is not None:
+            timeout_bridge.bind(inactivity_timeout)
+        inactivity_timeout.start()
         stdin_lock = threading.Lock()
         writer: threading.Thread | None = None
         writer_errors: list[BaseException] = []
@@ -487,6 +852,7 @@ class BaseCLIAdapter:
                 )
             )
             for line in process.stdout:
+                inactivity_timeout.reset()
                 data = _json_line(line)
                 native_request = (
                     _claude_interaction_request(data, self.display_name)
@@ -494,12 +860,16 @@ class BaseCLIAdapter:
                     else None
                 )
                 if native_request is not None:
-                    timer.cancel()
-                    response = _resolve_native_interaction(
-                        native_request,
-                        on_interaction=on_interaction,
-                        emit=emit,
-                    )
+                    inactivity_timeout.pause()
+                    try:
+                        response = _resolve_native_interaction(
+                            native_request,
+                            on_interaction=on_interaction,
+                            emit=emit,
+                        )
+                    finally:
+                        if not self.stop_requested:
+                            inactivity_timeout.resume()
                     payload = _claude_interaction_response(data, response)
                     try:
                         _write_native_message(
@@ -511,13 +881,21 @@ class BaseCLIAdapter:
                         if self.stop_requested:
                             raise KeyboardInterrupt
                         raise
-                    if not self.stop_requested:
-                        timer = threading.Timer(self.settings.timeout, stop_on_timeout)
-                        timer.daemon = True
-                        timer.start()
                     continue
                 for event in parser.feed(line):
                     emit(event)
+                if (
+                    native_claude
+                    and data is not None
+                    and data.get("type") == "result"
+                    and not process.stdin.closed
+                ):
+                    # Claude's stream-json input stays open so approval replies
+                    # can be sent during the turn. Once the terminal result is
+                    # received, leaving it open makes newer Claude CLIs wait for
+                    # another user message instead of exiting.
+                    with stdin_lock:
+                        process.stdin.close()
             process.stdout.close()
             exit_code = process.wait()
             if writer is not None:
@@ -528,7 +906,9 @@ class BaseCLIAdapter:
             stop_process_tree(process)
             raise
         finally:
-            timer.cancel()
+            inactivity_timeout.close()
+            if timeout_bridge is not None:
+                timeout_bridge.unbind(inactivity_timeout)
             if writer is not None and writer.is_alive():
                 signal_process_tree(process, force=True)
                 writer.join(timeout=1)
@@ -562,11 +942,12 @@ class BaseCLIAdapter:
                 )
             )
             raise AgentTimeoutError(
-                f"{self.display_name} CLI 超过 {self.settings.timeout:g} 秒未完成，已终止"
+                f"{self.display_name} CLI 连续超过 {self.settings.timeout:g} 秒无活动，已终止"
             )
 
-        if exit_code != 0:
+        if parser.errors or exit_code != 0:
             detail = parser.errors[-1] if parser.errors else "进程未返回可识别错误"
+            compatibility_reason = _model_compatibility_reason(detail)
             emit(
                 AgentEvent(
                     self.display_name,
@@ -577,6 +958,12 @@ class BaseCLIAdapter:
                     metadata={"exit_code": exit_code},
                 )
             )
+            if compatibility_reason:
+                raise AgentModelCompatibilityError(
+                    self.display_name,
+                    model,
+                    compatibility_reason,
+                )
             raise BridgeError(f"{self.display_name} CLI 失败（退出码 {exit_code}）：{detail}")
         if not parser.final_text.strip():
             raise BridgeError(f"{self.display_name} CLI 没有返回最终文本")
@@ -635,9 +1022,17 @@ class BaseCLIAdapter:
         environment.update(self.environment)
         return environment
 
-
 class ClaudeAdapter(BaseCLIAdapter):
     display_name = "Claude"
+
+    def __init__(
+        self,
+        settings: AgentCommandSettings,
+        *,
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(settings, environment=environment)
+        self._permission_bridge = threading.local()
 
     def build_command(
         self,
@@ -649,11 +1044,10 @@ class ClaudeAdapter(BaseCLIAdapter):
         interactive: bool = False,
     ) -> list[str]:
         del workspace
-        permission_mode = (
-            "manual"
-            if interactive or self._interaction_handler is not None
-            else "acceptEdits" if mode == "write" else "plan"
-        )
+        # Writable turns keep Claude's native workspace editing behavior. Any
+        # protected operation outside that baseline is routed through the MCP
+        # permission prompt tool when the UI interaction bridge is attached.
+        permission_mode = "acceptEdits" if mode == "write" else "plan"
         command = [
             *self.settings.command,
             "-p",
@@ -661,10 +1055,13 @@ class ClaudeAdapter(BaseCLIAdapter):
             "stream-json",
             "--output-format",
             "stream-json",
+            "--include-partial-messages",
             "--verbose",
             "--permission-mode",
             permission_mode,
         ]
+        bridge_args = getattr(self._permission_bridge, "args", ()) if interactive else ()
+        command.extend(bridge_args)
         selected_model = model or self.settings.model
         if selected_model:
             command.extend(["--model", selected_model])
@@ -675,6 +1072,73 @@ class ClaudeAdapter(BaseCLIAdapter):
 
     def new_parser(self) -> ClaudeEventParser:
         return ClaudeEventParser()
+
+    def _run_once(
+        self,
+        prompt: str,
+        *,
+        workspace: Path,
+        mode: str,
+        session_id: str | None,
+        on_event: EventCallback | None,
+        on_interaction: InteractionCallback | None,
+        step_id: str,
+        model: str | None,
+    ) -> AgentRunResult:
+        if on_interaction is None:
+            return super()._run_once(
+                prompt,
+                workspace=workspace,
+                mode=mode,
+                session_id=session_id,
+                on_event=on_event,
+                on_interaction=None,
+                step_id=step_id,
+                model=model,
+            )
+
+        started = time.monotonic()
+
+        def emit(event: AgentEvent) -> None:
+            if on_event is None:
+                return
+            on_event(
+                replace(
+                    event,
+                    step_id=event.step_id or step_id,
+                    elapsed_seconds=round(time.monotonic() - started, 3),
+                    safe_summary=event.safe_summary or _safe_event_summary(event),
+                )
+            )
+
+        def resolve(request: NativeInteractionRequest) -> NativeInteractionResponse:
+            timeout_bridge.begin_wait()
+            try:
+                return _resolve_native_interaction(
+                    request,
+                    on_interaction=on_interaction,
+                    emit=emit,
+                )
+            finally:
+                timeout_bridge.end_wait()
+
+        timeout_bridge = _TimeoutBridge()
+        with _ClaudePermissionBroker(resolve) as broker:
+            self._permission_bridge.args = broker.command_args()
+            try:
+                return super()._run_once(
+                    prompt,
+                    workspace=workspace,
+                    mode=mode,
+                    session_id=session_id,
+                    on_event=on_event,
+                    on_interaction=on_interaction,
+                    step_id=step_id,
+                    model=model,
+                    timeout_bridge=timeout_bridge,
+                )
+            finally:
+                self._permission_bridge.args = ()
 
 
 class CodexAdapter(BaseCLIAdapter):
@@ -689,6 +1153,12 @@ class CodexAdapter(BaseCLIAdapter):
     ) -> None:
         super().__init__(settings, environment=environment)
         self.token_api_base_url = token_api_base_url.rstrip("/") if token_api_base_url else None
+
+    @property
+    def session_resume_enabled(self) -> bool:
+        # MultiAgent owns the shared conversation history. Native Codex threads
+        # stay ephemeral so they never appear in the ChatGPT/Codex client.
+        return False
 
     def build_command(
         self,
@@ -733,7 +1203,7 @@ class CodexAdapter(BaseCLIAdapter):
         ]
         if selected_model:
             command.extend(["--model", selected_model])
-        command.extend(["exec", "--json", "--skip-git-repo-check"])
+        command.extend(["exec", "--json", "--skip-git-repo-check", "--ephemeral"])
         command.extend(self.settings.extra_args)
         command.append("-")
         return command
@@ -848,7 +1318,7 @@ class CodexAdapter(BaseCLIAdapter):
                 )
             )
 
-        command = [*self.settings.command, *self._token_api_provider_args(), "app-server", "--stdio"]
+        command = self.build_app_server_command()
         try:
             process = subprocess.Popen(
                 command,
@@ -868,25 +1338,20 @@ class CodexAdapter(BaseCLIAdapter):
         with self._process_lock:
             self._active_processes.add(process)
         timed_out = threading.Event()
-        timer = threading.Timer(self.settings.timeout, lambda: (timed_out.set(), signal_process_tree(process, force=True)))
-        timer.daemon = True
-        timer.start()
+
+        def stop_on_timeout() -> None:
+            timed_out.set()
+            signal_process_tree(process, force=True)
+
+        inactivity_timeout = _InactivityTimeout(self.settings.timeout, stop_on_timeout)
+        inactivity_timeout.start()
         rpc_id = itertools.count(1)
         stdin_lock = threading.Lock()
-        final_parts: list[str] = []
+        messages = _CodexMessageCollector()
         input_tokens = 0
         output_tokens = 0
         thread_id = session_id
         turn_complete = False
-
-        def arm_timeout() -> threading.Timer:
-            timeout_timer = threading.Timer(
-                self.settings.timeout,
-                lambda: (timed_out.set(), signal_process_tree(process, force=True)),
-            )
-            timeout_timer.daemon = True
-            timeout_timer.start()
-            return timeout_timer
 
         def send_request(method: str, params: dict[str, Any]) -> int:
             request_id = next(rpc_id)
@@ -909,11 +1374,17 @@ class CodexAdapter(BaseCLIAdapter):
             pending_turn_request: int | None = None
             emit(AgentEvent(self.display_name, "lifecycle", "waiting_model", status="waiting_model", safe_summary="Codex · 等待模型响应"))
             for line in process.stdout:
+                # app-server emits tool and delta notifications while a turn is
+                # active. The timeout is for inactivity, not total turn time.
+                inactivity_timeout.reset()
                 data = _json_line(line)
                 if data is None:
                     continue
                 request_id = data.get("id")
-                if request_id == initialize_id:
+                # JSON-RPC server requests also carry an ``id``.  They must
+                # not be mistaken for the response to one of our requests if
+                # the server happens to reuse that numeric id.
+                if request_id == initialize_id and "method" not in data:
                     _write_native_message(
                         process,
                         json.dumps({"jsonrpc": "2.0", "method": "initialized"}),
@@ -930,10 +1401,23 @@ class CodexAdapter(BaseCLIAdapter):
                             _codex_thread_params(workspace, mode, model),
                         )
                     continue
-                if pending_thread_request is not None and request_id == pending_thread_request:
+                if (
+                    pending_thread_request is not None
+                    and request_id == pending_thread_request
+                    and "method" not in data
+                ):
+                    pending_thread_request = None
+                    if data.get("error") is not None:
+                        raise BridgeError(
+                            "Codex app-server thread 启动失败："
+                            f"{_rpc_error_detail(data.get('error'))}"
+                        )
                     result = data.get("result")
                     if not isinstance(result, dict):
-                        raise BridgeError("Codex app-server 未返回会话信息")
+                        raise BridgeError(
+                            "Codex app-server 未返回会话信息："
+                            f"{_rpc_error_detail(data)}"
+                        )
                     thread = result.get("thread")
                     if not isinstance(thread, dict) or not isinstance(thread.get("id"), str):
                         raise BridgeError("Codex app-server 会话 ID 无效")
@@ -950,14 +1434,24 @@ class CodexAdapter(BaseCLIAdapter):
                         },
                     )
                     continue
-                if pending_turn_request is not None and request_id == pending_turn_request:
+                if (
+                    pending_turn_request is not None
+                    and request_id == pending_turn_request
+                    and "method" not in data
+                ):
+                    pending_turn_request = None
+                    if data.get("error") is not None:
+                        raise BridgeError(
+                            "Codex app-server turn 启动失败："
+                            f"{_rpc_error_detail(data.get('error'))}"
+                        )
                     continue
                 if "method" in data and "id" in data:
                     native_request = _codex_interaction_request(data, self.display_name)
                     if native_request is None:
                         _write_jsonrpc_error(process, data["id"], "不支持的原生交互请求", lock=stdin_lock)
                         continue
-                    timer.cancel()
+                    inactivity_timeout.pause()
                     response = _resolve_native_interaction(native_request, on_interaction=on_interaction, emit=emit)
                     try:
                         _write_native_message(
@@ -970,19 +1464,20 @@ class CodexAdapter(BaseCLIAdapter):
                             raise KeyboardInterrupt
                         raise
                     if not self.stop_requested:
-                        timer = arm_timeout()
+                        inactivity_timeout.resume()
                     continue
                 method = str(data.get("method") or "")
                 params = data.get("params") if isinstance(data.get("params"), dict) else {}
                 if method == "item/agentMessage/delta":
-                    delta = str(params.get("delta") or "")
-                    if delta:
-                        final_parts.append(delta)
-                        emit(AgentEvent(self.display_name, "progress", "".join(final_parts)))
+                    progress = messages.delta(params)
+                    if progress:
+                        emit(AgentEvent(self.display_name, "progress", progress))
                 elif method == "item/started":
                     item = params.get("item") if isinstance(params.get("item"), dict) else {}
                     item_type = str(item.get("type") or "")
-                    if item_type in {"commandExecution", "fileChange", "mcpToolCall"}:
+                    if item_type == "agentMessage":
+                        messages.start(item)
+                    elif item_type in {"commandExecution", "fileChange", "mcpToolCall"}:
                         emit(
                             AgentEvent(
                                 self.display_name,
@@ -994,15 +1489,16 @@ class CodexAdapter(BaseCLIAdapter):
                 elif method == "item/completed":
                     item = params.get("item") if isinstance(params.get("item"), dict) else {}
                     if str(item.get("type") or "") == "agentMessage":
-                        text = _first_text(item, "text", "content")
-                        if text and not final_parts:
-                            final_parts.append(text)
+                        progress = messages.complete(item)
+                        if progress and _codex_message_phase(item) != "commentary":
+                            emit(AgentEvent(self.display_name, "progress", progress))
                     elif item:
                         emit(
                             AgentEvent(
                                 self.display_name,
                                 "tool_result",
                                 str(item.get("status") or "completed"),
+                                status=_tool_result_event_status(item),
                                 metadata=_tool_event_metadata(
                                     str(item.get("type") or "tool"),
                                     item,
@@ -1029,7 +1525,7 @@ class CodexAdapter(BaseCLIAdapter):
                 if timed_out.is_set():
                     raise AgentTimeoutError(f"Codex CLI 超过 {self.settings.timeout:g} 秒未完成，已终止")
                 raise BridgeError(f"Codex app-server 提前退出（退出码 {exit_code}）")
-            final_text = "".join(final_parts).strip()
+            final_text = messages.final_text
             if not final_text:
                 raise BridgeError("Codex app-server 没有返回最终文本")
             duration = time.monotonic() - started
@@ -1040,7 +1536,7 @@ class CodexAdapter(BaseCLIAdapter):
             stop_process_tree(process)
             raise
         finally:
-            timer.cancel()
+            inactivity_timeout.close()
             signal_process_tree(process, force=True)
             with self._process_lock:
                 self._active_processes.discard(process)
@@ -1051,6 +1547,47 @@ class CodexAdapter(BaseCLIAdapter):
                 process.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 stop_process_tree(process)
+
+    def build_app_server_command(self) -> list[str]:
+        return [
+            *self.settings.command,
+            *self._token_api_provider_args(),
+            "app-server",
+            *self._app_server_extra_args(),
+            "--stdio",
+        ]
+
+    def _app_server_extra_args(self) -> list[str]:
+        args = list(self.settings.extra_args)
+        supported_with_value = {"-c", "--config", "--enable", "--disable"}
+        supported_flags = {"--strict-config"}
+        normalized: list[str] = []
+        index = 0
+        while index < len(args):
+            value = args[index]
+            if value in supported_flags:
+                normalized.append(value)
+                index += 1
+                continue
+            if value in supported_with_value:
+                if index + 1 >= len(args):
+                    raise BridgeError(f"Codex 附加参数 {value} 缺少值")
+                normalized.extend((value, args[index + 1]))
+                index += 2
+                continue
+            if any(
+                value.startswith(f"{option}=")
+                for option in ("--config", "--enable", "--disable")
+            ):
+                normalized.append(value)
+                index += 1
+                continue
+            raise BridgeError(
+                "Codex 在网页审批模式下使用 app-server；附加参数仅支持 "
+                "-c/--config、--enable、--disable 和 --strict-config。"
+                f"不支持：{value}"
+            )
+        return normalized
 
     def _token_api_provider_args(self) -> list[str]:
         if not self.token_api_base_url:
@@ -1080,6 +1617,36 @@ def _json_line(line: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def _rpc_error_detail(value: object) -> str:
+    """Return a compact, useful description for a JSON-RPC error/response."""
+
+    if isinstance(value, dict):
+        message = value.get("message") or value.get("detail") or value.get("reason")
+        code = value.get("code")
+        if message:
+            return f"{message}（code={code}）" if code is not None else str(message)
+        if code is not None:
+            return f"code={code}"
+        return _compact_json(value, 800)
+    if isinstance(value, str) and value:
+        return value
+    if value is None:
+        return "响应为空"
+    return _compact_json(value, 800)
+
+
+def _stream_block_index(data: dict[str, Any]) -> int | None:
+    value = data.get("index")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _write_native_message(
@@ -1134,6 +1701,98 @@ def _interaction_options(*values: tuple[str, str, str]) -> tuple[NativeInteracti
     return tuple(NativeInteractionOption(value, label, description) for value, label, description in values)
 
 
+def _claude_permission_prompt_request(
+    data: dict[str, Any],
+    source: str,
+) -> NativeInteractionRequest:
+    tool_name = str(
+        data.get("tool_name")
+        or data.get("toolName")
+        or data.get("name")
+        or "操作"
+    )
+    tool_input = next(
+        (
+            value
+            for value in (data.get("input"), data.get("tool_input"), data.get("toolInput"))
+            if isinstance(value, dict)
+        ),
+        {},
+    )
+    command = str(tool_input.get("command") or tool_input.get("cmd") or "")
+    reason = str(
+        data.get("reason")
+        or data.get("description")
+        or data.get("message")
+        or ""
+    )
+    request_id = str(
+        data.get("tool_use_id")
+        or data.get("toolUseId")
+        or data.get("request_id")
+        or data.get("requestId")
+        or secrets.token_urlsafe(12)
+    )
+    normalized_tool = tool_name.replace("_", "").lower()
+    kind = (
+        "command_approval"
+        if command or normalized_tool in {"bash", "shell", "terminal"}
+        else "network_approval"
+        if normalized_tool in {"webfetch", "websearch"}
+        else "file_approval"
+    )
+    cwd = str(tool_input.get("cwd") or "")
+    if not cwd:
+        path = tool_input.get("file_path") or tool_input.get("path")
+        if isinstance(path, str):
+            cwd = str(Path(path).parent)
+    return NativeInteractionRequest(
+        id=request_id,
+        source=source,
+        kind=kind,
+        title=f"{source} 请求使用 {tool_name}",
+        message=reason or _compact_json(tool_input, 1200),
+        command=command,
+        cwd=cwd,
+        options=_interaction_options(
+            ("approve", "允许一次", "仅允许当前操作"),
+            ("deny", "拒绝", "拒绝操作，但让 Agent 继续思考其他办法"),
+            ("cancel", "拒绝并停止", "拒绝操作并终止当前回复"),
+        ),
+        metadata={"provider": "claude", "tool_name": tool_name},
+    )
+
+
+def _claude_permission_prompt_response(
+    data: dict[str, Any],
+    response: NativeInteractionResponse,
+) -> dict[str, Any]:
+    if response.action == "approve":
+        tool_input = next(
+            (
+                value
+                for value in (
+                    data.get("input"),
+                    data.get("tool_input"),
+                    data.get("toolInput"),
+                )
+                if isinstance(value, dict)
+            ),
+            {},
+        )
+        return {"behavior": "allow", "updatedInput": tool_input}
+    return {
+        "behavior": "deny",
+        "message": response.text
+        or (
+            "用户拒绝并要求停止"
+            if response.action == "cancel"
+            else "用户拒绝了此操作"
+        ),
+        "interrupt": response.action == "cancel",
+    }
+
+
 def _claude_interaction_request(
     data: dict[str, Any],
     source: str,
@@ -1162,7 +1821,6 @@ def _claude_interaction_request(
         cwd=str(tool_input.get("cwd") or ""),
         options=_interaction_options(
             ("approve", "允许一次", "仅允许当前操作"),
-            ("approve_session", "本次会话允许", "同类操作在本次会话中不再询问"),
             ("deny", "拒绝", "拒绝操作，但让 Agent 继续思考其他办法"),
             ("cancel", "拒绝并停止", "拒绝操作并终止当前回复"),
         ),
@@ -1182,10 +1840,7 @@ def _claude_interaction_response(
         or request.get("requestId")
         or ""
     )
-    if response.action in {"approve", "approve_session"}:
-        # Do not guess Claude's provider-specific updatedPermissions payload:
-        # releases differ, and an invalid suggestion rejects the whole control
-        # response. Session approval therefore degrades safely to one-shot.
+    if response.action == "approve":
         result: dict[str, Any] = {"behavior": "allow"}
     else:
         result = {
@@ -1217,6 +1872,8 @@ def _codex_thread_params(
     }
     if thread_id:
         params["threadId"] = thread_id
+    else:
+        params["ephemeral"] = True
     if model:
         params["model"] = model
     return params
@@ -1441,6 +2098,11 @@ def _codex_item_detail(item: dict[str, Any]) -> str:
     return _first_text(item, "command", "path", "name", "tool")
 
 
+def _codex_message_phase(item: dict[str, Any]) -> str:
+    phase = str(item.get("phase") or "").strip().lower()
+    return phase if phase in {"commentary", "final_answer"} else ""
+
+
 def _tool_event_metadata(
     item_type: str,
     item: dict[str, Any],
@@ -1499,6 +2161,16 @@ def _tool_event_metadata(
     return metadata
 
 
+def _tool_result_event_status(item: dict[str, Any]) -> str:
+    raw_status = str(item.get("status") or "").lower()
+    exit_code = item.get("exit_code")
+    if raw_status in {"failed", "error", "cancelled", "canceled"}:
+        return "failed"
+    if isinstance(exit_code, int) and not isinstance(exit_code, bool) and exit_code != 0:
+        return "failed"
+    return "completed"
+
+
 def _first_text(data: dict[str, Any], *keys: str) -> str:
     for key in keys:
         value = data.get(key)
@@ -1520,6 +2192,33 @@ def _error_text(data: dict[str, Any]) -> str:
     if isinstance(error, dict):
         return str(error.get("message") or error)
     return str(error)
+
+
+def _model_compatibility_reason(detail: str) -> str:
+    """Return a bounded public reason for known CLI/provider shape failures."""
+
+    normalized = detail.lower()
+    validation_markers = (
+        "request validation",
+        "extra inputs are not permitted",
+        "input should be a valid string",
+        "validation error",
+    )
+    if "cache_control" in normalized and any(
+        marker in normalized for marker in validation_markers
+    ):
+        return "模型接口拒绝了 Claude Code 的缓存内容块（cache_control）"
+    unsupported_model_markers = (
+        "model not found",
+        "model does not exist",
+        "unknown model",
+        "unsupported model",
+        "invalid model",
+        "model is not supported",
+    )
+    if any(marker in normalized for marker in unsupported_model_markers):
+        return "当前服务不支持该模型名称或原生 Agent 调用方式"
+    return ""
 
 
 def _compact_json(value: Any, limit: int = 400) -> str:

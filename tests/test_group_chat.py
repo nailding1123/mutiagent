@@ -11,10 +11,12 @@ from typing import Any
 
 from multiagent_cli.bridge_models import (
     AgentCommandSettings,
+    AgentModelCompatibilityError,
     AgentRunResult,
     AgentTimeoutError,
     BridgeError,
     BridgeSettings,
+    ContextCompactionSettings,
 )
 from multiagent_cli.group_chat import (
     GroupChatEngine,
@@ -113,6 +115,31 @@ class GroupChatTests(unittest.TestCase):
             self.assertEqual(restored["messages"][1]["failure_reason"], "timeout")
             self.assertIn("响应超时", restored["messages"][1]["content"])
 
+    def test_model_protocol_failure_is_explained_in_failed_reply(self) -> None:
+        class IncompatibleAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                raise AgentModelCompatibilityError(
+                    "Claude Code",
+                    "kimi-k3",
+                    "模型接口拒绝了 cache_control",
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            claude = IncompatibleAdapter("Claude Code", [])
+            codex = FakeAdapter("Codex", [])
+            engine = GroupChatEngine(
+                settings(Path(directory)),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
+            )
+
+            engine.ask("@Claude 检查一下")
+            failed = engine.to_dict()["messages"][1]
+
+        self.assertEqual(failed["failure_reason"], "model_incompatible")
+        self.assertIn("模型不兼容", failed["content"])
+        self.assertIn("kimi-k3", failed["content"])
+
     def test_single_agent_questions_do_not_block_another_agent(self) -> None:
         started = threading.Event()
         release = threading.Event()
@@ -151,6 +178,82 @@ class GroupChatTests(unittest.TestCase):
             self.assertEqual(second.responses[0].final_text, "即时回答")
         self.assertEqual(len(codex.calls), 1)
 
+    def test_fast_agent_reply_is_persisted_before_slow_peer_finishes(self) -> None:
+        claude_started = threading.Event()
+        release_claude = threading.Event()
+        partial_states: list[dict[str, Any]] = []
+
+        class SlowClaude(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                claude_started.set()
+                release_claude.wait(2)
+                return next(self.results)
+
+        class FastCodex(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            engine = GroupChatEngine(
+                settings(Path(directory)),
+                {
+                    "claude": SlowClaude(
+                        "Claude", [AgentRunResult("Claude", "慢回复")]
+                    ),
+                    "codex": FastCodex(
+                        "Codex", [AgentRunResult("Codex", "快回复")]
+                    ),
+                },  # type: ignore[arg-type]
+            )
+            worker = threading.Thread(
+                target=lambda: engine.ask(
+                    "@all 一起回答",
+                    on_state=lambda state: partial_states.append(state),
+                ),
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(claude_started.wait(1))
+            deadline = time.monotonic() + 1
+            while not any(
+                any(
+                    item.get("sender") == "codex"
+                    and item.get("content") == "快回复"
+                    for item in state.get("messages", [])
+                )
+                and not any(
+                    item.get("sender") == "claude"
+                    and item.get("content") == "慢回复"
+                    for item in state.get("messages", [])
+                )
+                for state in partial_states
+            ) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(
+                any(
+                    any(
+                        item.get("sender") == "codex"
+                        and item.get("content") == "快回复"
+                        for item in state.get("messages", [])
+                    )
+                    and not any(
+                        item.get("sender") == "claude"
+                        and item.get("content") == "慢回复"
+                        for item in state.get("messages", [])
+                    )
+                    for state in partial_states
+                )
+            )
+            release_claude.set()
+            worker.join(2)
+            messages = engine.to_dict()["messages"]
+            self.assertEqual(
+                [item["content"] for item in messages if item["role"] == "assistant"],
+                ["慢回复", "快回复"],
+            )
+
     def test_only_one_worktree_is_created_and_merged_after_main_writer(self) -> None:
         repository = None
         started = threading.Event()
@@ -180,7 +283,7 @@ class GroupChatTests(unittest.TestCase):
                 [AgentRunResult("Codex", "Worktree 完成", session_id="cb")],
             )
             engine = GroupChatEngine(
-                settings(repository),
+                replace(settings(repository), worktree=True),
                 {"claude": claude, "codex": codex},  # type: ignore[arg-type]
             )
             first = engine.reserve("@Claude 执行：写入主工作区")
@@ -220,6 +323,453 @@ class GroupChatTests(unittest.TestCase):
             self.assertIn("?? claude.txt", status)
             self.assertIn("?? codex.txt", status)
             self.assertNotIn("A  codex.txt", status)
+
+    def test_dual_agent_execution_creates_reviewable_candidates_without_touching_main(self) -> None:
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                workspace = Path(kwargs["workspace"])
+                (workspace / f"{self.display_name.lower()}.txt").write_text(
+                    self.display_name,
+                    encoding="utf-8",
+                )
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            claude = WritingAdapter(
+                "Claude", [AgentRunResult("Claude", "方案 A", session_id="ca")]
+            )
+            codex = WritingAdapter(
+                "Codex", [AgentRunResult("Codex", "方案 B", session_id="cb")]
+            )
+            engine = GroupChatEngine(
+                settings(repository),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
+            )
+
+            turn = engine.ask("@all 执行：分别实现同一个功能")
+            comparison = engine.to_dict()["comparison"]
+
+            self.assertEqual(comparison["status"], "review")
+            self.assertNotEqual(
+                claude.calls[0]["workspace"],
+                codex.calls[0]["workspace"],
+            )
+            self.assertNotEqual(Path(claude.calls[0]["workspace"]), repository)
+            self.assertFalse((repository / "claude.txt").exists())
+            self.assertFalse((repository / "codex.txt").exists())
+            self.assertEqual(comparison["candidates"]["claude"]["status"], "ready")
+            self.assertEqual(comparison["candidates"]["codex"]["status"], "ready")
+            self.assertEqual(len(turn.responses), 2)
+
+            applied = engine.apply_comparison("claude")
+            applied_state = engine.to_dict()
+            claude_reply = next(
+                message
+                for message in applied_state["messages"]
+                if message.get("sender") == "claude"
+            )
+
+            self.assertEqual(applied["status"], "applied")
+            self.assertEqual(applied["selected_agent"], "claude")
+            self.assertEqual(
+                claude_reply["changes"]["rollback"]["status"],
+                "available",
+            )
+            self.assertTrue((repository / "claude.txt").is_file())
+            self.assertFalse((repository / "codex.txt").exists())
+            self.assertFalse(Path(claude.calls[0]["workspace"]).exists())
+            self.assertFalse(Path(codex.calls[0]["workspace"]).exists())
+
+    def test_comparison_can_preview_each_candidate_in_main_and_restore_on_discard(self) -> None:
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                (Path(kwargs["workspace"]) / f"{self.display_name.lower()}.txt").write_text(
+                    self.display_name,
+                    encoding="utf-8",
+                )
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            engine = GroupChatEngine(
+                settings(repository),
+                {
+                    "claude": WritingAdapter("Claude", [AgentRunResult("Claude", "A")]),
+                    "codex": WritingAdapter("Codex", [AgentRunResult("Codex", "B")]),
+                },  # type: ignore[arg-type]
+            )
+            engine.ask("@all 执行：分别实现")
+
+            preview = engine.preview_comparison("claude")
+            self.assertEqual(preview["status"], "previewing")
+            self.assertEqual(preview["preview"]["active_agent"], "claude")
+            self.assertTrue((repository / "claude.txt").is_file())
+            self.assertFalse((repository / "codex.txt").exists())
+
+            preview = engine.preview_comparison("codex")
+            self.assertEqual(preview["preview"]["active_agent"], "codex")
+            self.assertFalse((repository / "claude.txt").exists())
+            self.assertTrue((repository / "codex.txt").is_file())
+
+            discarded = engine.discard_comparison()
+            self.assertEqual(discarded["status"], "discarded")
+            self.assertFalse((repository / "claude.txt").exists())
+            self.assertFalse((repository / "codex.txt").exists())
+
+    def test_completed_candidate_can_preview_while_peer_is_still_running(self) -> None:
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                (Path(kwargs["workspace"]) / f"{self.display_name.lower()}.txt").write_text(
+                    self.display_name,
+                    encoding="utf-8",
+                )
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            engine = GroupChatEngine(
+                settings(repository),
+                {
+                    "claude": WritingAdapter("Claude", [AgentRunResult("Claude", "A")]),
+                    "codex": WritingAdapter("Codex", [AgentRunResult("Codex", "B")]),
+                },  # type: ignore[arg-type]
+            )
+            engine.ask("@all 执行：分别实现")
+            # Reproduce the live snapshot between the first candidate finishing
+            # and the peer finishing. The candidate worktrees and diffs already
+            # exist; only the comparison state is still running.
+            engine._state["comparison"]["status"] = "running"
+            engine._state["comparison"]["candidates"]["codex"]["status"] = "running"
+
+            preview = engine.preview_comparison("claude")
+            self.assertEqual(preview["status"], "previewing")
+            self.assertEqual(preview["preview"]["active_agent"], "claude")
+            self.assertTrue((repository / "claude.txt").is_file())
+            self.assertFalse((repository / "codex.txt").exists())
+
+            with self.assertRaisesRegex(BridgeError, "另一个 Agent 仍在执行"):
+                engine.apply_comparison("claude")
+
+            engine._state["comparison"]["candidates"]["codex"]["status"] = "ready"
+            applied = engine.apply_comparison("claude")
+            self.assertEqual(applied["status"], "applied")
+
+    def test_comparison_apply_stops_when_main_workspace_changed(self) -> None:
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                (Path(kwargs["workspace"]) / f"{self.display_name}.txt").write_text(
+                    "candidate",
+                    encoding="utf-8",
+                )
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            engine = GroupChatEngine(
+                settings(repository),
+                {
+                    "claude": WritingAdapter(
+                        "Claude", [AgentRunResult("Claude", "A")]
+                    ),
+                    "codex": WritingAdapter(
+                        "Codex", [AgentRunResult("Codex", "B")]
+                    ),
+                },  # type: ignore[arg-type]
+            )
+            engine.ask("@all 执行：分别实现")
+            (repository / "tracked.txt").write_text("user change", encoding="utf-8")
+
+            comparison = engine.apply_comparison("claude")
+
+            self.assertEqual(comparison["status"], "conflict")
+            self.assertIn("主工作区在对比期间发生了变化", comparison["error"])
+            self.assertTrue(comparison["recovery_patch"])
+            self.assertTrue(Path(comparison["recovery_patch"]).is_file())
+
+            discarded = engine.discard_comparison()
+            self.assertEqual(discarded["status"], "discarded")
+
+    def test_comparison_tracks_no_changes_and_keeps_successful_peer_when_one_fails(self) -> None:
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                (Path(kwargs["workspace"]) / "codex.txt").write_text(
+                    "candidate",
+                    encoding="utf-8",
+                )
+                return next(self.results)
+
+        class FailingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                raise BridgeError("Claude failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            no_change_engine = GroupChatEngine(
+                settings(repository),
+                {
+                    "claude": FakeAdapter(
+                        "Claude", [AgentRunResult("Claude", "只检查")]
+                    ),
+                    "codex": WritingAdapter(
+                        "Codex", [AgentRunResult("Codex", "有修改")]
+                    ),
+                },  # type: ignore[arg-type]
+            )
+            no_change_engine.ask("@all 执行：分别实现")
+            first = no_change_engine.to_dict()["comparison"]
+            self.assertEqual(first["candidates"]["claude"]["status"], "no_changes")
+            self.assertEqual(first["candidates"]["codex"]["status"], "ready")
+            no_change_engine.discard_comparison()
+
+            failing_engine = GroupChatEngine(
+                settings(repository),
+                {
+                    "claude": FailingAdapter("Claude", []),
+                    "codex": WritingAdapter(
+                        "Codex", [AgentRunResult("Codex", "可采用")]
+                    ),
+                },  # type: ignore[arg-type]
+            )
+            failing_engine.ask("@all 执行：分别实现")
+            second = failing_engine.to_dict()["comparison"]
+            self.assertEqual(second["candidates"]["claude"]["status"], "failed")
+            self.assertTrue(second["candidates"]["claude"]["response_message_id"])
+            self.assertEqual(second["candidates"]["codex"]["status"], "ready")
+
+            applied = failing_engine.apply_comparison("codex")
+
+            self.assertEqual(applied["status"], "applied")
+            self.assertTrue((repository / "codex.txt").is_file())
+
+    def test_running_comparison_recovers_existing_candidate_worktrees(self) -> None:
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                (Path(kwargs["workspace"]) / f"{self.display_name}.txt").write_text(
+                    "candidate",
+                    encoding="utf-8",
+                )
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            adapters = {
+                "claude": WritingAdapter(
+                    "Claude", [AgentRunResult("Claude", "A")]
+                ),
+                "codex": WritingAdapter(
+                    "Codex", [AgentRunResult("Codex", "B")]
+                ),
+            }
+            engine = GroupChatEngine(
+                settings(repository),
+                adapters,  # type: ignore[arg-type]
+            )
+            engine.ask("@all 执行：分别实现")
+            persisted = engine.to_dict()
+            persisted["comparison"]["status"] = "running"
+            for candidate in persisted["comparison"]["candidates"].values():
+                candidate["status"] = "running"
+                candidate["changes"] = None
+
+            recovered = GroupChatEngine(
+                settings(repository),
+                adapters,  # type: ignore[arg-type]
+                persisted,
+            )
+            comparison = recovered.to_dict()["comparison"]
+
+            self.assertEqual(comparison["status"], "review")
+            self.assertEqual(comparison["candidates"]["claude"]["status"], "ready")
+            self.assertEqual(comparison["candidates"]["codex"]["status"], "ready")
+            recovered.discard_comparison()
+            self.assertFalse(Path(comparison["candidates"]["claude"]["workspace"]).exists())
+            self.assertFalse(Path(comparison["candidates"]["codex"]["workspace"]).exists())
+
+    def test_dual_agent_execution_requires_git_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            engine = GroupChatEngine(
+                settings(Path(directory)),
+                {
+                    "claude": FakeAdapter("Claude", []),
+                    "codex": FakeAdapter("Codex", []),
+                },  # type: ignore[arg-type]
+            )
+
+            with self.assertRaisesRegex(BridgeError, "需要 Git 工作区"):
+                engine.ask("@all 执行：分别实现")
+
+    def test_disabled_worktree_serializes_git_writers_in_main_checkout(self) -> None:
+        claude_started = threading.Event()
+        release_claude = threading.Event()
+        codex_started = threading.Event()
+
+        class BlockingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                if self.display_name == "Claude":
+                    claude_started.set()
+                    release_claude.wait(2)
+                else:
+                    codex_started.set()
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            claude = BlockingAdapter(
+                "Claude", [AgentRunResult("Claude", "first", session_id="ca")]
+            )
+            codex = BlockingAdapter(
+                "Codex", [AgentRunResult("Codex", "second", session_id="cb")]
+            )
+            engine = GroupChatEngine(
+                replace(settings(repository), worktree=False),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
+            )
+            first = engine.reserve("@Claude first")
+            first_thread = threading.Thread(
+                target=lambda: engine.ask("@Claude first", reservation=first),
+                daemon=True,
+            )
+            first_thread.start()
+            self.assertTrue(claude_started.wait(1))
+
+            second = engine.reserve("@Codex second")
+            second_thread = threading.Thread(
+                target=lambda: engine.ask("@Codex second", reservation=second),
+                daemon=True,
+            )
+            second_thread.start()
+            time.sleep(0.1)
+            self.assertFalse(codex_started.is_set())
+            release_claude.set()
+            first_thread.join(2)
+            second_thread.join(2)
+
+        self.assertTrue(codex_started.is_set())
+        self.assertEqual(Path(claude.calls[0]["workspace"]), repository)
+        self.assertEqual(Path(codex.calls[0]["workspace"]), repository)
+
+    def test_worktree_merge_conflict_preserves_successful_agent_reply(self) -> None:
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                workspace = Path(kwargs["workspace"])
+                (workspace / "changed.txt").write_text("agent change", encoding="utf-8")
+                return next(self.results)
+
+        class ConflictLease:
+            def __init__(self, workspace: Path) -> None:
+                self.workspace = workspace
+
+            def release(self) -> dict[str, Any]:
+                return {
+                    "merged": False,
+                    "error": "修改未合并。完整修改已保存为补丁：recovery.patch",
+                }
+
+        class ConflictCoordinator:
+            def __init__(self, workspace: Path) -> None:
+                self.workspace = workspace
+
+            def acquire(self, *args: Any, **kwargs: Any) -> ConflictLease:
+                return ConflictLease(self.workspace)
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = _git_repository(Path(directory))
+            claude = WritingAdapter(
+                "Claude", [AgentRunResult("Claude", "Agent 已正常完成", session_id="ca")]
+            )
+            engine = GroupChatEngine(
+                settings(workspace),
+                {"claude": claude},  # type: ignore[arg-type]
+            )
+            engine.workspace_coordinator = ConflictCoordinator(workspace)  # type: ignore[assignment]
+
+            turn = engine.ask("@Claude 修改文件")
+            reply = engine.to_dict()["messages"][-1]
+
+        self.assertFalse(turn.errors)
+        self.assertEqual(reply["content"], "Agent 已正常完成")
+        self.assertEqual(reply["changes"]["merge_status"], "conflict")
+        self.assertEqual(reply["changes"]["file_count"], 1)
+        self.assertIn("recovery.patch", reply["changes"]["merge_error"])
+
+    def test_completed_write_turn_records_safe_rollback_patch(self) -> None:
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                workspace = Path(kwargs["workspace"])
+                (workspace / "changed.txt").write_text("agent change", encoding="utf-8")
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = _git_repository(Path(directory))
+            adapter = WritingAdapter(
+                "Claude",
+                [AgentRunResult("Claude", "已完成修改", session_id="ca")],
+            )
+            engine = GroupChatEngine(
+                settings(workspace),
+                {"claude": adapter},  # type: ignore[arg-type]
+            )
+            turn = engine.ask("@Claude 执行：修改文件")
+            reply = engine.to_dict()["messages"][-1]
+            rollback = reply["changes"]["rollback"]
+            result = engine.workspace_coordinator.rollback_patch(rollback)
+
+            self.assertTrue(turn.changes)
+            self.assertEqual(rollback["status"], "available")
+            self.assertEqual(result["status"], "rolled_back")
+            self.assertFalse((workspace / "changed.txt").exists())
+
+            (workspace / "after-agent.txt").write_text("user change", encoding="utf-8")
+            conflict = engine.workspace_coordinator.rollback_patch(rollback)
+            self.assertEqual(conflict["status"], "conflict")
+            self.assertTrue((workspace / "after-agent.txt").exists())
+
+    def test_merge_failure_without_file_changes_does_not_show_conflict(self) -> None:
+        class ConflictLease:
+            def __init__(self, workspace: Path) -> None:
+                self.workspace = workspace
+
+            def release(self) -> dict[str, Any]:
+                return {
+                    "merged": False,
+                    "error": "协调状态不存在",
+                }
+
+        class ConflictCoordinator:
+            def __init__(self, workspace: Path) -> None:
+                self.workspace = workspace
+
+            def acquire(self, *args: Any, **kwargs: Any) -> ConflictLease:
+                return ConflictLease(self.workspace)
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = _git_repository(Path(directory))
+            claude = FakeAdapter(
+                "Claude", [AgentRunResult("Claude", "本轮只检查，没有修改代码", session_id="ca")]
+            )
+            engine = GroupChatEngine(
+                settings(workspace),
+                {"claude": claude},  # type: ignore[arg-type]
+            )
+            engine.workspace_coordinator = ConflictCoordinator(workspace)  # type: ignore[assignment]
+
+            turn = engine.ask("@Claude 检查代码")
+            reply = engine.to_dict()["messages"][-1]
+
+        self.assertFalse(turn.errors)
+        self.assertIsNone(turn.changes)
+        self.assertNotIn("changes", reply)
 
     def test_stateless_multi_model_turns_receive_full_history_and_drop_old_session(self) -> None:
         first_adapter = FakeAdapter(
@@ -283,6 +833,127 @@ class GroupChatTests(unittest.TestCase):
         self.assertIn("第一轮用户问题", resumed_adapter.calls[0]["prompt"])
         self.assertIn("第二轮用户问题", resumed_adapter.calls[0]["prompt"])
 
+    def test_stateless_agent_receives_compacted_projection_without_mutating_history(
+        self,
+    ) -> None:
+        adapter = FakeAdapter(
+            "Codex",
+            [
+                AgentRunResult(
+                    "Codex",
+                    f"第 {index} 轮回答 " + "实现细节 " * 120,
+                    session_id=None,
+                )
+                for index in range(1, 5)
+            ],
+            session_resume_enabled=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            resolved = replace(
+                settings(Path(directory)),
+                context_compaction=ContextCompactionSettings(
+                    threshold_tokens=300,
+                    target_tokens=160,
+                    recent_messages=2,
+                ),
+            )
+            engine = GroupChatEngine(
+                resolved,
+                {"codex": adapter},  # type: ignore[arg-type]
+            )
+            engine.ask(
+                "@Codex 必须保留早期约束：不要删除 src/state.py。"
+                + "背景资料 " * 160
+            )
+            engine.ask("@Codex 第二轮问题")
+            engine.ask("@Codex 第三轮问题")
+            engine.ask("@Codex CURRENT_MESSAGE 请给出结论")
+            state = engine.to_dict()
+
+            projection = state["context_projections"]["discuss"]["codex"]
+            self.assertIsNotNone(projection)
+            self.assertIn("group_chat_history_summary", adapter.calls[-1]["prompt"])
+            self.assertIn("不要删除 src/state.py", adapter.calls[-1]["prompt"])
+            self.assertIn("CURRENT_MESSAGE 请给出结论", adapter.calls[-1]["prompt"])
+            self.assertEqual(len(state["messages"]), 8)
+            self.assertIn("背景资料", state["messages"][0]["content"])
+
+            restored = GroupChatEngine(
+                resolved,
+                {"codex": adapter},  # type: ignore[arg-type]
+                state,
+            ).to_dict()
+            self.assertEqual(
+                restored["context_projections"]["discuss"]["codex"]["source_hash"],
+                projection["source_hash"],
+            )
+
+            engine.set_message_context(state["messages"][1]["id"], False)
+            invalidated = engine.to_dict()["context_projections"]
+
+        self.assertTrue(
+            all(
+                value is None
+                for channel in invalidated.values()
+                for value in channel.values()
+            )
+        )
+
+    def test_resumable_claude_rolls_over_to_a_compacted_native_session(self) -> None:
+        adapter = FakeAdapter(
+            "Claude",
+            [
+                AgentRunResult("Claude", "第一轮回答", session_id="claude-1"),
+                AgentRunResult("Claude", "第二轮回答", session_id="claude-1"),
+                AgentRunResult("Claude", "第三轮回答", session_id="claude-2"),
+                AgentRunResult("Claude", "第四轮回答", session_id="claude-2"),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            resolved = replace(
+                settings(Path(directory)),
+                context_compaction=ContextCompactionSettings(
+                    threshold_tokens=1_800,
+                    target_tokens=800,
+                    recent_messages=1,
+                ),
+            )
+            engine = GroupChatEngine(
+                resolved,
+                {"claude": adapter},  # type: ignore[arg-type]
+            )
+
+            engine.ask("@Claude 第一轮用户问题")
+            engine.ask(
+                "@Claude 必须保留早期约束：不要删除 src/state.py。"
+                + "背景资料 " * 400
+            )
+            engine.ask("@Claude CURRENT_MESSAGE 请给出结论")
+            state_after_rollover = engine.to_dict()
+            engine.ask("@Claude 第四轮继续")
+
+        self.assertIsNone(adapter.calls[0]["session_id"])
+        self.assertEqual(adapter.calls[1]["session_id"], "claude-1")
+        self.assertIsNone(adapter.calls[2]["session_id"])
+        self.assertIn(
+            "group_chat_history_summary",
+            adapter.calls[2]["prompt"],
+        )
+        self.assertIn("不要删除 src/state.py", adapter.calls[2]["prompt"])
+        self.assertIn("CURRENT_MESSAGE 请给出结论", adapter.calls[2]["prompt"])
+        self.assertEqual(adapter.calls[3]["session_id"], "claude-2")
+        self.assertNotIn(
+            "group_chat_history_summary",
+            adapter.calls[3]["prompt"],
+        )
+        self.assertIsNotNone(
+            state_after_rollover["context_projections"]["discuss"]["claude"]
+        )
+        self.assertGreater(
+            state_after_rollover["native_context_tokens"]["discuss"]["claude"],
+            0,
+        )
+
     def test_group_chat_uses_custom_agent_identities(self) -> None:
         claude = FakeAdapter(
             "Claude",
@@ -309,6 +980,8 @@ class GroupChatTests(unittest.TestCase):
     def test_mentions_route_to_one_or_all_agents(self) -> None:
         self.assertEqual(resolve_mentions("请都回答"), ("claude", "codex"))
         self.assertEqual(resolve_mentions("@Claude 请审核"), ("claude",))
+        self.assertEqual(resolve_mentions("请检查这个页面@Claude"), ("claude",))
+        self.assertEqual(resolve_mentions("请检查这个页面@Claude后再回复"), ("claude",))
         self.assertEqual(resolve_mentions("@codex @claude 比较"), ("claude", "codex"))
         self.assertEqual(resolve_mentions("@all 汇总"), ("claude", "codex"))
         with self.assertRaisesRegex(BridgeError, "未识别的群聊成员"):
@@ -360,6 +1033,146 @@ class GroupChatTests(unittest.TestCase):
         self.assertIn("@Claude 给出你的方案", codex.calls[0]["prompt"])
         self.assertIn("Claude 的意见", codex.calls[0]["prompt"])
         self.assertIn("@Codex 审核 Claude 刚才的回答", codex.calls[0]["prompt"])
+
+    def test_agent_reply_can_be_excluded_from_and_restored_to_shared_context(
+        self,
+    ) -> None:
+        claude = FakeAdapter(
+            "Claude",
+            [AgentRunResult("Claude", "ONLY_FROM_CLAUDE", session_id="ca")],
+        )
+        codex = FakeAdapter(
+            "Codex",
+            [
+                AgentRunResult("Codex", "第一次回答", session_id="cb-1"),
+                AgentRunResult("Codex", "第二次回答", session_id="cb-2"),
+            ],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            engine = GroupChatEngine(
+                settings(Path(directory)),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
+            )
+            engine.ask("@Claude 给出候选回答")
+            claude_reply = engine.to_dict()["messages"][-1]
+
+            self.assertNotIn("include_in_context", claude_reply)
+            excluded = engine.set_message_context(claude_reply["id"], False)
+            excluded_state = engine.to_dict()
+            restored_engine = GroupChatEngine(
+                settings(Path(directory)),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
+                excluded_state,
+            )
+            restored_engine.ask("@Codex 第一次检查")
+
+            self.assertFalse(excluded["include_in_context"])
+            self.assertTrue(
+                all(value is None for value in excluded_state["sessions"].values())
+            )
+            self.assertTrue(
+                all(value == 0 for value in excluded_state["cursors"].values())
+            )
+            self.assertTrue(
+                all(
+                    value == 0
+                    for channel in excluded_state["native_context_tokens"].values()
+                    for value in channel.values()
+                )
+            )
+            self.assertNotIn("ONLY_FROM_CLAUDE", codex.calls[0]["prompt"])
+
+            restored = restored_engine.set_message_context(
+                claude_reply["id"],
+                True,
+            )
+            restored_engine.ask("@Codex 第二次检查")
+
+        self.assertNotIn("include_in_context", restored)
+        self.assertIn("ONLY_FROM_CLAUDE", codex.calls[1]["prompt"])
+
+    def test_user_message_cannot_be_removed_from_shared_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            engine = GroupChatEngine(
+                settings(Path(directory)),
+                {
+                    "claude": FakeAdapter(
+                        "Claude",
+                        [AgentRunResult("Claude", "回答", session_id="ca")],
+                    ),
+                    "codex": FakeAdapter("Codex", []),
+                },  # type: ignore[arg-type]
+            )
+            turn = engine.ask("@Claude 用户问题")
+
+            with self.assertRaisesRegex(BridgeError, "只有 Agent 回复"):
+                engine.set_message_context(turn.user_message_id, False)
+
+    def test_deleting_an_agent_reply_resets_native_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            engine = GroupChatEngine(
+                settings(Path(directory)),
+                {
+                    "claude": FakeAdapter(
+                        "Claude",
+                        [AgentRunResult("Claude", "旧回复", session_id="ca")],
+                    ),
+                    "codex": FakeAdapter("Codex", []),
+                },  # type: ignore[arg-type]
+            )
+            engine.ask("@Claude 用户问题")
+            old_reply = engine.to_dict()["messages"][-1]
+
+            removed = engine.delete_assistant_message(old_reply["id"])
+            state = engine.to_dict()
+
+        self.assertEqual(removed["content"], "旧回复")
+        self.assertEqual(
+            [message["role"] for message in state["messages"]],
+            ["user"],
+        )
+        self.assertTrue(all(value is None for value in state["sessions"].values()))
+        self.assertTrue(all(value == 0 for value in state["cursors"].values()))
+
+    def test_recalling_user_message_hides_replies_and_excludes_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            claude = FakeAdapter(
+                "Claude",
+                [AgentRunResult("Claude", "旧的 Agent 回复", session_id="ca")],
+            )
+            codex = FakeAdapter("Codex", [])
+            engine = GroupChatEngine(
+                settings(Path(directory)),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
+            )
+            turn = engine.ask("@Claude 这条消息稍后撤回")
+            before = engine.to_dict()
+            user_id = turn.user_message_id
+            reply = before["messages"][1]
+
+            recalled = engine.recall_user_message(user_id)
+            state = engine.to_dict()
+
+            self.assertTrue(recalled["recalled"])
+            self.assertEqual(state["messages"][0]["content"], "消息已撤回")
+            self.assertTrue(state["messages"][0]["recalled"])
+            self.assertTrue(state["messages"][1]["hidden"])
+            self.assertTrue(state["messages"][1]["recalled"])
+            self.assertTrue(all(value is None for value in state["sessions"].values()))
+            self.assertTrue(all(value == 0 for value in state["cursors"].values()))
+
+            restored = GroupChatEngine(
+                settings(Path(directory)),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
+                state,
+            )
+            self.assertNotIn("旧的 Agent 回复", restored._prompt_for(  # noqa: SLF001
+                "codex",
+                ("codex",),
+                "discuss",
+                session_id=None,
+            )[0])
+            self.assertEqual(reply["content"], "旧的 Agent 回复")
 
     def test_broadcast_answers_in_parallel_sessions_and_persists_context(self) -> None:
         claude = FakeAdapter(
@@ -420,21 +1233,27 @@ class GroupChatTests(unittest.TestCase):
         self.assertEqual(len(claude.calls), 1)
         self.assertEqual(codex.calls, [])
 
-    def test_execution_can_be_disabled_for_group_chat(self) -> None:
+    def test_execution_prefix_can_route_to_all_native_agents(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            resolved = replace(
-                settings(Path(directory)),
-                group_chat_execution=False,
+            repository = _git_repository(Path(directory))
+            claude = FakeAdapter(
+                "Claude", [AgentRunResult("Claude", "Claude 已执行", session_id="ca")]
+            )
+            codex = FakeAdapter(
+                "Codex", [AgentRunResult("Codex", "Codex 已执行", session_id="cb")]
             )
             engine = GroupChatEngine(
-                resolved,
-                {
-                    "claude": FakeAdapter("Claude", []),
-                    "codex": FakeAdapter("Codex", []),
-                },  # type: ignore[arg-type]
+                settings(repository),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
             )
-            with self.assertRaisesRegex(BridgeError, "群聊执行已在设置中关闭"):
-                engine.ask("@Claude 执行：修改文件")
+            turn = engine.ask("@all 执行：分别检查并修改代码")
+
+        self.assertEqual(turn.action, "execute")
+        self.assertEqual(turn.recipients, ("claude", "codex"))
+        self.assertEqual(claude.calls[0]["mode"], "write")
+        self.assertEqual(codex.calls[0]["mode"], "write")
+        self.assertIn("明确要求 Claude 执行", claude.calls[0]["prompt"])
+        self.assertIn("明确要求 Codex 执行", codex.calls[0]["prompt"])
 
     def test_single_agent_executes_directly_in_target_workspace(self) -> None:
         class WritingAdapter(FakeAdapter):
@@ -492,12 +1311,10 @@ class GroupChatTests(unittest.TestCase):
                 "execute",
             )
 
-    def test_single_mentioned_agent_gets_write_access_without_an_exec_prefix(
+    def test_single_mentioned_agent_delegates_read_write_decision_to_native_agent(
         self,
     ) -> None:
-        """Write access is no longer gated on the /exec prefix: a solo recipient
-        holds the workspace in write mode and decides from the message whether
-        editing is warranted."""
+        """Every native Agent receives its normal workspace capabilities."""
 
         with tempfile.TemporaryDirectory() as directory:
             repository = Path(directory) / "repo"
@@ -519,18 +1336,21 @@ class GroupChatTests(unittest.TestCase):
             self.assertEqual(turn.action, "discuss")
             self.assertEqual(claude.calls[0]["mode"], "write")
             self.assertEqual(Path(turn.workspaces["claude"]), repository)
-            self.assertIn("自行判断是否需要修改文件", prompt)
+            self.assertIn("MultiAgent 不替你判断本轮应只读还是写入", prompt)
+            self.assertIn("已经具备本轮工作区的读取和写入能力", prompt)
+            self.assertIn("不得以只读模式或没有工作区写权限为由拒绝", prompt)
             self.assertIn("不要提交 Git", prompt)
 
-    def test_broadcast_turns_stay_read_only_so_only_one_agent_can_write(self) -> None:
+    def test_broadcast_turns_delegate_read_write_decision_to_each_native_agent(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            repository = Path(directory) / "repo"
-            repository.mkdir()
+            repository = _git_repository(Path(directory))
             claude = FakeAdapter(
-                "Claude", [AgentRunResult("Claude", "只读回答", session_id="ca")]
+                "Claude", [AgentRunResult("Claude", "Claude 回答", session_id="ca")]
             )
             codex = FakeAdapter(
-                "Codex", [AgentRunResult("Codex", "只读回答", session_id="cb")]
+                "Codex", [AgentRunResult("Codex", "Codex 回答", session_id="cb")]
             )
             engine = GroupChatEngine(
                 settings(repository),
@@ -538,34 +1358,13 @@ class GroupChatTests(unittest.TestCase):
             )
             turn = engine.ask("@all 帮我改一下这个模块")
 
-            self.assertEqual(turn.workspaces, {})
-            self.assertEqual(claude.calls[0]["mode"], "read")
-            self.assertEqual(codex.calls[0]["mode"], "read")
-            self.assertIn("本轮是只读讨论", claude.calls[0]["prompt"])
-
-    def test_disabling_execution_keeps_a_solo_agent_read_only(self) -> None:
-        """The existing toggle still governs write access; with it off even a
-        single recipient must not receive the workspace in write mode."""
-
-        with tempfile.TemporaryDirectory() as directory:
-            repository = Path(directory) / "repo"
-            repository.mkdir()
-            claude = FakeAdapter(
-                "Claude", [AgentRunResult("Claude", "只读回答", session_id="ca")]
+            self.assertEqual(set(turn.workspaces), {"claude", "codex"})
+            self.assertEqual(claude.calls[0]["mode"], "write")
+            self.assertEqual(codex.calls[0]["mode"], "write")
+            self.assertIn(
+                "MultiAgent 不替你判断本轮应只读还是写入",
+                claude.calls[0]["prompt"],
             )
-            resolved = replace(settings(repository), group_chat_execution=False)
-            engine = GroupChatEngine(
-                resolved,
-                {
-                    "claude": claude,
-                    "codex": FakeAdapter("Codex", []),
-                },  # type: ignore[arg-type]
-            )
-            turn = engine.ask("@Claude 改一下这个文件")
-
-            self.assertEqual(turn.workspaces, {})
-            self.assertEqual(claude.calls[0]["mode"], "read")
-            self.assertIn("本轮是只读讨论", claude.calls[0]["prompt"])
 
     def test_autonomous_writes_are_captured_on_a_discussion_turn(self) -> None:
         """Baseline capture must run on every turn, not just /exec ones -
@@ -631,21 +1430,59 @@ class GroupChatTests(unittest.TestCase):
             self.assertIsNone(turn.changes)
             self.assertNotIn("changes", message)
 
-    def test_all_agent_execution_is_rejected_before_writing(self) -> None:
+    def test_non_git_concurrent_native_agents_remain_non_blocking(self) -> None:
+        claude_started = threading.Event()
+        release_claude = threading.Event()
+        codex_started = threading.Event()
+
+        class BlockingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                if self.display_name == "Claude":
+                    claude_started.set()
+                    release_claude.wait(2)
+                else:
+                    codex_started.set()
+                return next(self.results)
+
         with tempfile.TemporaryDirectory() as directory:
-            engine = GroupChatEngine(
-                settings(Path(directory)),
-                {
-                    "claude": FakeAdapter("Claude", []),
-                    "codex": FakeAdapter("Codex", []),
-                },  # type: ignore[arg-type]
+            workspace = Path(directory)
+            claude = BlockingAdapter(
+                "Claude", [AgentRunResult("Claude", "完成", session_id="ca")]
             )
-            with self.assertRaisesRegex(BridgeError, "一次只能由一个 Agent 执行"):
-                engine.ask("@all 执行：分别修改代码")
+            codex = BlockingAdapter(
+                "Codex", [AgentRunResult("Codex", "完成", session_id="cb")]
+            )
+            engine = GroupChatEngine(
+                settings(workspace),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
+            )
+            first = engine.reserve("@Claude 先处理")
+            first_thread = threading.Thread(
+                target=lambda: engine.ask("@Claude 先处理", reservation=first),
+                daemon=True,
+            )
+            first_thread.start()
+            self.assertTrue(claude_started.wait(1))
 
-        self.assertEqual(engine.to_dict()["messages"], [])
+            second = engine.reserve("@Codex 同时处理")
+            second_thread = threading.Thread(
+                target=lambda: engine.ask("@Codex 同时处理", reservation=second),
+                daemon=True,
+            )
+            second_thread.start()
+            self.assertTrue(codex_started.wait(1))
 
-    def test_edit_and_retry_append_auditable_messages_without_mutating_history(self) -> None:
+            release_claude.set()
+            first_thread.join(2)
+            second_thread.join(2)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(claude.calls[0]["mode"], "write")
+        self.assertEqual(codex.calls[0]["mode"], "write")
+
+    def test_edit_appends_auditable_messages_without_mutating_history(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             engine = GroupChatEngine(
                 settings(Path(directory)),

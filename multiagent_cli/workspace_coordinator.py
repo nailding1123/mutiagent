@@ -4,20 +4,32 @@ from __future__ import annotations
 
 Reads are deliberately not serialized: an Agent that only needs to inspect the
 workspace can use the main checkout even while another Agent is writing it.
-There can be at most one isolated write Worktree.  A second writer starts from
-a snapshot of the main checkout, and its uncommitted diff is applied back to
-the main checkout when the lease ends.  The temporary snapshot commit is an
-unreachable Git object; no user-visible commit or branch is created.
+For ordinary Git workspaces there can be at most one isolated write Worktree.
+A second writer starts from a snapshot of the main checkout, and its
+uncommitted diff is applied back to the main checkout when the lease ends.
+Explicit dual-Agent comparison creates one retained Worktree per candidate
+from one shared snapshot and never applies automatically. Non-Git workspaces
+have no safe snapshot/merge primitive, so native Agents share the target
+workspace. Temporary Git snapshots are unreachable; no user-visible commit or
+branch is created.
 """
 
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
 import threading
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from .workspace_state import (
+    WorkspaceChangeBaseline,
+    capture_change_baseline,
+    summarize_workspace_changes,
+)
 
 
 class WorkspaceCoordinatorError(RuntimeError):
@@ -56,11 +68,480 @@ class _WorkspaceState:
 
 
 class WorkspaceCoordinator:
-    """Grant read access freely and serialize writes with one optional Worktree."""
+    """Coordinate ordinary leases and retained A/B comparison Worktrees."""
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._states: dict[str, _WorkspaceState] = {}
+
+    def validate_comparison_workspace(self, workspace: Path) -> None:
+        """Require a Git checkout with a real HEAD for A/B isolation."""
+
+        repository, _pathspec = _repository_context(workspace)
+        if repository is None:
+            raise WorkspaceCoordinatorError(
+                "双 Agent 对比执行需要 Git 工作区，以便隔离和回滚。"
+                "当前目录无法创建 Worktree，请先初始化 Git 仓库或改用单 Agent 执行。"
+            )
+
+    def prepare_comparison(
+        self,
+        workspace: Path,
+        owners: tuple[str, ...],
+        *,
+        comparison_id: str,
+    ) -> dict[str, Any]:
+        """Create one detached Worktree per candidate from one shared snapshot."""
+
+        self.validate_comparison_workspace(workspace)
+        repository, pathspec = _repository_context(workspace)
+        assert repository is not None
+        baseline = capture_change_baseline(workspace)
+        if not baseline.available or not baseline.tree:
+            raise WorkspaceCoordinatorError(
+                baseline.reason or "无法记录双 Agent 对比执行的工作区基线"
+            )
+        base_commit = _snapshot_commit(repository, pathspec)
+        candidates: dict[str, dict[str, Any]] = {}
+        created_roots: list[Path] = []
+        try:
+            for owner in owners:
+                worktree_root = _create_worktree_from_base(
+                    repository,
+                    base_commit,
+                    prefix=f"multiagent-{comparison_id}-{owner}-",
+                )
+                created_roots.append(worktree_root)
+                candidate_workspace = (
+                    worktree_root
+                    if pathspec == "."
+                    else worktree_root / Path(pathspec)
+                )
+                candidate_baseline = capture_change_baseline(candidate_workspace)
+                if not candidate_baseline.available or not candidate_baseline.tree:
+                    raise WorkspaceCoordinatorError(
+                        candidate_baseline.reason
+                        or f"无法记录 {owner} 候选工作区基线"
+                    )
+                quoted = shlex.quote(str(candidate_workspace))
+                candidates[owner] = {
+                    "workspace": str(candidate_workspace),
+                    "worktree_root": str(worktree_root),
+                    "base_commit": base_commit,
+                    "baseline": candidate_baseline.to_dict(),
+                    "status": "running",
+                    "changes": None,
+                    "response_message_id": "",
+                    "preview_commands": [
+                        f"cd {quoted}",
+                        "git status --short",
+                        "git diff --stat",
+                        "git diff",
+                        "git diff --check",
+                    ],
+                    "apply_status": "pending",
+                    "error": "",
+                    "cleaned": False,
+                }
+        except BaseException:
+            for root in created_roots:
+                _remove_worktree(root)
+            raise
+        return {
+            "id": comparison_id,
+            "status": "running",
+            "trigger_message_id": "",
+            "created_at": _timestamp(),
+            "base": {
+                **baseline.to_dict(),
+                "commit": base_commit,
+                "created_at": _timestamp(),
+            },
+            "selected_agent": None,
+            "candidates": candidates,
+            "error": "",
+            "recovery_patch": "",
+        }
+
+    def candidate_workspace(
+        self,
+        comparison: dict[str, Any],
+        agent: str,
+    ) -> Path:
+        candidate = _comparison_candidate(comparison, agent)
+        workspace = Path(str(candidate.get("workspace") or "")).resolve()
+        if not workspace.is_dir():
+            raise WorkspaceCoordinatorError(f"{agent} 候选工作区已经不存在")
+        return workspace
+
+    def collect_candidate_diff(
+        self,
+        comparison: dict[str, Any],
+        agent: str,
+    ) -> dict[str, Any]:
+        candidate = _comparison_candidate(comparison, agent)
+        baseline = WorkspaceChangeBaseline.from_dict(candidate.get("baseline"))
+        workspace = self.candidate_workspace(comparison, agent)
+        if baseline is None:
+            raise WorkspaceCoordinatorError(f"{agent} 候选缺少有效工作区基线")
+        return summarize_workspace_changes(workspace, baseline)
+
+    def apply_candidate(
+        self,
+        comparison: dict[str, Any],
+        agent: str,
+    ) -> dict[str, Any]:
+        """Apply exactly one candidate when the main checkout still matches base."""
+
+        candidate = _comparison_candidate(comparison, agent)
+        if candidate.get("status") not in {"ready", "no_changes"}:
+            raise WorkspaceCoordinatorError("只有已完成的候选方案可以采用")
+        target_workspace, base = _comparison_target(comparison)
+        target = Path(str(base.get("repository"))).resolve()
+        current = capture_change_baseline(target_workspace)
+        preview = comparison.get("preview") if isinstance(comparison.get("preview"), dict) else {}
+        preview_agent = str(preview.get("active_agent") or "")
+        selected_tree = _candidate_tree(candidate)
+        current_is_selected = bool(selected_tree and current.tree == selected_tree)
+        if current_is_selected:
+            rollback = _save_rollback_metadata(
+                target_workspace,
+                _baseline_from_comparison_base(base),
+                current,
+                f"{comparison.get('id', 'comparison')}-{agent}",
+            )
+            self.cleanup_comparison(comparison)
+            return {
+                "applied": True,
+                "error": "",
+                "recovery_patch": "",
+                "rollback": rollback,
+            }
+        if preview_agent and preview_agent != agent:
+            active_candidate = _comparison_candidate(comparison, preview_agent)
+            active_tree = _candidate_tree(active_candidate)
+            if not active_tree or not current.available or current.tree != active_tree:
+                raise WorkspaceCoordinatorError(
+                    "主工作区在预览期间发生了变化，已停止切换以避免覆盖现有修改。"
+                )
+            _apply_patch(target_workspace, _comparison_patch(active_candidate, target_workspace), reverse=True)
+            current = capture_change_baseline(target_workspace)
+        if not current.available or current.tree != str(base.get("tree") or ""):
+            patch = _comparison_patch(candidate, target_workspace)
+            recovery = _save_recovery_patch(
+                target_workspace,
+                f"{comparison.get('id', 'comparison')}-{agent}",
+                patch,
+            )
+            return {
+                "applied": False,
+                "error": (
+                    "主工作区在对比期间发生了变化，已停止应用以避免覆盖现有修改。"
+                    "候选补丁已保留，请先处理主工作区变化后再重试。"
+                ),
+                "recovery_patch": str(recovery or ""),
+            }
+        patch = _comparison_patch(candidate, target_workspace)
+        if patch:
+            result = _git(
+                target,
+                "apply",
+                "--binary",
+                "--whitespace=nowarn",
+                input_text=patch,
+            )
+            if result.returncode != 0:
+                recovery = _save_recovery_patch(
+                    target_workspace,
+                    f"{comparison.get('id', 'comparison')}-{agent}",
+                    patch,
+                )
+                return {
+                    "applied": False,
+                    "error": "候选补丁无法安全应用到主工作区，已停止应用。",
+                    "recovery_patch": str(recovery or ""),
+                }
+        after = capture_change_baseline(target_workspace)
+        rollback = _save_rollback_metadata(
+            target_workspace,
+            _baseline_from_comparison_base(base),
+            after,
+            f"{comparison.get('id', 'comparison')}-{agent}",
+        )
+        self.cleanup_comparison(comparison)
+        return {
+            "applied": True,
+            "error": "",
+            "recovery_patch": "",
+            "rollback": rollback,
+        }
+
+    def rollback_patch(self, metadata: object) -> dict[str, Any]:
+        """Safely reverse one previously recorded workspace change.
+
+        The patch is only applied when the workspace still has the exact tree
+        that was recorded immediately after the Agent turn. This conservative
+        check prevents a rollback from removing unrelated user changes.
+        """
+
+        if not isinstance(metadata, dict) or metadata.get("available") is not True:
+            return {
+                "status": "unavailable",
+                "rolled_back": False,
+                "error": "这条 Agent 回复没有可回撤的完整补丁。",
+                "recovery_patch": "",
+            }
+        workspace_text = str(metadata.get("workspace") or "")
+        patch_text = str(metadata.get("path") or "")
+        before_tree = str(metadata.get("before_tree") or "")
+        after_tree = str(metadata.get("after_tree") or "")
+        if not workspace_text or not patch_text or not before_tree or not after_tree:
+            return {
+                "status": "unavailable",
+                "rolled_back": False,
+                "error": "回撤记录不完整，无法安全操作。",
+                "recovery_patch": patch_text,
+            }
+        workspace = Path(workspace_text).expanduser().resolve()
+        patch = Path(patch_text).expanduser().resolve()
+        if not workspace.is_dir() or not patch.is_file():
+            return {
+                "status": "unavailable",
+                "rolled_back": False,
+                "error": "主工作区或回撤补丁已经不存在。",
+                "recovery_patch": patch_text,
+            }
+        repository, pathspec = _repository_context(workspace)
+        if repository is None or pathspec != str(metadata.get("pathspec") or "."):
+            return {
+                "status": "unavailable",
+                "rolled_back": False,
+                "error": "回撤记录对应的 Git 工作区已经发生变化。",
+                "recovery_patch": patch_text,
+            }
+        if Path(str(metadata.get("repository") or "")).resolve() != repository:
+            return {
+                "status": "unavailable",
+                "rolled_back": False,
+                "error": "回撤记录不属于当前主工作区。",
+                "recovery_patch": patch_text,
+            }
+        if not _is_within_git_common_dir(repository, patch):
+            return {
+                "status": "unavailable",
+                "rolled_back": False,
+                "error": "回撤补丁路径不受信任，已停止操作。",
+                "recovery_patch": patch_text,
+            }
+        current = capture_change_baseline(workspace)
+        if not current.available or current.tree != after_tree:
+            return {
+                "status": "conflict",
+                "rolled_back": False,
+                "error": (
+                    "主工作区在 Agent 完成后发生了变化，已停止回撤以避免覆盖现有修改。"
+                    "原始回撤补丁已保留，请先处理主工作区变化。"
+                ),
+                "recovery_patch": patch_text,
+            }
+        try:
+            patch_content = patch.read_text(encoding="utf-8")
+            checked = _git(
+                repository,
+                "apply",
+                "--check",
+                "--binary",
+                "--whitespace=nowarn",
+                input_text=patch_content,
+            )
+            if checked.returncode != 0:
+                raise WorkspaceCoordinatorError(
+                    checked.stderr.strip() or "Git 无法校验回撤补丁"
+                )
+            applied = _git(
+                repository,
+                "apply",
+                "--binary",
+                "--whitespace=nowarn",
+                input_text=patch_content,
+            )
+            if applied.returncode != 0:
+                raise WorkspaceCoordinatorError(
+                    applied.stderr.strip() or "Git 无法应用回撤补丁"
+                )
+        except (OSError, WorkspaceCoordinatorError) as exc:
+            return {
+                "status": "conflict",
+                "rolled_back": False,
+                "error": f"回撤补丁无法安全应用：{exc}",
+                "recovery_patch": patch_text,
+            }
+        restored = capture_change_baseline(workspace)
+        if not restored.available or restored.tree != before_tree:
+            return {
+                "status": "conflict",
+                "rolled_back": False,
+                "error": "回撤后工作区校验未通过，已停止继续操作；请检查当前文件。",
+                "recovery_patch": patch_text,
+            }
+        return {
+            "status": "rolled_back",
+            "rolled_back": True,
+            "error": "",
+            "recovery_patch": patch_text,
+        }
+
+    def save_rollback(
+        self,
+        workspace: Path,
+        before: WorkspaceChangeBaseline | None,
+        after: WorkspaceChangeBaseline | None,
+        owner: str,
+    ) -> dict[str, Any] | None:
+        """Persist a rollback patch for a completed write turn."""
+
+        return _save_rollback_metadata(workspace, before, after, owner)
+
+    def preview_candidate(
+        self,
+        comparison: dict[str, Any],
+        agent: str,
+    ) -> dict[str, Any]:
+        """Temporarily materialize one candidate in the main checkout.
+
+        This is deliberately a reversible patch switch rather than source-code
+        commenting. Arbitrary projects may contain binary files, generated
+        sources, deleted files, or syntax where comments are not valid.
+        """
+
+        candidate = _comparison_candidate(comparison, agent)
+        if candidate.get("status") not in {"ready", "no_changes"}:
+            raise WorkspaceCoordinatorError("只有已完成的候选方案可以预览")
+        target_workspace, base = _comparison_target(comparison)
+        current = capture_change_baseline(target_workspace)
+        if not current.available:
+            raise WorkspaceCoordinatorError(current.reason or "无法读取主工作区状态")
+        candidate_tree = _candidate_tree(candidate)
+        if not candidate_tree:
+            raise WorkspaceCoordinatorError("候选方案缺少可预览的工作区快照")
+        preview = comparison.get("preview")
+        if not isinstance(preview, dict):
+            preview = {"active_agent": "", "main_tree": str(base.get("tree") or "")}
+            comparison["preview"] = preview
+        active_agent = str(preview.get("active_agent") or "")
+        if active_agent == agent and current.tree == candidate_tree:
+            return {"previewed": True, "agent": agent, "error": ""}
+
+        if active_agent:
+            active_candidate = _comparison_candidate(comparison, active_agent)
+            active_tree = _candidate_tree(active_candidate)
+            if not active_tree or current.tree != active_tree:
+                raise WorkspaceCoordinatorError(
+                    "主工作区在预览期间发生了变化，已停止切换以避免覆盖现有修改。"
+                )
+            active_patch = _comparison_patch(active_candidate, target_workspace)
+            if active_patch:
+                _apply_patch(target_workspace, active_patch, reverse=True)
+        elif current.tree != str(base.get("tree") or ""):
+            raise WorkspaceCoordinatorError(
+                "主工作区在对比期间发生了变化，已停止预览以避免覆盖现有修改。"
+            )
+
+        target_patch = _comparison_patch(candidate, target_workspace)
+        if target_patch:
+            _apply_patch(target_workspace, target_patch)
+        after = capture_change_baseline(target_workspace)
+        if not after.available or after.tree != candidate_tree:
+            raise WorkspaceCoordinatorError("候选方案未能完整应用到主工作区，已停止预览。")
+        preview["active_agent"] = agent
+        preview["main_tree"] = candidate_tree
+        preview["updated_at"] = _timestamp()
+        return {"previewed": True, "agent": agent, "error": ""}
+
+    def cleanup_comparison(self, comparison: dict[str, Any]) -> None:
+        """Remove candidate Worktrees without changing the main checkout."""
+
+        candidates = comparison.get("candidates")
+        if not isinstance(candidates, dict):
+            return
+        for candidate in candidates.values():
+            if not isinstance(candidate, dict):
+                continue
+            root_text = str(candidate.get("worktree_root") or "")
+            if root_text:
+                _remove_worktree(Path(root_text))
+            candidate["cleaned"] = True
+
+    def discard_comparison(self, comparison: dict[str, Any]) -> None:
+        preview = comparison.get("preview") if isinstance(comparison.get("preview"), dict) else {}
+        active_agent = str(preview.get("active_agent") or "")
+        if active_agent:
+            target_workspace, base = _comparison_target(comparison)
+            current = capture_change_baseline(target_workspace)
+            active_candidate = _comparison_candidate(comparison, active_agent)
+            active_tree = _candidate_tree(active_candidate)
+            if not current.available or not active_tree or current.tree != active_tree:
+                raise WorkspaceCoordinatorError(
+                    "主工作区在预览期间发生了变化，无法安全恢复原始状态；候选工作区仍保留。"
+                )
+            active_patch = _comparison_patch(active_candidate, target_workspace)
+            if active_patch:
+                _apply_patch(target_workspace, active_patch, reverse=True)
+            restored = capture_change_baseline(target_workspace)
+            if not restored.available or restored.tree != str(base.get("tree") or ""):
+                raise WorkspaceCoordinatorError("无法恢复预览前的主工作区状态；候选工作区仍保留。")
+            preview["active_agent"] = ""
+            preview["main_tree"] = restored.tree
+        self.cleanup_comparison(comparison)
+
+    def recover_comparison(self, comparison: object) -> dict[str, Any] | None:
+        """Validate persisted candidate paths without ever touching main files."""
+
+        if not isinstance(comparison, dict) or not isinstance(comparison.get("id"), str):
+            return None
+        recovered = dict(comparison)
+        recovered["candidates"] = {
+            str(agent): dict(candidate)
+            for agent, candidate in (comparison.get("candidates") or {}).items()
+            if isinstance(agent, str) and isinstance(candidate, dict)
+        }
+        if recovered.get("status") in {"applied", "discarded"}:
+            return recovered
+        for agent, candidate in recovered["candidates"].items():
+            workspace = Path(str(candidate.get("workspace") or ""))
+            if not workspace.is_dir():
+                candidate["status"] = "unavailable"
+                candidate["error"] = "候选 Worktree 已不存在"
+                candidate["cleaned"] = True
+                continue
+            if candidate.get("status") == "running":
+                try:
+                    changes = self.collect_candidate_diff(recovered, agent)
+                    candidate["changes"] = changes
+                    file_count = changes.get("file_count")
+                    has_changes = (
+                        isinstance(file_count, int)
+                        and not isinstance(file_count, bool)
+                        and file_count > 0
+                    ) or bool(changes.get("files"))
+                    candidate["status"] = (
+                        "unavailable"
+                        if changes.get("available") is False
+                        else "ready"
+                        if has_changes
+                        else "no_changes"
+                    )
+                    candidate["error"] = (
+                        str(changes.get("reason") or "无法生成候选变更预览")
+                        if candidate["status"] == "unavailable"
+                        else ""
+                    )
+                except WorkspaceCoordinatorError as exc:
+                    candidate["error"] = str(exc)
+                    candidate["status"] = "unavailable"
+        if recovered.get("status") in {"running", "applying"}:
+            recovered["status"] = "review"
+        return recovered
 
     def acquire(
         self,
@@ -68,12 +549,19 @@ class WorkspaceCoordinator:
         *,
         owner: str,
         access: str,
+        isolate: bool = True,
     ) -> WorkspaceLease:
         target = workspace
         if access != "write":
             return WorkspaceLease(self, target, target, owner, "read")
 
         repository, pathspec = _repository_context(target)
+        if repository is None:
+            # MultiAgent no longer predicts whether a native Agent will write.
+            # Without Git there is no Worktree isolation available, so keep
+            # independent Agent turns non-blocking and let their native rules
+            # decide how to use the shared workspace.
+            return WorkspaceLease(self, target, target, owner, "shared-write")
         key = str(target)
         with self._lock:
             state = self._states.get(key)
@@ -82,6 +570,15 @@ class WorkspaceCoordinator:
                 self._states[key] = state
 
             while True:
+                if not isolate:
+                    # A shared checkout cannot safely host overlapping writes.
+                    # Queue the second writer instead of creating a Worktree
+                    # whose patch may conflict with the first writer later.
+                    if state.main_writer is None and state.worktree_owner is None:
+                        state.main_writer = owner
+                        return WorkspaceLease(self, target, target, owner, "write")
+                    state.condition.wait()
+                    continue
                 # The first writer owns the real checkout.  A second, distinct
                 # writer gets the only isolated Worktree while that lease is
                 # active; all other writes wait for one of the two to finish.
@@ -117,12 +614,6 @@ class WorkspaceCoordinator:
                         base_commit=base_commit,
                     )
 
-                if repository is None and state.main_writer is not None:
-                    raise WorkspaceCoordinatorError(
-                        "主工作区正在被另一个 Agent 写入；当前目录不是 Git 仓库，"
-                        "无法创建隔离 Worktree，请稍后重试。"
-                    )
-
                 state.condition.wait()
 
     def release(self, lease: WorkspaceLease) -> dict[str, Any]:
@@ -152,10 +643,21 @@ class WorkspaceCoordinator:
             error = ""
             merged = True
             patch = ""
+            rollback: dict[str, Any] | None = None
             try:
                 patch = _worktree_patch(lease)
                 if patch:
+                    before = capture_change_baseline(lease.target_workspace)
                     _apply_patch(lease.target_workspace, patch)
+                    after = capture_change_baseline(lease.target_workspace)
+                    rollback = _save_rollback_metadata(
+                        lease.target_workspace,
+                        before,
+                        after,
+                        lease.owner,
+                    )
+                else:
+                    rollback = None
             except WorkspaceCoordinatorError as exc:
                 merged = False
                 recovery = _save_recovery_patch(
@@ -174,7 +676,12 @@ class WorkspaceCoordinator:
                     state.worktree_base = ""
                     state.condition.notify_all()
                 self._drop_state_if_idle(key, state)
-            return {"isolated": True, "merged": merged, "error": error}
+            return {
+                "isolated": True,
+                "merged": merged,
+                "error": error,
+                "rollback": rollback if merged else None,
+            }
 
     def _drop_state_if_idle(self, key: str, state: _WorkspaceState) -> None:
         if state.main_writer is None and state.worktree_owner is None:
@@ -199,7 +706,16 @@ def _repository_context(workspace: Path) -> tuple[Path | None, str]:
 
 def _create_worktree(repository: Path, pathspec: str) -> tuple[Path, str]:
     base_commit = _snapshot_commit(repository, pathspec)
-    temporary = Path(tempfile.mkdtemp(prefix="multiagent-worktree-"))
+    return _create_worktree_from_base(repository, base_commit), base_commit
+
+
+def _create_worktree_from_base(
+    repository: Path,
+    base_commit: str,
+    *,
+    prefix: str = "multiagent-worktree-",
+) -> Path:
+    temporary = Path(tempfile.mkdtemp(prefix=prefix))
     # git worktree add wants to create the target directory itself.
     temporary.rmdir()
     result = _git(repository, "worktree", "add", "--detach", str(temporary), base_commit)
@@ -208,7 +724,7 @@ def _create_worktree(repository: Path, pathspec: str) -> tuple[Path, str]:
         raise WorkspaceCoordinatorError(
             f"无法创建隔离 Worktree：{result.stderr.strip() or 'git worktree add 失败'}"
         )
-    return temporary, base_commit
+    return temporary
 
 
 def _snapshot_commit(repository: Path, pathspec: str) -> str:
@@ -299,18 +815,155 @@ def _worktree_patch(lease: WorkspaceLease) -> str:
         return result.stdout
 
 
-def _apply_patch(workspace: Path, patch: str) -> None:
+def _comparison_candidate(
+    comparison: dict[str, Any],
+    agent: str,
+) -> dict[str, Any]:
+    candidates = comparison.get("candidates")
+    candidate = candidates.get(agent) if isinstance(candidates, dict) else None
+    if not isinstance(candidate, dict):
+        raise WorkspaceCoordinatorError(f"找不到 {agent} 候选方案")
+    return candidate
+
+
+def _comparison_target(
+    comparison: dict[str, Any],
+) -> tuple[Path, dict[str, Any]]:
+    base = comparison.get("base") if isinstance(comparison.get("base"), dict) else {}
+    repository_text = str(base.get("repository") or "")
+    target = Path(repository_text).expanduser().resolve() if repository_text else None
+    if target is None or not target.is_dir():
+        raise WorkspaceCoordinatorError("对比任务的主工作区已经不存在")
+    pathspec = str(base.get("pathspec") or ".")
+    target_workspace = target if pathspec == "." else target / Path(pathspec)
+    if not target_workspace.is_dir():
+        raise WorkspaceCoordinatorError("对比任务的主工作区路径已经不存在")
+    return target_workspace, base
+
+
+def _candidate_tree(candidate: dict[str, Any]) -> str:
+    stored = str(candidate.get("result_tree") or "")
+    if stored:
+        return stored
+    workspace_text = str(candidate.get("workspace") or "")
+    if not workspace_text:
+        return ""
+    baseline = capture_change_baseline(Path(workspace_text))
+    return baseline.tree if baseline.available else ""
+
+
+def _baseline_from_comparison_base(base: dict[str, Any]) -> WorkspaceChangeBaseline:
+    baseline = WorkspaceChangeBaseline.from_dict(base)
+    if baseline is None:
+        return WorkspaceChangeBaseline(False, reason="对比任务缺少有效主工作区基线")
+    return baseline
+
+
+def _save_rollback_metadata(
+    workspace: Path,
+    before: WorkspaceChangeBaseline | None,
+    after: WorkspaceChangeBaseline | None,
+    owner: str,
+) -> dict[str, Any] | None:
+    """Persist an exact after->before patch and its tree guards."""
+
+    if (
+        before is None
+        or after is None
+        or not before.available
+        or not after.available
+        or not before.tree
+        or not after.tree
+        or before.repository != after.repository
+        or before.pathspec != after.pathspec
+        or before.tree == after.tree
+    ):
+        return None
+    repository = Path(before.repository)
+    result = _git(
+        repository,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "--no-renames",
+        after.tree,
+        before.tree,
+        "--",
+        before.pathspec,
+    )
+    if result.returncode != 0 or not result.stdout:
+        return None
+    path = _save_recovery_patch(
+        workspace,
+        f"{owner}-rollback-{_timestamp()}",
+        result.stdout,
+    )
+    if path is None:
+        return None
+    return {
+        "available": True,
+        "status": "available",
+        "path": str(path),
+        "workspace": str(workspace.resolve()),
+        "repository": before.repository,
+        "pathspec": before.pathspec,
+        "before_tree": before.tree,
+        "after_tree": after.tree,
+        "created_at": _timestamp(),
+    }
+
+
+def _is_within_git_common_dir(repository: Path, candidate: Path) -> bool:
+    common = _git(repository, "rev-parse", "--git-common-dir")
+    if common.returncode != 0 or not common.stdout.strip():
+        return False
+    common_dir = Path(common.stdout.strip())
+    if not common_dir.is_absolute():
+        common_dir = repository / common_dir
+    try:
+        candidate.relative_to(common_dir.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _comparison_patch(candidate: dict[str, Any], target_workspace: Path) -> str:
+    root_text = str(candidate.get("worktree_root") or "")
+    base_commit = str(candidate.get("base_commit") or "")
+    if not root_text or not base_commit:
+        raise WorkspaceCoordinatorError("候选方案缺少 Worktree 恢复信息")
+    lease = WorkspaceLease(
+        coordinator=WorkspaceCoordinator(),
+        workspace=Path(str(candidate.get("workspace") or root_text)),
+        target_workspace=target_workspace,
+        owner="comparison",
+        access="write",
+        worktree_root=Path(root_text),
+        base_commit=base_commit,
+    )
+    return _worktree_patch(lease)
+
+
+def _apply_patch(workspace: Path, patch: str, *, reverse: bool = False) -> None:
+    if not patch:
+        return
     repository, _ = _repository_context(workspace)
     target = repository or workspace
+    direction = ["-R"] if reverse else []
     result = _git(
         target,
         "apply",
+        *direction,
         "--binary",
         "--whitespace=nowarn",
         input_text=patch,
     )
     if result.returncode == 0:
         return
+    if reverse:
+        raise WorkspaceCoordinatorError(
+            "无法恢复预览前的主工作区状态；候选工作区仍保留。"
+        )
     # Retry with Git's 3-way merger when the direct patch no longer matches the
     # main writer's result. --3way stages its output, so restore the caller's
     # index afterwards without touching working files.
@@ -401,3 +1054,7 @@ def _git(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return subprocess.CompletedProcess(["git", *args], 1, "", str(exc))
+
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")

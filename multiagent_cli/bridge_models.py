@@ -8,20 +8,44 @@ from typing import Any
 
 from .token_api import TokenAPISettings
 
-DEFAULT_GROUP_CHAT_AGENT_A_IDENTITY = (
+DEFAULT_GROUP_CHAT_IDENTITY = (
+    "你是 MultiAgent 群聊中的一名原生 Agent 协作伙伴。直接回应用户当前的问题，"
+    "并结合群聊历史补充有价值的信息。若另一位 Agent 已经回答，不要机械重复；"
+    "可以认可正确部分、指出遗漏或提出不同看法。表达自然、清晰、简洁，不要把普通交流"
+    "强行变成正式方案或评审流程。涉及代码时先依据工作区事实判断，不确定的内容要明确说明。"
+)
+DEFAULT_GROUP_CHAT_AGENT_A_IDENTITY = DEFAULT_GROUP_CHAT_IDENTITY
+DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY = DEFAULT_GROUP_CHAT_IDENTITY
+
+LEGACY_GROUP_CHAT_AGENT_A_IDENTITY = (
     "你是群聊中的 Claude，一名善于理解需求、分析复杂问题和组织方案的协作伙伴。"
     "直接回应用户当前的问题，并结合群聊历史补充有价值的信息。若 Codex 已经回答，"
     "不要机械重复；可以认可正确部分、指出遗漏或提出不同看法。表达自然、清晰、简洁，"
     "不要把普通交流强行变成正式方案或评审流程。涉及代码时先依据工作区事实判断，"
     "不确定的内容要明确说明。"
 )
-DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY = (
+LEGACY_GROUP_CHAT_AGENT_B_IDENTITY = (
     "你是群聊中的 Codex，一名偏重代码实现、工程细节和验证结果的协作伙伴。"
     "直接回应用户当前的问题，并结合群聊历史给出可执行的建议。若 Claude 已经回答，"
     "不要机械重复；优先补充代码事实、边界情况、风险和验证方法，也可以明确提出不同意见。"
-    "表达自然、清晰、简洁，不要把普通交流强行变成正式方案或评审流程。涉及代码时以实际"
-    "工作区内容为依据，不确定的内容要明确说明。"
+    "表达自然、清晰、简洁，不要把普通交流强行变成正式方案或评审流程。"
+    "涉及代码时以实际工作区内容为依据，不确定的内容要明确说明。"
 )
+_LEGACY_GROUP_CHAT_IDENTITIES = {
+    LEGACY_GROUP_CHAT_AGENT_A_IDENTITY,
+    LEGACY_GROUP_CHAT_AGENT_B_IDENTITY,
+}
+
+
+def normalize_group_chat_identity(value: str) -> str:
+    """Map former built-in role prompts to the shared neutral default."""
+
+    normalized = value.strip()
+    return (
+        DEFAULT_GROUP_CHAT_IDENTITY
+        if normalized in _LEGACY_GROUP_CHAT_IDENTITIES
+        else normalized
+    )
 
 EVENT_PROTOCOL = "multiagent.event.v2"
 
@@ -83,6 +107,18 @@ class AgentTimeoutError(BridgeError):
     """One model attempt exceeded its configured response timeout."""
 
 
+class AgentModelCompatibilityError(BridgeError):
+    """A configured model rejected the native Agent protocol shape."""
+
+    def __init__(self, agent_name: str, model: str | None, reason: str) -> None:
+        self.agent_name = agent_name
+        self.model = model or "CLI 默认模型"
+        self.reason = reason
+        super().__init__(
+            f"{agent_name} 模型 {self.model} 与当前 CLI/API 协议不兼容：{reason}"
+        )
+
+
 class NativeInteractionUnavailable(BridgeError):
     """A native CLI requested user interaction but no handler was attached."""
 
@@ -100,6 +136,16 @@ class AgentCommandSettings:
 
 
 @dataclass(frozen=True)
+class ContextCompactionSettings:
+    """How shared chat history is projected into bounded Agent context."""
+
+    enabled: bool = True
+    threshold_tokens: int = 16_000
+    target_tokens: int = 8_000
+    recent_messages: int = 8
+
+
+@dataclass(frozen=True)
 class BridgeSettings:
     """Resolved settings for a Claude/Codex bridge session."""
 
@@ -110,7 +156,12 @@ class BridgeSettings:
     group_chat_agent_a_identity: str = DEFAULT_GROUP_CHAT_AGENT_A_IDENTITY
     group_chat_agent_b_identity: str = DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY
     group_chat_default_agent: str = "both"
-    group_chat_execution: bool = True
+    # Isolated Git worktrees are opt-in: overlapping Agent edits are safer when
+    # serialized in the shared checkout than merged after both have finished.
+    worktree: bool = False
+    context_compaction: ContextCompactionSettings = field(
+        default_factory=ContextCompactionSettings
+    )
     token_api: TokenAPISettings = field(default_factory=TokenAPISettings)
 
 
@@ -208,6 +259,7 @@ class AgentEvent:
             limit=40,
         )
         tool_name = _public_activity_value(metadata.get("tool_name"), limit=120)
+        activity_id = _public_activity_value(metadata.get("activity_id"), limit=200)
         command = _public_activity_value(metadata.get("command"))
         path = _public_activity_value(metadata.get("path"))
         output = _public_activity_value(metadata.get("output"))
@@ -233,6 +285,7 @@ class AgentEvent:
             selected_detail = command or path or detail
 
         return {
+            "id": activity_id,
             "type": activity_type,
             "title": title,
             "tool_name": tool_name,
