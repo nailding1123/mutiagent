@@ -1199,6 +1199,66 @@ if ([...state.streamBuffers.keys()].some((key) => key.startsWith('run-1:'))) {
         self.assertTrue(messages[1]["hidden"])
         self.assertTrue(messages[1]["recalled"])
 
+    def test_recall_chat_message_stops_an_active_agent_turn(self) -> None:
+        class BlockingAdapter(FakeChatAdapter):
+            def __init__(self, name: str) -> None:
+                super().__init__(name, [])
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.stop_requested = False
+
+            def request_stop(self) -> None:
+                self.stop_requested = True
+                self.release.set()
+
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                self.started.set()
+                self.release.wait(3)
+                if self.stop_requested:
+                    raise KeyboardInterrupt
+                return AgentRunResult(self.display_name, "意外完成")
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".multiagent.json").write_text(
+                json.dumps({
+                    "claude": {"command": "/bin/echo"},
+                    "codex": {"command": "/bin/echo"},
+                }),
+                encoding="utf-8",
+            )
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            claude = BlockingAdapter("Claude")
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={
+                    "claude": claude,
+                    "codex": FakeChatAdapter("Codex", []),
+                },
+            ):
+                started = manager.start_task({"task": "@Claude 这条消息稍后撤回"})
+                self.assertTrue(claude.started.wait(2))
+                record = manager.store.get(started["id"]) or {}
+                user_id = record["group_chat"]["messages"][0]["id"]
+                result = manager.recall_chat_message(started["id"], user_id)
+                self.assertTrue(claude.stop_requested)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    current = manager.store.get(started["id"]) or {}
+                    if current.get("status") in {"ready", "interrupted", "failed"}:
+                        break
+                    time.sleep(0.01)
+                self.assertIn(
+                    (manager.store.get(started["id"]) or {}).get("status"),
+                    {"ready", "interrupted", "failed"},
+                )
+
+        self.assertTrue(result["message"]["recalled"])
+
     def test_retry_replaces_old_reply_while_continue_keeps_current_reply(
         self,
     ) -> None:

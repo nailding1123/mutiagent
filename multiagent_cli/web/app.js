@@ -57,7 +57,7 @@ const MAX_DOCUMENT_FILES = 5;
 const MAX_DOCUMENT_FILE_BYTES = 10_000_000;
 const MAX_DOCUMENT_TOTAL_BYTES = 20_000_000;
 const THEMES = Object.freeze({
-  paper: { label: '协作纸张', colorScheme: 'light', themeColor: '#faf5e6' },
+  paper: { label: '雾面工作台', colorScheme: 'light', themeColor: '#f4f7f8' },
   ocean: { label: '深海终端', colorScheme: 'dark', themeColor: '#071019' },
   graphite: { label: '石墨专业', colorScheme: 'light', themeColor: '#f5f7f9' },
   botanical: { label: '植物工作室', colorScheme: 'light', themeColor: '#f5f1e8' },
