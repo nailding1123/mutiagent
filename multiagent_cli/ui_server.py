@@ -239,7 +239,7 @@ class UISession:
 
     def has_active_chat_turns(self) -> bool:
         with self._condition:
-            return bool(self._active_chat_turns)
+            return bool(self._active_chat_turns or self._native_interactions)
 
     def begin_chat_turn(
         self,
@@ -303,7 +303,10 @@ class UISession:
 
     def request_stop(self) -> None:
         with self._condition:
-            if self.status not in ACTIVE_STATUSES:
+            has_active_work = bool(
+                self._active_chat_turns or self._native_interactions
+            )
+            if self.status not in ACTIVE_STATUSES and not has_active_work:
                 raise UIError("当前任务已经结束")
             if self._stop_requested:
                 return
@@ -1673,7 +1676,7 @@ class UISessionManager:
         except (KeyError, OSError) as exc:
             raise UIError(f"保存撤回消息失败：{exc}") from exc
 
-        if should_stop and session is not None and session.status in ACTIVE_STATUSES:
+        if should_stop and session is not None:
             try:
                 session.request_stop()
             except UIError:
@@ -2489,7 +2492,7 @@ def make_request_handler(manager: UISessionManager, static_root: Path):
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'self'; script-src 'self'; style-src 'self'; "
-                "connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'",
+                "connect-src 'self'; img-src 'self' data: blob:; frame-ancestors 'none'",
             )
 
         def log_message(self, _format: str, *_args: object) -> None:
