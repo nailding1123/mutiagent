@@ -593,6 +593,13 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .comparison-panel-notice code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .comparison-panel-notice button { justify-self: start; padding: 4px 7px; font-size: 9px; }
 .comparison-panel-conflict { color: var(--danger-ink); background: var(--danger-soft); }
+.comparison-drift-files { margin-top: 7px; padding-top: 7px; border-top: 1px solid color-mix(in srgb, var(--danger-ink) 20%, transparent); }
+.comparison-drift-files strong { display: block; margin-bottom: 4px; font-size: 10px; }
+.comparison-drift-files ul { display: grid; gap: 3px; margin: 0; padding: 0; list-style: none; }
+.comparison-drift-files li { display: flex; align-items: center; gap: 7px; min-width: 0; font-family: var(--mono); font-size: 9px; }
+.comparison-drift-files li code { overflow: hidden; flex: 1; text-overflow: ellipsis; white-space: nowrap; }
+.comparison-drift-files li span { color: var(--danger-ink); font-size: 8px; font-weight: 800; }
+.comparison-drift-files small { display: block; margin-top: 4px; opacity: .78; }
 .comparison-panel-success { background: var(--success-soft); }
 .comparison-panel-preview { background: var(--highlight-soft); }
 .comparison-selection-notice { display: grid; gap: 4px; margin-bottom: 9px; padding: 8px; background: var(--highlight-soft); border: 1.5px solid var(--ink); border-radius: 5px; font-size: 10px; }
@@ -618,6 +625,18 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .comparison-guide ol { margin: 7px 0; padding-left: 18px; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .comparison-guide pre { max-height: 130px; margin: 0; overflow: auto; padding: 7px; background: #111; color: #d8d8d8; font-family: var(--mono); font-size: 9px; line-height: 1.45; white-space: pre-wrap; }
 .comparison-error { margin-top: 7px; padding: 7px; color: var(--danger-ink); background: var(--danger-soft); border: 1px solid var(--red); border-radius: 4px; font-size: 10px; }
+.comparison-conflict-assessment { display: grid; gap: 4px; margin-top: 7px; padding: 7px; border: 1px solid var(--line-soft); border-radius: 4px; font-size: 10px; }
+.comparison-conflict-assessment strong { font-size: 10px; }
+.comparison-conflict-assessment span,
+.comparison-conflict-assessment small { color: var(--muted); line-height: 1.45; }
+.comparison-conflict-assessment.assessment-safe { border-color: var(--green); background: var(--success-soft); }
+.comparison-conflict-assessment.assessment-safe strong { color: var(--success-ink); }
+.comparison-conflict-assessment.assessment-unsafe { border-color: var(--red); background: var(--danger-soft); }
+.comparison-conflict-assessment.assessment-unsafe strong { color: var(--danger-ink); }
+.comparison-conflict-assessment.assessment-review { border-color: var(--orange); background: var(--highlight-soft); }
+.comparison-resolution-response { margin-top: 7px; border: 1px solid var(--line-soft); border-radius: 4px; }
+.comparison-resolution-response > summary { padding: 6px 7px; cursor: pointer; color: var(--muted); font-size: 10px; font-weight: 750; }
+.comparison-resolution-response > div { max-height: 180px; overflow: auto; padding: 7px; border-top: 1px solid var(--line-soft); color: var(--muted); font-size: 10px; line-height: 1.5; white-space: pre-wrap; }
 .comparison-actions { justify-content: flex-end; margin-top: 9px; }
 .comparison-actions button { padding: 4px 7px; font-size: 9px; }
 .comparison-panel-footer { justify-content: space-between; margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--line-soft); color: var(--muted); font-size: 10px; }

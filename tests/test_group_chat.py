@@ -490,9 +490,112 @@ class GroupChatTests(unittest.TestCase):
             self.assertIn("主工作区在对比期间发生了变化", comparison["error"])
             self.assertTrue(comparison["recovery_patch"])
             self.assertTrue(Path(comparison["recovery_patch"]).is_file())
+            self.assertIn(
+                "tracked.txt",
+                [item["path"] for item in comparison["changed_files"]],
+            )
+
+            (repository / "tracked.txt").write_text("base", encoding="utf-8")
+            rechecked = engine.recheck_comparison()
+            self.assertEqual(rechecked["status"], "review")
+            self.assertEqual(rechecked["error"], "")
 
             discarded = engine.discard_comparison()
             self.assertEqual(discarded["status"], "discarded")
+
+    def test_agent_can_assess_conflict_without_applying_or_mutating_main(self) -> None:
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                if kwargs.get("mode") == "write":
+                    (Path(kwargs["workspace"]) / f"{self.display_name}.txt").write_text(
+                        "candidate",
+                        encoding="utf-8",
+                    )
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            claude = WritingAdapter(
+                "Claude",
+                [
+                    AgentRunResult("Claude", "A"),
+                    AgentRunResult(
+                        "Claude",
+                        '{"decision":"safe","confidence":"high","reason":"改动文件不重叠","files":["Claude.txt"],"checks":["git apply --check"]}',
+                    ),
+                ],
+            )
+            codex = WritingAdapter("Codex", [AgentRunResult("Codex", "B")])
+            engine = GroupChatEngine(
+                settings(repository),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
+            )
+            engine.ask("@all 执行：分别实现")
+            (repository / "tracked.txt").write_text("user change", encoding="utf-8")
+
+            conflict = engine.apply_comparison("claude")
+            self.assertEqual(conflict["status"], "conflict")
+            assessed = engine.assess_comparison_conflict("claude")
+            assessment = assessed["candidates"]["claude"]["conflict_assessment"]
+
+            self.assertEqual(assessment["status"], "completed")
+            self.assertEqual(assessment["decision"], "safe")
+            self.assertEqual(assessment["confidence"], "high")
+            self.assertEqual((repository / "tracked.txt").read_text(encoding="utf-8"), "user change")
+            self.assertEqual(claude.calls[-1]["mode"], "read")
+            self.assertTrue(Path(conflict["candidates"]["claude"]["workspace"]).is_dir())
+
+            engine.discard_comparison()
+
+    def test_agent_can_reimplement_candidate_on_current_main_after_conflict(self) -> None:
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                workspace = Path(kwargs["workspace"])
+                if kwargs.get("mode") == "write":
+                    if "conflict_resolution" in str(kwargs.get("step_id") or ""):
+                        (workspace / "resolved.txt").write_text(
+                            "adapted",
+                            encoding="utf-8",
+                        )
+                    else:
+                        (workspace / f"{self.display_name}.txt").write_text(
+                            "candidate",
+                            encoding="utf-8",
+                        )
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            claude = WritingAdapter(
+                "Claude",
+                [AgentRunResult("Claude", "A"), AgentRunResult("Claude", "重做完成")],
+            )
+            codex = WritingAdapter("Codex", [AgentRunResult("Codex", "B")])
+            engine = GroupChatEngine(
+                settings(repository),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
+            )
+            engine.ask("@all 执行：分别实现")
+            (repository / "tracked.txt").write_text("user change", encoding="utf-8")
+            conflict = engine.apply_comparison("claude")
+            self.assertEqual(conflict["status"], "conflict")
+
+            resolved = engine.resolve_comparison_conflict("claude")
+            self.assertEqual(resolved["status"], "review")
+            self.assertEqual(claude.calls[-1]["mode"], "write")
+            self.assertEqual(
+                (repository / "tracked.txt").read_text(encoding="utf-8"),
+                "user change",
+            )
+            applied = engine.apply_comparison("claude")
+            self.assertEqual(applied["status"], "applied")
+            self.assertEqual((repository / "resolved.txt").read_text(encoding="utf-8"), "adapted")
+            self.assertEqual(
+                (repository / "tracked.txt").read_text(encoding="utf-8"),
+                "user change",
+            )
 
     def test_comparison_tracks_no_changes_and_keeps_successful_peer_when_one_fails(self) -> None:
         class WritingAdapter(FakeAdapter):

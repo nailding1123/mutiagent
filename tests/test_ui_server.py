@@ -178,6 +178,87 @@ class UIServerTests(unittest.TestCase):
         self.assertFalse(other_exists)
         self.assertTrue(selected_exists)
 
+    def test_comparison_manager_previews_finished_candidate_while_peer_runs(self) -> None:
+        class WritingAdapter(FakeChatAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                (Path(kwargs["workspace"]) / f"{self.display_name.lower()}.txt").write_text(
+                    self.display_name,
+                    encoding="utf-8",
+                )
+                return next(self.results)
+
+        class BlockingWritingAdapter(FakeChatAdapter):
+            def __init__(self, name: str) -> None:
+                super().__init__(name, [])
+                self.started = threading.Event()
+                self.release = threading.Event()
+
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                (Path(kwargs["workspace"]) / "codex.txt").write_text(
+                    self.display_name,
+                    encoding="utf-8",
+                )
+                self.started.set()
+                self.release.wait(3)
+                return AgentRunResult(self.display_name, "B")
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "repo"
+            workspace.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=workspace, check=True)
+            (workspace / "tracked.txt").write_text("base", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=workspace, check=True)
+            manager = UISessionManager(
+                store=RunStore(Path(directory) / "state"),
+                default_workspace=workspace,
+            )
+            codex = BlockingWritingAdapter("Codex")
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={
+                    "claude": WritingAdapter("Claude", [AgentRunResult("Claude", "A")]),
+                    "codex": codex,
+                },
+            ):
+                started = manager.start_task(
+                    {"task": "@all 执行：分别实现", "workspace": str(workspace)}
+                )
+                self.assertTrue(codex.started.wait(2))
+                deadline = time.monotonic() + 3
+                comparison = None
+                while time.monotonic() < deadline:
+                    record = manager.store.get(started["id"]) or {}
+                    comparison = (record.get("group_chat") or {}).get("comparison")
+                    if (
+                        isinstance(comparison, dict)
+                        and comparison.get("status") == "running"
+                        and comparison.get("candidates", {}).get("claude", {}).get("status") == "ready"
+                    ):
+                        break
+                    time.sleep(0.01)
+                self.assertIsInstance(comparison, dict)
+                comparison_id = comparison["id"]
+
+                previewed = manager.preview_comparison(
+                    started["id"],
+                    "claude",
+                    comparison_id,
+                )
+                self.assertEqual(previewed["comparison"]["status"], "previewing")
+                self.assertTrue((workspace / "claude.txt").is_file())
+                self.assertFalse((workspace / "codex.txt").exists())
+
+                codex.release.set()
+                self._wait_for_status(manager, started["id"], "ready", message_count=3)
+                manager.discard_comparison(started["id"], comparison_id)
+
+        self.assertFalse((workspace / "claude.txt").exists())
+
     def test_non_git_comparison_is_rejected_before_creating_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "plain"
@@ -192,6 +273,9 @@ class UIServerTests(unittest.TestCase):
                     "claude": FakeChatAdapter("Claude", []),
                     "codex": FakeChatAdapter("Codex", []),
                 },
+            ), patch(
+                "multiagent_cli.bridge_config._discover_executable",
+                side_effect=AssertionError("CLI discovery should not run before Git validation"),
             ):
                 with self.assertRaisesRegex(UIError, "需要 Git 工作区"):
                     manager.start_task(
@@ -219,7 +303,10 @@ function extract(name, nextName) {
 function escapeHtml(value) { return String(value || ''); }
 function agentKeyFromName(value) { return String(value || '').toLowerCase(); }
 eval(extract('statusKey', 'statusLabel'));
-eval(extract('fallbackAgentDetail', 'renderNativeInteraction'));
+eval(extract('fallbackAgentDetail', 'activeAgentFallbackDetail'));
+eval(extract('activeAgentFallbackDetail', 'inactiveAgentFallbackDetail'));
+eval(extract('inactiveAgentFallbackDetail', 'renderNativeInteraction'));
+eval(extract('currentAgentTurnState', 'fallbackAgentDetail'));
 eval(extract('renderAgentStatus', 'fallbackAgentDetail'));
 
 const session = {
@@ -239,6 +326,42 @@ renderAgentStatus(codexContainer, codexDot, 'codex', 'Codex', session, 'running'
 if (claudeDot.className !== 'status-dot status-running') throw new Error('active Agent did not animate');
 if (codexDot.className === 'status-dot status-running') throw new Error('inactive Agent still animates');
 if (codexDot.className !== 'status-dot status-waiting') throw new Error('inactive Agent is not static waiting');
+
+const startingSession = {active_agents: ['codex'], agent_events: {}, native_interactions: []};
+const startingContainer = {};
+const startingDot = {};
+renderAgentStatus(startingContainer, startingDot, 'codex', 'Codex', startingSession, 'running');
+if (startingDot.className !== 'status-dot status-running') throw new Error('active Agent without first event did not show starting state');
+if (!startingContainer.innerHTML.includes('已加入本轮，等待首个状态更新')) throw new Error('active Agent fallback text is ambiguous');
+if (startingContainer.innerHTML.includes('安全进度事件')) throw new Error('legacy ambiguous security-event wording remained');
+
+const staleSession = {
+  active_agents: [],
+  agent_events: {codex: {status: 'completed', safe_summary: 'Codex · 已生成上一轮最终输出'}},
+  native_interactions: [],
+  group_chat: {messages: [
+    {id: 'm1', role: 'user', sender: 'user', recipients: ['claude'], recalled: false},
+  ]},
+};
+const staleContainer = {};
+const staleDot = {};
+renderAgentStatus(staleContainer, staleDot, 'codex', 'Codex', staleSession, 'running');
+if (!staleContainer.innerHTML.includes('未参与本轮回复')) throw new Error('stale directed-turn status was shown as current');
+if (staleContainer.innerHTML.includes('上一轮最终输出')) throw new Error('previous-turn event leaked into current status');
+
+const repliedSession = {
+  active_agents: [],
+  agent_events: {codex: {status: 'completed', safe_summary: 'Codex · 已生成本轮最终输出'}},
+  native_interactions: [],
+  group_chat: {messages: [
+    {id: 'm2', role: 'user', sender: 'user', recipients: ['claude', 'codex'], recalled: false},
+    {id: 'm3', role: 'assistant', sender: 'codex', reply_to: 'm2', recalled: false},
+  ]},
+};
+const repliedContainer = {};
+const repliedDot = {};
+renderAgentStatus(repliedContainer, repliedDot, 'codex', 'Codex', repliedSession, 'running');
+if (!repliedContainer.innerHTML.includes('已生成本轮最终输出')) throw new Error('current completed reply was hidden');
 """
         completed = subprocess.run(
             [node, "-e", harness, str(script_path)],
@@ -439,6 +562,82 @@ if (!html.includes(claudePreview)) throw new Error('finished candidate preview b
 if (html.includes(`${claudePreview} disabled`)) throw new Error('finished candidate preview button was disabled');
 if (!html.includes(`${codexPreview} disabled`)) throw new Error('running candidate preview button was enabled');
 if (!html.includes('另一个 Agent 完成后，才可以正式采用方案')) throw new Error('running comparison guidance missing');
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_conflicted_comparison_pauses_apply_until_workspace_recheck(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend comparison-state test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const start = source.indexOf('function comparisonMarkup');
+const end = source.indexOf('\nconst feedHtmlCache', start);
+if (start < 0 || end < 0) throw new Error('comparisonMarkup was not found');
+function escapeHtml(value) { return String(value || ''); }
+function agentName(value) { return value === 'claude' ? 'Claude Code' : 'Codex'; }
+function changeSummaryMarkup() { return ''; }
+const state = {detail: {session: {workspace: '/main'}, record: {workspace: '/main'}}};
+eval(source.slice(start, end));
+const html = comparisonMarkup({
+  id: 'comparison-conflict', status: 'conflict',
+  candidates: {
+    claude: {status: 'ready', workspace: '/tmp/claude', preview_commands: ['cd /tmp/claude']},
+    codex: {status: 'ready', workspace: '/tmp/codex', preview_commands: ['cd /tmp/codex']},
+  },
+  recovery_patch: '/tmp/recovery.patch',
+}, 'run-1');
+if (!html.includes('主工作区发生了变化')) throw new Error('conflict guidance missing');
+if (!html.includes('重新检查主工作区')) throw new Error('recheck action missing');
+if (!html.includes('重新检查后采用')) throw new Error('conflict apply label missing');
+if (!html.includes('data-comparison-action="apply" data-comparison-agent="claude" disabled')) throw new Error('Claude apply was not paused');
+if (!html.includes('data-comparison-action="apply" data-comparison-agent="codex" disabled')) throw new Error('Codex apply was not paused');
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_conflicted_comparison_offers_agent_assessment_without_enabling_apply(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend comparison-state test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const start = source.indexOf('function comparisonMarkup');
+const end = source.indexOf('\nconst feedHtmlCache', start);
+if (start < 0 || end < 0) throw new Error('comparisonMarkup was not found');
+function escapeHtml(value) { return String(value || ''); }
+function agentName(value) { return value === 'claude' ? 'Claude Code' : 'Codex'; }
+function changeSummaryMarkup() { return ''; }
+const state = {detail: {session: {workspace: '/main'}, record: {workspace: '/main'}}};
+eval(source.slice(start, end));
+const html = comparisonMarkup({
+  id: 'comparison-assess', status: 'conflict',
+  candidates: {
+    claude: {status: 'ready', workspace: '/tmp/claude', preview_commands: ['cd /tmp/claude'], conflict_assessment: {status: 'completed', decision: 'safe', confidence: 'high', summary: '文件不重叠', files: ['tracked.txt'], checks: ['git apply --check']}},
+    codex: {status: 'ready', workspace: '/tmp/codex', preview_commands: ['cd /tmp/codex']},
+  },
+}, 'run-1');
+if (!html.includes('让 Claude Code 评估')) throw new Error('Claude assessment button missing');
+if (!html.includes('让 Claude Code 解决冲突')) throw new Error('Claude conflict resolution button missing');
+if (!html.includes('Agent 判断：可以继续安全检查')) throw new Error('assessment result missing');
+if (!html.includes('data-comparison-action="assess" data-comparison-agent="codex"')) throw new Error('Codex assessment button missing');
+if (!html.includes('data-comparison-action="resolve" data-comparison-agent="codex"')) throw new Error('Codex conflict resolution button missing');
+if (!html.includes('data-comparison-action="apply" data-comparison-agent="claude" disabled')) throw new Error('assessment bypassed apply safety gate');
 """
         completed = subprocess.run(
             [node, "-e", harness, str(script_path)],
@@ -1258,6 +1457,71 @@ if ([...state.streamBuffers.keys()].some((key) => key.startsWith('run-1:'))) {
                 )
 
         self.assertTrue(result["message"]["recalled"])
+
+    def test_recall_chat_message_only_stops_agent_serving_that_message(self) -> None:
+        class BlockingAdapter(FakeChatAdapter):
+            def __init__(self, name: str) -> None:
+                super().__init__(name, [])
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.stop_requested = False
+
+            def request_stop(self) -> None:
+                self.stop_requested = True
+                self.release.set()
+
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                self.started.set()
+                self.release.wait(3)
+                if self.stop_requested:
+                    raise KeyboardInterrupt
+                return AgentRunResult(self.display_name, "正常完成")
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            (workspace / ".multiagent.json").write_text(
+                json.dumps({
+                    "claude": {"command": "/bin/echo"},
+                    "codex": {"command": "/bin/echo"},
+                }),
+                encoding="utf-8",
+            )
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            claude = BlockingAdapter("Claude")
+            codex = BlockingAdapter("Codex")
+            with patch(
+                "multiagent_cli.runtime.make_adapters",
+                return_value={"claude": claude, "codex": codex},
+            ):
+                started = manager.start_task({"task": ""})
+                manager.send_chat_message(
+                    started["id"],
+                    {"message": "@Claude 第一条待撤回"},
+                )
+                self.assertTrue(claude.started.wait(2))
+                manager.send_chat_message(
+                    started["id"],
+                    {"message": "@Codex 第二条保留"},
+                )
+                self.assertTrue(codex.started.wait(2))
+                record = manager.store.get(started["id"]) or {}
+                first_user_id = record["group_chat"]["messages"][0]["id"]
+                manager.recall_chat_message(started["id"], first_user_id)
+                self.assertTrue(claude.stop_requested)
+                self.assertFalse(codex.stop_requested)
+                codex.release.set()
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    current = manager.store.get(started["id"]) or {}
+                    if current.get("status") in {"ready", "failed", "interrupted"}:
+                        break
+                    time.sleep(0.01)
+
+        self.assertFalse(codex.stop_requested)
 
     def test_retry_replaces_old_reply_while_continue_keeps_current_reply(
         self,
@@ -2740,6 +3004,7 @@ if ([...state.streamBuffers.keys()].some((key) => key.startsWith('run-1:'))) {
         self.assertIn('id="settings-token-api-key"', html)
         self.assertIn('id="settings-claude-model-order"', html)
         self.assertIn('id="settings-codex-model-order"', html)
+        self.assertIn('id="settings-codex-reasoning-effort"', html)
         self.assertIn('id="settings-group-chat-agent-a-identity"', html)
         self.assertIn('id="settings-group-chat-agent-b-identity"', html)
         self.assertLess(

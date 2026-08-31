@@ -44,6 +44,7 @@ from .bridge_models import (
 )
 from .group_chat import (
     GroupChatEngine,
+    is_explicit_comparison_execution_request,
     recall_user_message_state,
     reset_native_context_state,
     set_message_context_state,
@@ -183,6 +184,8 @@ class UISession:
         self._interaction_tokens: dict[str, str | None] = {}
         self._stop_requested = False
         self._stop_handler: Callable[[], None] | None = None
+        self._agent_stop_handler: Callable[[set[str]], None] | None = None
+        self._stopped_agents: set[str] = set()
         self._condition = threading.Condition()
         # Map each in-flight turn to the native Agents reserved for it. The
         # browser uses this to distinguish an Agent that is actually working
@@ -194,6 +197,7 @@ class UISession:
         self._stream_sent: dict[str, str] = {}
         self._stream_gate = stream_gate
         self._active_chat_turns: set[str] = set()
+        self._active_chat_messages: dict[str, str] = {}
 
     def bind_record_persistence(self, persist: Callable[[AgentEvent], None]) -> None:
         """Attach the store-backed timeline writer for this session.
@@ -208,6 +212,10 @@ class UISession:
     def bind_stop_handler(self, handler: Callable[[], None]) -> None:
         with self._condition:
             self._stop_handler = handler
+
+    def bind_agent_stop_handler(self, handler: Callable[[set[str]], None]) -> None:
+        with self._condition:
+            self._agent_stop_handler = handler
 
     def bind_chat_engine(self, engine: GroupChatEngine) -> None:
         with self._condition:
@@ -235,7 +243,7 @@ class UISession:
     def chat_requires_restore(self) -> bool:
         """Return whether stopped adapters must be recreated before another turn."""
         with self._condition:
-            return self._stop_requested
+            return self._stop_requested or bool(self._stopped_agents)
 
     def has_active_chat_turns(self) -> bool:
         with self._condition:
@@ -254,6 +262,7 @@ class UISession:
             self._active_chat_agents[token] = tuple(
                 agent for agent in (agents or ()) if agent in {"claude", "codex"}
             )
+            self._active_chat_messages.pop(token, None)
             # ``agent_events`` is a live per-Agent status snapshot, not the
             # history timeline.  A completed event from a previous directed
             # turn must not be used to label the loading bubble of this turn
@@ -267,6 +276,23 @@ class UISession:
             self._stream_sent.clear()
         self._notify("chat_turn", self.id)
         return token
+
+    def bind_chat_turn_message(self, token: str | None, message_id: str) -> None:
+        if not token or not message_id:
+            return
+        with self._condition:
+            if token in self._active_chat_agents:
+                self._active_chat_messages[token] = message_id
+                self.updated_at = _timestamp()
+
+    def active_agents_for_message(self, message_id: str) -> set[str]:
+        with self._condition:
+            return {
+                agent
+                for token, current_message_id in self._active_chat_messages.items()
+                if current_message_id == message_id
+                for agent in self._active_chat_agents.get(token, ())
+            }
 
     def finish_chat_turn(
         self,
@@ -286,6 +312,7 @@ class UISession:
             if token is not None:
                 self._active_chat_turns.discard(token)
                 self._active_chat_agents.pop(token, None)
+                self._active_chat_messages.pop(token, None)
             active = bool(
                 self._active_chat_turns
                 or any(
@@ -323,6 +350,74 @@ class UISession:
         if handler is not None:
             handler()
         self._notify("stopping", self.id)
+
+    def request_stop_for_message(self, message_id: str) -> bool:
+        """Stop only the native Agents serving one recalled user message."""
+
+        with self._condition:
+            tokens = {
+                token
+                for token, current_message_id in self._active_chat_messages.items()
+                if current_message_id == message_id
+            }
+            agents = {
+                agent
+                for token in tokens
+                for agent in self._active_chat_agents.get(token, ())
+            }
+        return self.request_stop_agents(agents, tokens=tokens)
+
+    def request_stop_agents(
+        self,
+        agents: set[str],
+        *,
+        tokens: set[str] | None = None,
+    ) -> bool:
+        """Stop a selected subset of native Agents without stopping peers."""
+
+        agents = {
+            agent for agent in agents if agent in {"claude", "codex"}
+        }
+        if not agents:
+            return False
+        with self._condition:
+            tokens = set(tokens or {
+                token
+                for token, current_agents in self._active_chat_agents.items()
+                if agents.intersection(current_agents)
+            })
+            active_agents = {
+                agent
+                for token in tokens
+                for agent in self._active_chat_agents.get(token, ())
+                if agent in agents
+            }
+            if not active_agents:
+                return False
+            for interaction_id, request in self._native_interactions.items():
+                if interaction_id in self._native_responses:
+                    continue
+                source_key = _agent_key(request.get("source"))
+                interaction_token = self._interaction_tokens.get(interaction_id)
+                if source_key in active_agents or interaction_token in tokens:
+                    self._native_responses.setdefault(
+                        interaction_id,
+                        NativeInteractionResponse("cancel"),
+                    )
+            self._stopped_agents.update(active_agents)
+            self._condition.notify_all()
+            handler = self._agent_stop_handler
+        if handler is not None:
+            handler(set(active_agents))
+        else:
+            # Compatibility for callers created before the per-Agent handler
+            # was bound. This path is only used when no targeted hook exists.
+            with self._condition:
+                fallback = self._stop_handler
+            if fallback is not None:
+                fallback()
+        self._notify("chat_turn", self.id)
+        return True
 
     def on_event(self, event: AgentEvent) -> None:
         safe = event.to_dict(safe=True, include_activity=True)
@@ -549,6 +644,8 @@ class UISession:
             self._interaction_tokens.clear()
             self._active_chat_turns.clear()
             self._active_chat_agents.clear()
+            self._active_chat_messages.clear()
+            self._stopped_agents.clear()
             self.updated_at = _timestamp()
         self._notify("finished", self.id)
 
@@ -561,6 +658,8 @@ class UISession:
             self._interaction_tokens.clear()
             self._active_chat_turns.clear()
             self._active_chat_agents.clear()
+            self._active_chat_messages.clear()
+            self._stopped_agents.clear()
             self.updated_at = _timestamp()
         self._notify("finished", self.id)
 
@@ -887,6 +986,20 @@ class UISessionManager:
         if not workspace.is_dir():
             raise UIError(f"工作区不是有效目录：{workspace}")
 
+        # Validate the A/B prerequisite before resolving native CLI paths. In
+        # CI or a fresh installation the CLIs may be unavailable, but an
+        # explicitly requested comparison in a non-Git directory should still
+        # report the actionable Worktree error first.
+        if (
+            not previous
+            and task
+            and is_explicit_comparison_execution_request(task)
+        ):
+            try:
+                WorkspaceCoordinator().validate_comparison_workspace(workspace)
+            except WorkspaceCoordinatorError as exc:
+                raise UIError(str(exc)) from exc
+
         from .runtime import (
             apply_resume_settings,
             make_adapters,
@@ -952,11 +1065,18 @@ class UISessionManager:
             for adapter in adapters.values():
                 adapter.request_stop()
 
+        def stop_agent_adapters(agents: set[str]) -> None:
+            for agent in agents:
+                adapter = adapters.get(agent)
+                if adapter is not None:
+                    adapter.request_stop()
+
         for adapter in adapters.values():
             bind_interaction = getattr(adapter, "bind_interaction_handler", None)
             if callable(bind_interaction):
                 bind_interaction(session.wait_for_native_interaction)
         session.bind_stop_handler(stop_adapters)
+        session.bind_agent_stop_handler(stop_agent_adapters)
         session.bind_record_persistence(
             self._record_timeline_persister(session.id)
         )
@@ -1054,6 +1174,25 @@ class UISessionManager:
 
         def save_state(state: dict[str, Any]) -> None:
             session.update_group_chat_state(state)
+            if reservation is not None:
+                messages = state.get("messages")
+                if isinstance(messages, list):
+                    latest_user = next(
+                        (
+                            item
+                            for item in reversed(messages)
+                            if isinstance(item, dict)
+                            and item.get("role") == "user"
+                            and item.get("sender") == "user"
+                            and item.get("content") == message
+                        ),
+                        None,
+                    )
+                    if isinstance(latest_user, dict):
+                        session.bind_chat_turn_message(
+                            getattr(reservation, "token", None),
+                            str(latest_user.get("id") or ""),
+                        )
             try:
                 self.store.update(
                     session.id,
@@ -1221,7 +1360,11 @@ class UISessionManager:
                 _workspace_attachment_mirror(workspace, run_id, uploaded_attachments)
         try:
             session = self.session(run_id)
-            if session is not None and session.chat_requires_restore():
+            if (
+                session is not None
+                and session.chat_requires_restore()
+                and not session.has_active_chat_turns()
+            ):
                 # request_stop() propagates a permanent stop flag into the native
                 # CLI adapters. Rebuild them from the persisted chat state instead
                 # of reusing an adapter that can never accept another turn.
@@ -1413,11 +1556,18 @@ class UISessionManager:
             for adapter in adapters.values():
                 adapter.request_stop()
 
+        def stop_agent_adapters(agents: set[str]) -> None:
+            for agent in agents:
+                adapter = adapters.get(agent)
+                if adapter is not None:
+                    adapter.request_stop()
+
         for adapter in adapters.values():
             bind_interaction = getattr(adapter, "bind_interaction_handler", None)
             if callable(bind_interaction):
                 bind_interaction(session.wait_for_native_interaction)
         session.bind_stop_handler(stop_adapters)
+        session.bind_agent_stop_handler(stop_agent_adapters)
         session.bind_record_persistence(
             self._record_timeline_persister(session.id)
         )
@@ -1657,10 +1807,21 @@ class UISessionManager:
         if record is None:
             raise UIError("找不到群聊对话")
         session = self.session(run_id)
-        should_stop = bool(session and session.has_active_chat_turns())
+        target_agents: set[str] = set()
+        if session is not None:
+            target_agents = session.active_agents_for_message(message_id)
         try:
             if session is not None:
                 engine = session.chat_engine()
+                target = engine.find_message(message_id)
+                if not isinstance(target, dict) or target.get("role") != "user":
+                    raise UIError("只有用户消息可以撤回")
+                if not target_agents:
+                    target_agents = {
+                        value
+                        for value in target.get("recipients", [])
+                        if value in {"claude", "codex"}
+                    }
                 message = engine.recall_user_message(message_id)
                 state = engine.to_dict()
                 session.update_group_chat_state(state)
@@ -1676,9 +1837,9 @@ class UISessionManager:
         except (KeyError, OSError) as exc:
             raise UIError(f"保存撤回消息失败：{exc}") from exc
 
-        if should_stop and session is not None:
+        if session is not None and target_agents:
             try:
-                session.request_stop()
+                session.request_stop_agents(target_agents)
             except UIError:
                 # The native turn may have completed between persistence and
                 # the stop signal. The durable recall is still authoritative.
@@ -1827,6 +1988,52 @@ class UISessionManager:
         session = self.session(run_id)
         if session is None:
             session = self._restore_group_chat_session(record)
+        active_turn = session.has_active_chat_turns()
+        try:
+            engine = session.chat_engine()
+            current = engine.comparison()
+            if comparison_id and (
+                not isinstance(current, dict)
+                or current.get("id") != comparison_id
+            ):
+                raise UIError("A/B 对比任务 ID 不匹配")
+            candidate = (
+                current.get("candidates", {}).get(agent)
+                if isinstance(current, dict)
+                and isinstance(current.get("candidates"), dict)
+                else None
+            )
+            can_preview_during_parallel_turn = (
+                active_turn
+                and isinstance(current, dict)
+                and current.get("status") in {"running", "review", "previewing", "conflict"}
+                and isinstance(candidate, dict)
+                and candidate.get("status") in {"ready", "no_changes"}
+            )
+            if active_turn and not can_preview_during_parallel_turn:
+                raise UIError("Agent 正在回复，请等待 A/B 候选方案完成")
+            comparison = engine.preview_comparison(agent)
+            state = engine.to_dict()
+            session.update_group_chat_state(state)
+            self.store.update(run_id, group_chat=state)
+        except (BridgeError, WorkspaceCoordinatorError) as exc:
+            raise UIError(str(exc)) from exc
+        except (KeyError, OSError) as exc:
+            raise UIError(f"预览候选方案失败：{exc}") from exc
+        self.publish("comparison_updated", run_id, {"status": comparison.get("status")})
+        return {"comparison": comparison, "group_chat": state, "session": session.to_dict()}
+
+    def recheck_comparison(
+        self,
+        run_id: str,
+        comparison_id: str = "",
+    ) -> dict[str, Any]:
+        record = self.store.get(run_id)
+        if record is None:
+            raise UIError("找不到群聊对话")
+        session = self.session(run_id)
+        if session is None:
+            session = self._restore_group_chat_session(record)
         if session.has_active_chat_turns():
             raise UIError("Agent 正在回复，请等待 A/B 候选方案完成")
         try:
@@ -1837,15 +2044,93 @@ class UISessionManager:
                 or current.get("id") != comparison_id
             ):
                 raise UIError("A/B 对比任务 ID 不匹配")
-            comparison = engine.preview_comparison(agent)
+            comparison = engine.recheck_comparison()
             state = engine.to_dict()
             session.update_group_chat_state(state)
             self.store.update(run_id, group_chat=state)
         except (BridgeError, WorkspaceCoordinatorError) as exc:
             raise UIError(str(exc)) from exc
         except (KeyError, OSError) as exc:
-            raise UIError(f"预览候选方案失败：{exc}") from exc
+            raise UIError(f"重新检查候选方案失败：{exc}") from exc
         self.publish("comparison_updated", run_id, {"status": comparison.get("status")})
+        return {"comparison": comparison, "group_chat": state, "session": session.to_dict()}
+
+    def assess_comparison_conflict(
+        self,
+        run_id: str,
+        agent: object,
+        comparison_id: str = "",
+    ) -> dict[str, Any]:
+        if not isinstance(agent, str) or agent not in {"claude", "codex"}:
+            raise UIError("agent 必须是 claude 或 codex")
+        record = self.store.get(run_id)
+        if record is None:
+            raise UIError("找不到群聊对话")
+        session = self.session(run_id)
+        if session is None:
+            session = self._restore_group_chat_session(record)
+        if session.has_active_chat_turns():
+            raise UIError("Agent 正在回复，请等待当前任务完成后再评估冲突")
+        try:
+            engine = session.chat_engine()
+            current = engine.comparison()
+            if comparison_id and (
+                not isinstance(current, dict)
+                or current.get("id") != comparison_id
+            ):
+                raise UIError("A/B 对比任务 ID 不匹配")
+            comparison = engine.assess_comparison_conflict(agent)
+            state = engine.to_dict()
+            session.update_group_chat_state(state)
+            self.store.update(run_id, group_chat=state)
+        except (BridgeError, WorkspaceCoordinatorError) as exc:
+            raise UIError(str(exc)) from exc
+        except (KeyError, OSError) as exc:
+            raise UIError(f"保存冲突评估失败：{exc}") from exc
+        self.publish(
+            "comparison_updated",
+            run_id,
+            {"status": comparison.get("status"), "assessment_agent": agent},
+        )
+        return {"comparison": comparison, "group_chat": state, "session": session.to_dict()}
+
+    def resolve_comparison_conflict(
+        self,
+        run_id: str,
+        agent: object,
+        comparison_id: str = "",
+    ) -> dict[str, Any]:
+        if not isinstance(agent, str) or agent not in {"claude", "codex"}:
+            raise UIError("agent 必须是 claude 或 codex")
+        record = self.store.get(run_id)
+        if record is None:
+            raise UIError("找不到群聊对话")
+        session = self.session(run_id)
+        if session is None:
+            session = self._restore_group_chat_session(record)
+        if session.has_active_chat_turns():
+            raise UIError("Agent 正在回复，请等待当前任务完成后再解决冲突")
+        try:
+            engine = session.chat_engine()
+            current = engine.comparison()
+            if comparison_id and (
+                not isinstance(current, dict)
+                or current.get("id") != comparison_id
+            ):
+                raise UIError("A/B 对比任务 ID 不匹配")
+            comparison = engine.resolve_comparison_conflict(agent)
+            state = engine.to_dict()
+            session.update_group_chat_state(state)
+            self.store.update(run_id, group_chat=state)
+        except (BridgeError, WorkspaceCoordinatorError) as exc:
+            raise UIError(str(exc)) from exc
+        except (KeyError, OSError) as exc:
+            raise UIError(f"保存冲突重做结果失败：{exc}") from exc
+        self.publish(
+            "comparison_updated",
+            run_id,
+            {"status": comparison.get("status"), "resolution_agent": agent},
+        )
         return {"comparison": comparison, "group_chat": state, "session": session.to_dict()}
 
     def discard_comparison(
@@ -2235,6 +2520,44 @@ def make_request_handler(manager: UISessionManager, static_root: Path):
                 )
                 if match:
                     result = manager.preview_comparison(
+                        match.group(1),
+                        payload.get("agent") if isinstance(payload, dict) else None,
+                        match.group(2),
+                    )
+                    self._json(result)
+                    return
+                match = re.fullmatch(
+                    r"/api/sessions/([A-Za-z0-9._-]+)/comparisons/"
+                    r"([A-Za-z0-9._-]+)/refresh",
+                    path,
+                )
+                if match:
+                    result = manager.recheck_comparison(
+                        match.group(1),
+                        match.group(2),
+                    )
+                    self._json(result)
+                    return
+                match = re.fullmatch(
+                    r"/api/sessions/([A-Za-z0-9._-]+)/comparisons/"
+                    r"([A-Za-z0-9._-]+)/assess",
+                    path,
+                )
+                if match:
+                    result = manager.assess_comparison_conflict(
+                        match.group(1),
+                        payload.get("agent") if isinstance(payload, dict) else None,
+                        match.group(2),
+                    )
+                    self._json(result)
+                    return
+                match = re.fullmatch(
+                    r"/api/sessions/([A-Za-z0-9._-]+)/comparisons/"
+                    r"([A-Za-z0-9._-]+)/resolve",
+                    path,
+                )
+                if match:
+                    result = manager.resolve_comparison_conflict(
                         match.group(1),
                         payload.get("agent") if isinstance(payload, dict) else None,
                         match.group(2),
@@ -2888,7 +3211,7 @@ def _config_for_ui(data: dict[str, Any]) -> dict[str, Any]:
             models = [model] if isinstance(model, str) and model.strip() else []
         timeout = raw.get("timeout", 900)
         extra_args = raw.get("extra_args", [])
-        return {
+        agent_data = {
             "command": command,
             "model": model if isinstance(model, str) else "",
             "models": models,
@@ -2910,6 +3233,16 @@ def _config_for_ui(data: dict[str, Any]) -> dict[str, Any]:
                 else []
             ),
         }
+        if name == "codex":
+            agent_data = {
+                **agent_data,
+                "reasoning_effort": (
+                    raw.get("reasoning_effort")
+                    if isinstance(raw.get("reasoning_effort"), str)
+                    else "auto"
+                ),
+            }
+        return agent_data
 
     group_chat_default_agent = data.get("group_chat_default_agent", "both")
     return {
@@ -3068,6 +3401,8 @@ def _config_from_ui(values: dict[str, Any]) -> dict[str, Any]:
             "timeout": raw.get("timeout"),
             "extra_args": raw.get("extra_args"),
         }
+        if name == "codex":
+            agent["reasoning_effort"] = raw.get("reasoning_effort") or "auto"
         command = raw.get("command")
         if command is not None and command != "":
             agent["command"] = command
@@ -3112,7 +3447,7 @@ def _merge_known_config(
         ),
         (
             "codex",
-            ("command", "model", "models", "fallback_on_timeout", "timeout", "extra_args"),
+            ("command", "model", "models", "fallback_on_timeout", "timeout", "extra_args", "reasoning_effort"),
         ),
         ("ui", ("theme", "show_archived", "compact_sidebar", "stream_model_text", "browser_notifications")),
     ):

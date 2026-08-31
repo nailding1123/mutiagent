@@ -315,6 +315,8 @@ function bindEvents() {
       const action = comparisonAction.dataset.comparisonAction;
       if (action === 'apply') void applyComparison(comparisonAction.dataset.comparisonAgent || '');
       else if (action === 'preview') void previewComparison(comparisonAction.dataset.comparisonAgent || '');
+      else if (action === 'assess') void assessComparisonConflict(comparisonAction.dataset.comparisonAgent || '');
+      else if (action === 'resolve') void resolveComparisonConflict(comparisonAction.dataset.comparisonAgent || '');
       else if (action === 'discard') void discardComparison();
       else if (action === 'copy-path' || action === 'copy-commands') {
         const comparison = currentComparison();
@@ -331,7 +333,10 @@ function bindEvents() {
         const workspace = state.detail?.session?.workspace || state.detail?.record?.workspace || '';
         void copyText(workspace, '主工作区路径');
       }
-      else if (action === 'refresh') void refreshAll();
+      else if (action === 'refresh') {
+        if (currentComparison()?.status === 'conflict') void recheckComparison();
+        else void refreshAll();
+      }
       return;
     }
   });
@@ -794,6 +799,7 @@ function populateSettingsForm(settings) {
     setValue(`settings-${agent}-command`, formatCommandSetting(agentValues.command));
     setValue(`settings-${agent}-extra-args`, Array.isArray(agentValues.extra_args) ? agentValues.extra_args.join('\n') : '');
   });
+  setValue('settings-codex-reasoning-effort', values.codex?.reasoning_effort || 'auto');
   renderModelCatalog();
   setValue('settings-group-chat-agent-a-identity', values.group_chat_identities?.agent_a || '');
   setValue('settings-group-chat-agent-b-identity', values.group_chat_identities?.agent_b || '');
@@ -1188,6 +1194,10 @@ function collectSettingsValues() {
     timeout: positive(`settings-${name}-timeout`, `${agentName(name)} 超时`),
     extra_args: get(`settings-${name}-extra-args`).value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
   });
+  const codexReasoningEffort = get('settings-codex-reasoning-effort')?.value || 'auto';
+  if (!['auto', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(codexReasoningEffort)) {
+    throw new Error('Codex 思考强度设置无效。');
+  }
   const compactionThreshold = positiveInteger('settings-context-compaction-threshold', '上下文压缩触发预算');
   const compactionTarget = positiveInteger('settings-context-compaction-target', '上下文压缩目标预算');
   if (compactionTarget >= compactionThreshold) throw new Error('上下文压缩目标预算必须小于触发预算。');
@@ -1208,7 +1218,7 @@ function collectSettingsValues() {
       base_url: get('settings-token-api-base-url').value.trim(),
     },
     claude: agent('claude'),
-    codex: agent('codex'),
+    codex: { ...agent('codex'), reasoning_effort: codexReasoningEffort },
     ui: {
       theme: document.querySelector('input[name="settings-theme"]:checked')?.value || 'paper',
       show_archived: get('settings-show-archived').checked,
@@ -2127,6 +2137,15 @@ function groupChatState(record = state.detail?.record, session = state.detail?.s
       const candidateRank = { running: 0, failed: 1, unavailable: 1, no_changes: 2, ready: 2 };
       if ((candidateRank[String(live?.status || '')] ?? -1) > (candidateRank[String(durable?.status || '')] ?? -1)) {
         candidates[agent] = live;
+      } else if (
+        live?.conflict_assessment
+        && (!durable?.conflict_assessment
+          || String(live.conflict_assessment.created_at || '') > String(durable.conflict_assessment.created_at || ''))
+      ) {
+        // A conflict assessment is written after both candidates are already
+        // in the same terminal state. Preserve it when the live session and
+        // durable record arrive in either order.
+        candidates[agent] = { ...durable, conflict_assessment: live.conflict_assessment };
       }
     }
     return {
@@ -2182,6 +2201,113 @@ async function applyComparison(agent) {
     }
   } catch (error) {
     if (button) button.disabled = false;
+    showToast(error.message, true);
+  }
+}
+
+async function recheckComparison() {
+  const comparison = currentComparison();
+  if (!comparison || !state.currentId) return;
+  const button = document.querySelector('[data-comparison-action="refresh"]');
+  if (button) button.disabled = true;
+  try {
+    const payload = await api(
+      `/api/sessions/${encodeURIComponent(state.currentId)}/comparisons/${encodeURIComponent(comparison.id)}/refresh`,
+      { method: 'POST', body: JSON.stringify({}) },
+    );
+    if (state.detail && payload?.session) state.detail.session = payload.session;
+    if (state.detail && payload?.group_chat) {
+      state.detail.session = state.detail.session || {};
+      state.detail.session.group_chat = payload.group_chat;
+    }
+    renderDetail();
+    if (payload.comparison?.status === 'review') {
+      showToast('主工作区已恢复到对比基线，可以重新选择方案。');
+    } else {
+      showToast(payload.comparison?.error || '主工作区仍有变化，暂时不能采用候选方案。', true);
+    }
+  } catch (error) {
+    if (button) button.disabled = false;
+    showToast(error.message, true);
+  }
+}
+
+async function assessComparisonConflict(agent) {
+  const comparison = currentComparison();
+  if (!comparison || comparison.status !== 'conflict' || !state.currentId || !['claude', 'codex'].includes(agent)) return;
+  const candidate = comparison.candidates?.[agent];
+  if (!candidate || !['ready', 'no_changes'].includes(candidate.status)) return;
+  const button = document.querySelector(`[data-comparison-action="assess"][data-comparison-agent="${cssEscape(agent)}"]`);
+  const originalLabel = button?.textContent || '';
+  if (button) {
+    button.disabled = true;
+    button.textContent = '正在评估…';
+  }
+  try {
+    const payload = await api(
+      `/api/sessions/${encodeURIComponent(state.currentId)}/comparisons/${encodeURIComponent(comparison.id)}/assess`,
+      { method: 'POST', body: JSON.stringify({ agent }) },
+    );
+    if (state.detail && payload?.session) state.detail.session = payload.session;
+    if (state.detail && payload?.group_chat) {
+      state.detail.session = state.detail.session || {};
+      state.detail.session.group_chat = payload.group_chat;
+    }
+    renderDetail();
+    const assessment = payload.comparison?.candidates?.[agent]?.conflict_assessment;
+    const labels = {
+      safe: '认为可以继续安全检查',
+      unsafe: '认为不应直接应用',
+      needs_review: '认为需要人工复核',
+    };
+    if (assessment?.status === 'failed') {
+      showToast(assessment.error || `${agentName(agent)} 未能完成冲突评估。`, true);
+    } else {
+      showToast(`${agentName(agent)} ${labels[assessment?.decision] || '已完成冲突评估'}。`);
+    }
+  } catch (error) {
+    if (button) {
+      button.disabled = false;
+      button.textContent = originalLabel;
+    }
+    showToast(error.message, true);
+  }
+}
+
+async function resolveComparisonConflict(agent) {
+  const comparison = currentComparison();
+  if (!comparison || comparison.status !== 'conflict' || !state.currentId || !['claude', 'codex'].includes(agent)) return;
+  const candidate = comparison.candidates?.[agent];
+  if (!candidate || !['ready', 'no_changes'].includes(candidate.status)) return;
+  const name = agentName(agent);
+  const confirmed = window.confirm(
+    `让 ${name} 重新实现并解决冲突？\n\n`
+      + '系统会从当前主工作区创建新的隔离 Worktree，让 Agent 在其中重做自己的方案。完成后仍需通过 Git 校验并由你确认采用。',
+  );
+  if (!confirmed) return;
+  const button = document.querySelector(`[data-comparison-action="resolve"][data-comparison-agent="${cssEscape(agent)}"]`);
+  if (button) {
+    button.disabled = true;
+    button.textContent = '正在重做…';
+  }
+  try {
+    const payload = await api(
+      `/api/sessions/${encodeURIComponent(state.currentId)}/comparisons/${encodeURIComponent(comparison.id)}/resolve`,
+      { method: 'POST', body: JSON.stringify({ agent }) },
+    );
+    if (state.detail && payload?.session) state.detail.session = payload.session;
+    if (state.detail && payload?.group_chat) {
+      state.detail.session = state.detail.session || {};
+      state.detail.session.group_chat = payload.group_chat;
+    }
+    renderDetail();
+    if (payload.comparison?.status === 'review') {
+      showToast(`${name} 已基于当前主工作区重做方案，现在可以重新查看并采用。`);
+    } else {
+      showToast(`${name} 已完成重做，但主工作区又发生变化，请重新检查。`, true);
+    }
+  } catch (error) {
+    if (button?.isConnected) button.disabled = false;
     showToast(error.message, true);
   }
 }
@@ -3027,6 +3153,7 @@ function renderAgentStatus(container, navDot, key, name, session, runStatus) {
     ? session.active_agents.map((agent) => String(agent).toLowerCase())
     : [];
   const agentActive = activeAgents.includes(key);
+  const turnState = currentAgentTurnState(session, key);
   const eventValue = String(event?.status || '').toLowerCase();
   const terminalEvent = eventValue && (
     eventValue.includes('complete')
@@ -3043,14 +3170,16 @@ function renderAgentStatus(container, navDot, key, name, session, runStatus) {
   const eventStatus = stopping
     ? 'stopping'
     : interaction ? 'waiting_user'
-      : agentActive ? terminalEvent ? event.status : 'working'
-        : terminalEvent ? event.status : 'waiting';
+      : agentActive ? terminalEvent ? event.status : event ? 'working' : 'starting'
+        : turnState === 'replied' && terminalEvent ? event.status
+          : 'waiting';
   const detail = stopping
     ? fallbackAgentDetail(name, runStatus)
     : interaction ? `${name} 正在等待你的权限决定或补充信息`
-      : agentActive ? event?.safe_summary || fallbackAgentDetail(name, runStatus)
-        : terminalEvent ? event?.safe_summary || fallbackAgentDetail(name, runStatus)
-          : `${name} 当前未参与本轮回复`;
+      : agentActive ? event?.safe_summary || activeAgentFallbackDetail(name, runStatus)
+        : turnState === 'replied' ? event?.safe_summary || `${name} 已完成本轮回复`
+          : turnState === 'pending' ? `${name} 已被点名，等待回复状态`
+            : inactiveAgentFallbackDetail(name, runStatus);
   const elapsed = Number(event?.elapsed_seconds);
   container.innerHTML = `
     <div class="agent-status-title">
@@ -3062,13 +3191,50 @@ function renderAgentStatus(container, navDot, key, name, session, runStatus) {
   navDot.className = `status-dot status-${statusKey(eventStatus)}`;
 }
 
+function currentAgentTurnState(session, key) {
+  const messages = Array.isArray(session?.group_chat?.messages)
+    ? session.group_chat.messages
+    : [];
+  const latestUser = [...messages].reverse().find((message) => (
+    message
+    && message.role === 'user'
+    && message.sender === 'user'
+    && message.recalled !== true
+  ));
+  if (!latestUser) return '';
+  const recipients = Array.isArray(latestUser.recipients)
+    ? latestUser.recipients.map((agent) => String(agent).toLowerCase())
+    : [];
+  if (!recipients.includes(key)) return 'not_targeted';
+  const replied = messages.some((message) => (
+    message
+    && message.role === 'assistant'
+    && message.sender === key
+    && String(message.reply_to || '') === String(latestUser.id || '')
+    && message.recalled !== true
+  ));
+  return replied ? 'replied' : 'pending';
+}
+
 function fallbackAgentDetail(name, status) {
   if (status === 'complete') return '本次协作已完成';
   if (status === 'ready') return `等待下一条群聊消息或 @${name}`;
   if (status === 'awaiting_interaction') return '正在等待你的权限决定或补充信息';
   if (status === 'stopping') return '正在安全停止当前任务';
   if (['failed', 'cancelled', 'interrupted'].includes(status)) return '当前任务已停止';
-  return `等待 ${name} 的安全进度事件`;
+  return `${name} 当前没有新的状态更新`;
+}
+
+function activeAgentFallbackDetail(name, status) {
+  if (status === 'stopping') return '正在安全停止当前任务';
+  return `${name} 已加入本轮，等待首个状态更新`;
+}
+
+function inactiveAgentFallbackDetail(name, status) {
+  if (['starting', 'running', 'awaiting_interaction', 'stopping'].includes(status)) {
+    return `${name} 未参与本轮回复`;
+  }
+  return `${name} 当前没有新的状态更新`;
 }
 
 function renderNativeInteraction(session) {
@@ -3403,8 +3569,14 @@ function comparisonMarkup(comparison, runId) {
     discarded: '已放弃 · 主工作区未修改',
   }[status] || '处理中';
   const mainWorkspace = state.detail?.session?.workspace || state.detail?.record?.workspace || '';
+  const driftFiles = Array.isArray(comparison?.changed_files)
+    ? comparison.changed_files.filter((item) => item && item.path).slice(0, 20)
+    : [];
+  const driftNotice = driftFiles.length
+    ? `<div class="comparison-drift-files"><strong>检测到的变化文件</strong><ul>${driftFiles.map((item) => `<li><code>${escapeHtml(item.path)}</code><span>${escapeHtml(item.status || 'M')}</span></li>`).join('')}</ul>${comparison?.changed_files?.length > driftFiles.length ? `<small>还有 ${comparison.changed_files.length - driftFiles.length} 个文件未展开。</small>` : ''}</div>`
+    : '';
   const conflictNotice = status === 'conflict'
-    ? `<div class="comparison-panel-notice comparison-panel-conflict"><strong>无法安全应用候选方案</strong><span>${escapeHtml(comparison?.error || '主工作区已经发生变化，为避免覆盖现有文件，本次应用已停止。')}</span>${comparison?.recovery_patch ? `<code>${escapeHtml(comparison.recovery_patch)}</code><button class="secondary-button" type="button" data-comparison-action="copy-recovery">复制恢复补丁路径</button>` : ''}</div>`
+    ? `<div class="comparison-panel-notice comparison-panel-conflict"><strong>无法安全应用候选方案</strong><span>${escapeHtml(comparison?.error || '主工作区已经发生变化，为避免覆盖现有文件，本次应用已停止。')}</span><small>可以先让对应 Agent 只读分析冲突；如果仍想采用它的实现，可让 Agent 从当前主工作区重新实现并生成新的候选补丁。两种操作都不会直接覆盖主工作区。</small>${driftNotice}${comparison?.recovery_patch ? `<code>${escapeHtml(comparison.recovery_patch)}</code><button class="secondary-button" type="button" data-comparison-action="copy-recovery">复制恢复补丁路径</button>` : ''}</div>`
     : status === 'applied'
       ? `<div class="comparison-panel-notice comparison-panel-success"><strong>已采用 ${escapeHtml(agentName(comparison?.selected_agent || ''))} 方案，修改已写入主工作区</strong><span>当前仍是未提交 Git 的修改；未选中的候选 Worktree 已清理。</span>${mainWorkspace ? `<code>${escapeHtml(mainWorkspace)}</code>` : ''}</div>`
       : '';
@@ -3420,10 +3592,12 @@ function comparisonMarkup(comparison, runId) {
     return candidate && ['ready', 'no_changes', 'failed', 'unavailable'].includes(String(candidate.status || ''));
   });
   const selectionNotice = ['running', 'review', 'previewing'].includes(status) && selectableAgents.length
-    ? `<div class="comparison-selection-notice"><strong>${status === 'running' ? '已完成的候选可以先预览' : status === 'previewing' ? '可以切换预览或正式采用当前实现' : '先在主工作区查看 A/B 效果'}</strong><span>${status === 'running' ? '预览会临时替换主工作区；另一个 Agent 完成后，才可以正式采用方案。' : '预览只临时替换主工作区文件，不会自动提交；确认后再点击“采用”。'}</span><div class="comparison-selection-actions">${selectableAgents.map((agent) => `<button class="secondary-button" type="button" data-comparison-action="preview" data-comparison-agent="${agent}">预览 ${escapeHtml(agentName(agent))}</button>${candidatesFinished ? `<button class="primary-button" type="button" data-comparison-action="apply" data-comparison-agent="${agent}">采用 ${escapeHtml(agentName(agent))}</button>` : ''}`).join('')}${status !== 'running' ? '<button class="secondary-button" type="button" data-comparison-action="discard">放弃全部</button>' : ''}</div></div>`
+    ? `<div class="comparison-selection-notice"><strong>${status === 'running' ? '已完成的候选可以先预览' : status === 'previewing' ? '可以切换预览或正式采用当前实现' : '先在主工作区查看 A/B 效果'}</strong><span>${status === 'running' ? '已完成的候选可以立即临时显示在主工作区；另一个 Agent 会继续在隔离 Worktree 中执行。另一个 Agent 完成后，才可以正式采用方案。' : '预览只临时替换主工作区文件，不会自动提交；确认后再点击“采用”。'}</span><div class="comparison-selection-actions">${selectableAgents.map((agent) => `<button class="secondary-button" type="button" data-comparison-action="preview" data-comparison-agent="${agent}">预览 ${escapeHtml(agentName(agent))}</button>${candidatesFinished ? `<button class="primary-button" type="button" data-comparison-action="apply" data-comparison-agent="${agent}">采用 ${escapeHtml(agentName(agent))}</button>` : ''}`).join('')}${status !== 'running' ? '<button class="secondary-button" type="button" data-comparison-action="discard">放弃全部</button>' : ''}</div></div>`
     : '';
   const headerNotice = status === 'previewing'
     ? '当前只是临时预览，确认采用后才会结束对比。'
+    : status === 'conflict'
+      ? '主工作区发生了变化，处理后点击“重新检查”才能继续采用。'
     : '主工作区在你选择前不会被修改。';
   const cards = ['claude', 'codex'].map((agent) => {
     const candidate = candidates[agent] && typeof candidates[agent] === 'object'
@@ -3435,6 +3609,10 @@ function comparisonMarkup(comparison, runId) {
         ? '已清理 · 未采用'
         : status === 'running' && ['ready', 'no_changes'].includes(candidateStatus)
           ? candidateStatus === 'no_changes' ? '已完成 · 可预览（无文件修改）' : '已完成 · 可预览'
+        : status === 'conflict' && ['ready', 'no_changes'].includes(candidateStatus)
+          ? '已完成 · 等待主工作区重新检查'
+        : candidate.resolution && ['ready', 'no_changes'].includes(candidateStatus)
+          ? '已完成冲突重做 · 可采用'
         : {
       running: '正在执行',
       ready: '可以查看和采用',
@@ -3444,12 +3622,31 @@ function comparisonMarkup(comparison, runId) {
         }[candidateStatus] || candidateStatus;
     const changes = candidate.changes;
     const usable = ['ready', 'no_changes'].includes(candidateStatus);
-    const applyDisabled = !usable || !terminal || !['review', 'previewing', 'conflict'].includes(status);
+    const applyDisabled = !usable || !terminal || !['review', 'previewing'].includes(status);
     const previewDisabled = !usable || !['running', 'review', 'previewing'].includes(status);
     const isPreviewed = comparison?.preview?.active_agent === agent;
     const commands = Array.isArray(candidate.preview_commands)
       ? candidate.preview_commands.join('\n') : '';
     const error = candidate.error ? `<div class="comparison-error">${escapeHtml(candidate.error)}</div>` : '';
+    const assessment = candidate.conflict_assessment && typeof candidate.conflict_assessment === 'object'
+      ? candidate.conflict_assessment : null;
+    const assessmentDecision = String(assessment?.decision || 'needs_review');
+    const assessmentConfidence = {
+      high: '高',
+      medium: '中',
+      low: '低',
+    }[String(assessment?.confidence || 'low')] || '低';
+    const assessmentLabel = {
+      safe: 'Agent 判断：可以继续安全检查',
+      unsafe: 'Agent 判断：不建议直接应用',
+      needs_review: 'Agent 判断：需要人工复核',
+    }[assessmentDecision] || 'Agent 判断：需要人工复核';
+    const assessmentMarkup = status === 'conflict' && assessment
+      ? `<div class="comparison-conflict-assessment ${assessmentDecision === 'safe' ? 'assessment-safe' : assessmentDecision === 'unsafe' ? 'assessment-unsafe' : 'assessment-review'}"><strong>${escapeHtml(assessmentLabel)}（置信度${assessmentConfidence}）</strong><span>${escapeHtml(assessment.summary || assessment.error || '未提供详细说明。')}</span>${assessment.files?.length ? `<small>关注文件：${escapeHtml(assessment.files.join('、'))}</small>` : ''}${assessment.checks?.length ? `<small>建议校验：${escapeHtml(assessment.checks.join('；'))}</small>` : ''}${assessment.status === 'failed' ? `<small>${escapeHtml(assessment.error || '评估失败')}</small>` : ''}</div>`
+      : '';
+    const resolutionResponse = candidate.resolution?.response
+      ? `<details class="comparison-resolution-response"><summary>Agent 冲突重做说明</summary><div>${escapeHtml(candidate.resolution.response)}</div></details>`
+      : '';
     const candidateCleaned = candidate.cleaned === true
       || ['applied', 'discarded'].includes(status)
       || ['applied', 'discarded'].includes(String(candidate.apply_status || ''));
@@ -3462,11 +3659,16 @@ function comparisonMarkup(comparison, runId) {
     const canInspectCandidate = usable
       && !candidateCleaned
       && ['running', 'review', 'previewing', 'conflict'].includes(status);
+    const canAssessConflict = usable
+      && !candidateCleaned
+      && status === 'conflict';
+    const canResolveConflict = canAssessConflict;
     const previewLabel = candidateCleaned
       ? '候选已清理'
       : isPreviewed ? '已在主工作区预览' : '在主工作区预览';
     const applyLabel = candidateCleaned
       ? candidate.apply_status === 'applied' ? '已采用' : '已清理'
+      : status === 'conflict' ? '重新检查后采用'
       : '采用此方案';
     // The final answer is rendered once as a normal group-chat bubble above.
     // Keeping a second copy inside the candidate card caused confusing duplicate
@@ -3481,6 +3683,8 @@ function comparisonMarkup(comparison, runId) {
       ${isPreviewed ? '<div class="comparison-preview-active">当前主工作区正在显示此方案</div>' : ''}
       ${changes ? changeSummaryMarkup(changes, `comparison-${runId}-${agent}`) : ''}
       ${error}
+      ${assessmentMarkup}
+      ${resolutionResponse}
       ${canInspectCandidate ? `<details class="comparison-guide" open>
         <summary>如何查看实现效果</summary>
         <ol><li>打开终端进入上面的隔离工作区。</li><li>执行项目自己的测试或预览命令。</li><li>确认效果后回到这里选择采用方案。</li></ol>
@@ -3490,6 +3694,7 @@ function comparisonMarkup(comparison, runId) {
         <button class="secondary-button" type="button" data-comparison-action="copy-path" data-comparison-agent="${agent}"${copyPathDisabled ? ' disabled' : ''}>${candidateCleaned ? '路径已清理' : '复制路径'}</button>
         <button class="secondary-button" type="button" data-comparison-action="copy-commands" data-comparison-agent="${agent}"${copyCommandsDisabled ? ' disabled' : ''}>${candidateCleaned ? '命令已失效' : '复制查看命令'}</button>
         <button class="secondary-button" type="button" data-comparison-action="preview" data-comparison-agent="${agent}"${previewDisabled ? ' disabled' : ''}>${previewLabel}</button>
+        ${canAssessConflict ? `<button class="secondary-button" type="button" data-comparison-action="assess" data-comparison-agent="${agent}">让 ${escapeHtml(agentName(agent))} 评估</button><button class="secondary-button" type="button" data-comparison-action="resolve" data-comparison-agent="${agent}">让 ${escapeHtml(agentName(agent))} 解决冲突</button>` : ''}
         <button class="primary-button" type="button" data-comparison-action="apply" data-comparison-agent="${agent}"${applyDisabled ? ' disabled' : ''}>${applyLabel}</button>
       </div>
     </article>`;
@@ -3500,7 +3705,7 @@ function comparisonMarkup(comparison, runId) {
     ${previewNotice}
     ${selectionNotice}
     <div class="comparison-candidates">${cards}</div>
-    <footer class="comparison-panel-footer"><span>${status === 'review' ? '可分别预览 A、B 的实现效果，再决定采用哪一个。' : status === 'previewing' ? '主工作区当前只临时显示一个候选方案，切换不会提交 Git。' : status === 'applied' ? '所选方案已保留为主工作区中的未提交修改。' : status === 'discarded' ? '两个候选已清理，主工作区未修改。' : '候选工作区只在采用或放弃后清理。'}</span><div class="comparison-footer-actions">${mainWorkspace ? '<button class="secondary-button" type="button" data-comparison-action="copy-main-path">复制主工作区路径</button>' : ''}<button class="secondary-button" type="button" data-comparison-action="refresh">重新检查</button><button class="secondary-button" type="button" data-comparison-action="discard"${['running', 'applying', 'applied', 'discarded'].includes(status) ? ' disabled' : ''}>放弃全部方案</button></div></footer>
+    <footer class="comparison-panel-footer"><span>${status === 'review' ? '可分别预览 A、B 的实现效果，再决定采用哪一个。' : status === 'previewing' ? '主工作区当前只临时显示一个候选方案，切换不会提交 Git。' : status === 'conflict' ? '主工作区有变化，采用入口已暂停；处理后点击“重新检查”。' : status === 'applied' ? '所选方案已保留为主工作区中的未提交修改。' : status === 'discarded' ? '两个候选已清理，主工作区未修改。' : '候选工作区只在采用或放弃后清理。'}</span><div class="comparison-footer-actions">${mainWorkspace ? '<button class="secondary-button" type="button" data-comparison-action="copy-main-path">复制主工作区路径</button>' : ''}<button class="secondary-button" type="button" data-comparison-action="refresh">${status === 'conflict' ? '重新检查主工作区' : '重新检查'}</button><button class="secondary-button" type="button" data-comparison-action="discard"${['running', 'applying', 'applied', 'discarded'].includes(status) ? ' disabled' : ''}>放弃全部方案</button></div></footer>
   </section>`;
 }
 

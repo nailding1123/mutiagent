@@ -46,7 +46,7 @@ class BridgeConfigTests(unittest.TestCase):
                         "recent_messages": 6,
                     },
                     "claude": {"command": ["/bin/echo", "claude"], "models": ["claude-opus-5", "fallback"]},
-                    "codex": {"command": "/bin/echo codex", "models": ["gpt-5.6-sol"], "timeout": 42},
+                    "codex": {"command": "/bin/echo codex", "models": ["gpt-5.6-sol"], "timeout": 42, "reasoning_effort": "high"},
                 },
                 workspace=directory,
             )
@@ -59,6 +59,34 @@ class BridgeConfigTests(unittest.TestCase):
         self.assertEqual(settings.context_compaction.recent_messages, 6)
         self.assertEqual(settings.claude.models, ("claude-opus-5", "fallback"))
         self.assertEqual(settings.codex.timeout, 42)
+        self.assertEqual(settings.codex.reasoning_effort, "high")
+
+    def test_codex_reasoning_effort_defaults_to_native_and_rejects_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            automatic = resolve_bridge_settings(
+                {
+                    "claude": {"command": "/bin/echo"},
+                    "codex": {"command": "/bin/echo", "reasoning_effort": "auto"},
+                },
+                workspace=directory,
+            )
+            self.assertIsNone(automatic.codex.reasoning_effort)
+            with self.assertRaisesRegex(ConfigError, "reasoning_effort"):
+                resolve_bridge_settings(
+                    {
+                        "claude": {"command": "/bin/echo"},
+                        "codex": {"command": "/bin/echo", "reasoning_effort": "extreme"},
+                    },
+                    workspace=directory,
+                )
+            with self.assertRaisesRegex(ConfigError, "reasoning_effort"):
+                resolve_bridge_settings(
+                    {
+                        "claude": {"command": "/bin/echo"},
+                        "codex": {"command": "/bin/echo", "reasoning_effort": []},
+                    },
+                    workspace=directory,
+                )
 
     def test_resolves_worktree_toggle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

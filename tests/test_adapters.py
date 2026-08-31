@@ -22,6 +22,7 @@ from multiagent_cli.adapters import (
     _claude_permission_prompt_response,
     _codex_interaction_request,
     _codex_interaction_response,
+    _codex_turn_params,
     _codex_thread_params,
 )
 from multiagent_cli.bridge_models import (
@@ -259,6 +260,71 @@ class CommandBuilderTests(unittest.TestCase):
                 self.assertEqual(params["approvalPolicy"], "on-request")
                 self.assertEqual(params["approvalsReviewer"], "user")
                 self.assertTrue(params["ephemeral"])
+
+    def test_codex_reasoning_effort_is_forwarded_to_cli_and_app_server(self) -> None:
+        adapter = CodexAdapter(
+            AgentCommandSettings(("codex",), reasoning_effort="high")
+        )
+        command = adapter.build_command(
+            workspace=Path("/tmp"), mode="write", session_id=None
+        )
+        params = _codex_turn_params(
+            thread_id="thread-1",
+            prompt="task",
+            workspace=Path("/tmp"),
+            mode="write",
+            model="gpt-test",
+            reasoning_effort="high",
+        )
+
+        self.assertIn('model_reasoning_effort="high"', command)
+        self.assertEqual(params["effort"], "high")
+        self.assertEqual(params["model"], "gpt-test")
+
+    def test_codex_app_server_sends_reasoning_effort_on_turn_start(self) -> None:
+        script_text = """#!/usr/bin/env python3
+import json
+import sys
+
+def receive():
+    return json.loads(sys.stdin.readline())
+
+def send(payload):
+    print(json.dumps(payload), flush=True)
+
+initialize = receive()
+send({"jsonrpc": "2.0", "id": initialize["id"], "result": {}})
+receive()
+thread_start = receive()
+send({"jsonrpc": "2.0", "id": thread_start["id"], "result": {"thread": {"id": "thread-1"}}})
+turn_start = receive()
+if turn_start.get("params", {}).get("effort") != "xhigh":
+    raise SystemExit("reasoning effort was not forwarded")
+send({"jsonrpc": "2.0", "id": turn_start["id"], "result": {"turn": {"id": "turn-1"}}})
+item = {"type": "agentMessage", "id": "final", "text": "完成", "phase": "final_answer"}
+send({"jsonrpc": "2.0", "method": "item/started", "params": {"item": item}})
+send({"jsonrpc": "2.0", "method": "item/completed", "params": {"item": item}})
+send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"status": "completed"}}})
+sys.stdin.read()
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            fake_cli = Path(directory) / "codex-effort-app-server.py"
+            fake_cli.write_text(script_text, encoding="utf-8")
+            adapter = CodexAdapter(
+                AgentCommandSettings(
+                    (sys.executable, str(fake_cli)),
+                    reasoning_effort="xhigh",
+                    timeout=2,
+                )
+            )
+            result = adapter.run(
+                "task",
+                workspace=Path(directory),
+                mode="read",
+                on_interaction=lambda _request: NativeInteractionResponse("approve"),
+            )
+
+        self.assertEqual(result.final_text, "完成")
 
     def test_codex_app_server_forwards_supported_extra_args(self) -> None:
         adapter = CodexAdapter(

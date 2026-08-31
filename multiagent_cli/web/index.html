@@ -309,6 +309,7 @@
                     <ol id="settings-codex-model-order" class="model-order-list" aria-label="Codex 模型优先顺序"></ol>
                     <small>拖动模型或使用上移/下移调整顺序；第一个是首选，列表为空时使用 Codex CLI 默认模型。</small>
                   </div>
+                  <label><span>思考强度</span><select id="settings-codex-reasoning-effort"><option value="auto">自动（由模型决定）</option><option value="minimal">最小</option><option value="low">低</option><option value="medium">中</option><option value="high">高</option><option value="xhigh">极高</option></select><small>仅对支持该参数的 Codex GPT 模型生效；自动时使用模型默认值。</small></label>
                   <div class="agent-identity-field">
                     <label><span>群聊身份提示词</span><textarea id="settings-group-chat-agent-b-identity" rows="7" required></textarea></label>
                     <small>只用于群聊协作；路由由系统控制，是否读取或修改由 Codex 自行判断。</small>

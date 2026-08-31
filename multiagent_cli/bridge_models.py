@@ -133,6 +133,8 @@ class AgentCommandSettings:
     fallback_on_timeout: bool = True
     extra_args: tuple[str, ...] = ()
     timeout: float = 900
+    # Codex Responses reasoning effort. None delegates to the native default.
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)

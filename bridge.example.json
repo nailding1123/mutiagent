@@ -32,6 +32,7 @@
   "codex": {
     "model": null,
     "models": [],
+    "reasoning_effort": "auto",
     "fallback_on_timeout": true,
     "timeout": 900,
     "extra_args": []

@@ -1184,6 +1184,11 @@ class CodexAdapter(BaseCLIAdapter):
                 "--ask-for-approval",
                 "never",
             ]
+            if self.settings.reasoning_effort:
+                command.extend([
+                    "-c",
+                    f'model_reasoning_effort="{self.settings.reasoning_effort}"',
+                ])
             if selected_model:
                 command.extend(["--model", selected_model])
             command.extend(["exec", "resume", "--json", session_id])
@@ -1201,6 +1206,11 @@ class CodexAdapter(BaseCLIAdapter):
             "--ask-for-approval",
             "never",
         ]
+        if self.settings.reasoning_effort:
+            command.extend([
+                "-c",
+                f'model_reasoning_effort="{self.settings.reasoning_effort}"',
+            ])
         if selected_model:
             command.extend(["--model", selected_model])
         command.extend(["exec", "--json", "--skip-git-repo-check", "--ephemeral"])
@@ -1424,14 +1434,14 @@ class CodexAdapter(BaseCLIAdapter):
                     thread_id = thread["id"]
                     pending_turn_request = send_request(
                         "turn/start",
-                        {
-                            "threadId": thread_id,
-                            "input": [{"type": "text", "text": prompt}],
-                            "cwd": str(workspace),
-                            **_codex_approval_params(),
-                            "sandboxPolicy": _codex_sandbox_policy(mode),
-                            **({"model": model} if model else {}),
-                        },
+                        _codex_turn_params(
+                            thread_id=thread_id,
+                            prompt=prompt,
+                            workspace=workspace,
+                            mode=mode,
+                            model=model,
+                            reasoning_effort=self.settings.reasoning_effort,
+                        ),
                     )
                     continue
                 if (
@@ -1874,6 +1884,29 @@ def _codex_thread_params(
         params["threadId"] = thread_id
     else:
         params["ephemeral"] = True
+    if model:
+        params["model"] = model
+    return params
+
+
+def _codex_turn_params(
+    *,
+    thread_id: str,
+    prompt: str,
+    workspace: Path,
+    mode: str,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {
+        "threadId": thread_id,
+        "input": [{"type": "text", "text": prompt}],
+        "cwd": str(workspace),
+        **_codex_approval_params(),
+        "sandboxPolicy": _codex_sandbox_policy(mode),
+    }
+    if reasoning_effort:
+        params["effort"] = reasoning_effort
     if model:
         params["model"] = model
     return params

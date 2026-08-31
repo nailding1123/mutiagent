@@ -24,6 +24,9 @@ from .token_api import (
 )
 
 
+CODEX_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+
+
 class ConfigError(ValueError):
     """Invalid or incomplete bridge configuration."""
 
@@ -178,6 +181,16 @@ def _resolve_agent_settings(name: str, raw: Any) -> AgentCommandSettings:
     ):
         raise ConfigError(f"{name}.timeout 必须是正数")
 
+    reasoning_effort = raw.get("reasoning_effort") if name == "codex" else None
+    if reasoning_effort is None or reasoning_effort == "" or reasoning_effort == "auto":
+        reasoning_effort = None
+    if reasoning_effort is not None:
+        if not isinstance(reasoning_effort, str) or reasoning_effort not in CODEX_REASONING_EFFORTS:
+            values = "、".join(sorted(CODEX_REASONING_EFFORTS))
+            raise ConfigError(
+                f"codex.reasoning_effort 必须是 auto、{values} 之一"
+            )
+
     return AgentCommandSettings(
         command=command,
         model=models[0] if models else None,
@@ -185,6 +198,7 @@ def _resolve_agent_settings(name: str, raw: Any) -> AgentCommandSettings:
         fallback_on_timeout=fallback_on_timeout,
         extra_args=tuple(extra_args),
         timeout=float(timeout),
+        reasoning_effort=reasoning_effort,
     )
 
 

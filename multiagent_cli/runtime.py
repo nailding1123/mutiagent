@@ -58,6 +58,7 @@ def settings_snapshot(settings: BridgeSettings) -> dict[str, object]:
             "fallback_on_timeout": agent.fallback_on_timeout,
             "timeout": agent.timeout,
             "extra_args": list(agent.extra_args),
+            "reasoning_effort": agent.reasoning_effort,
         }
 
     resolved = {
@@ -98,6 +99,7 @@ def settings_snapshot(settings: BridgeSettings) -> dict[str, object]:
         ),
         "claude_timeout": settings.claude.timeout,
         "codex_timeout": settings.codex.timeout,
+        "codex_reasoning_effort": settings.codex.reasoning_effort,
         "resolved_config": resolved,
     }
 
@@ -137,6 +139,7 @@ def apply_resume_settings(
         model = snapshot.get(f"{prefix}_model")
         models = snapshot.get(f"{prefix}_models")
         timeout = snapshot.get(f"{prefix}_timeout")
+        reasoning_effort = snapshot.get(f"{prefix}_reasoning_effort")
         return replace(
             agent,
             model=model if isinstance(model, str) else None,
@@ -150,6 +153,11 @@ def apply_resume_settings(
                 float(timeout)
                 if isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
                 else agent.timeout
+            ),
+            reasoning_effort=(
+                reasoning_effort
+                if isinstance(reasoning_effort, str) and reasoning_effort.strip()
+                else agent.reasoning_effort
             ),
         )
 

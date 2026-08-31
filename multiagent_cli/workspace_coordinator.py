@@ -186,6 +186,99 @@ class WorkspaceCoordinator:
             raise WorkspaceCoordinatorError(f"{agent} 候选缺少有效工作区基线")
         return summarize_workspace_changes(workspace, baseline)
 
+    def collect_conflict_context(
+        self,
+        comparison: dict[str, Any],
+        agent: str,
+    ) -> dict[str, Any]:
+        """Collect bounded main/candidate diffs for an Agent safety review.
+
+        The returned context is informational only.  It deliberately captures
+        the current main checkout and the retained candidate Worktree without
+        applying either one, so an Agent can assess a conflict while the
+        deterministic tree guard in :meth:`apply_candidate` remains the final
+        authority.
+        """
+
+        target_workspace, base = _comparison_target(comparison)
+        current = capture_change_baseline(target_workspace)
+        if not current.available:
+            raise WorkspaceCoordinatorError(
+                current.reason or "无法读取冲突时的主工作区状态"
+            )
+        baseline = _baseline_from_comparison_base(base)
+        main_changes = summarize_workspace_changes(target_workspace, baseline)
+        candidate_changes = self.collect_candidate_diff(comparison, agent)
+        candidate_workspace = self.candidate_workspace(comparison, agent)
+        candidate_current = capture_change_baseline(candidate_workspace)
+        if not candidate_current.available:
+            raise WorkspaceCoordinatorError(
+                candidate_current.reason or "无法读取候选工作区状态"
+            )
+        drift_files = _workspace_drift(
+            target_workspace,
+            str(base.get("tree") or ""),
+            current,
+            str(base.get("pathspec") or "."),
+        )
+        return {
+            "main_workspace": str(target_workspace),
+            "candidate_workspace": str(candidate_workspace),
+            "base_tree": str(base.get("tree") or ""),
+            "main_tree": current.tree,
+            "candidate_tree": candidate_current.tree,
+            "changed_files": drift_files,
+            "main_changes": main_changes,
+            "candidate_changes": candidate_changes,
+        }
+
+    def prepare_conflict_resolution(
+        self,
+        comparison: dict[str, Any],
+        agent: str,
+    ) -> dict[str, Any]:
+        """Create a fresh candidate Worktree from the current main checkout.
+
+        Conflict resolution must start from what the user currently has, not
+        from the stale A/B base. The Agent can then re-implement the selected
+        candidate's intent without asking Git to blindly replay an old patch.
+        """
+
+        target_workspace, _base = _comparison_target(comparison)
+        repository, pathspec = _repository_context(target_workspace)
+        if repository is None:
+            raise WorkspaceCoordinatorError("冲突重做需要可用的 Git 工作区")
+        target_baseline = capture_change_baseline(target_workspace)
+        if not target_baseline.available or not target_baseline.tree:
+            raise WorkspaceCoordinatorError(
+                target_baseline.reason or "无法记录冲突重做的主工作区基线"
+            )
+        base_commit = _snapshot_commit(repository, pathspec)
+        root = _create_worktree_from_base(
+            repository,
+            base_commit,
+            prefix=f"multiagent-resolution-{comparison.get('id', 'comparison')}-{agent}-",
+        )
+        candidate_workspace = root if pathspec == "." else root / Path(pathspec)
+        baseline = capture_change_baseline(candidate_workspace)
+        if not baseline.available or not baseline.tree:
+            _remove_worktree(root)
+            raise WorkspaceCoordinatorError("无法记录冲突重做候选工作区基线")
+        return {
+            "workspace": str(candidate_workspace),
+            "worktree_root": str(root),
+            "base_commit": base_commit,
+            "baseline": baseline.to_dict(),
+            "target_baseline": target_baseline.to_dict(),
+        }
+
+    def discard_conflict_resolution(self, resolution: object) -> None:
+        if not isinstance(resolution, dict):
+            return
+        root = str(resolution.get("worktree_root") or "")
+        if root:
+            _remove_worktree(Path(root))
+
     def apply_candidate(
         self,
         comparison: dict[str, Any],
@@ -226,6 +319,95 @@ class WorkspaceCoordinator:
                 )
             _apply_patch(target_workspace, _comparison_patch(active_candidate, target_workspace), reverse=True)
             current = capture_change_baseline(target_workspace)
+        resolution = candidate.get("resolution")
+        if isinstance(resolution, dict):
+            resolution_base = str(resolution.get("base_tree") or "")
+            result_tree = str(resolution.get("result_tree") or "")
+            if not resolution_base or not result_tree:
+                raise WorkspaceCoordinatorError("Agent 冲突重做缺少完整工作区快照")
+            if not current.available or current.tree != resolution_base:
+                patch = _tree_diff_patch(
+                    Path(str(base.get("repository") or target_workspace)),
+                    resolution_base,
+                    result_tree,
+                    str(base.get("pathspec") or "."),
+                )
+                recovery = _save_recovery_patch(
+                    target_workspace,
+                    f"{comparison.get('id', 'comparison')}-{agent}-resolution",
+                    patch,
+                )
+                return {
+                    "applied": False,
+                    "error": "主工作区在 Agent 冲突重做后又发生了变化，已停止应用。",
+                    "recovery_patch": str(recovery or ""),
+                    "changed_files": _workspace_drift(
+                        target_workspace,
+                        resolution_base,
+                        current,
+                        str(base.get("pathspec") or "."),
+                    ),
+                }
+            patch = _tree_diff_patch(
+                Path(str(base.get("repository") or target_workspace)),
+                resolution_base,
+                result_tree,
+                str(base.get("pathspec") or "."),
+            )
+            if patch:
+                checked = _git(
+                    target,
+                    "apply",
+                    "--check",
+                    "--binary",
+                    "--whitespace=nowarn",
+                    input_text=patch,
+                )
+                if checked.returncode != 0:
+                    recovery = _save_recovery_patch(
+                        target_workspace,
+                        f"{comparison.get('id', 'comparison')}-{agent}-resolution",
+                        patch,
+                    )
+                    return {
+                        "applied": False,
+                        "error": "Agent 冲突重做后的补丁未通过 Git 安全校验，已停止应用。",
+                        "recovery_patch": str(recovery or ""),
+                        "changed_files": [],
+                    }
+                applied = _git(
+                    target,
+                    "apply",
+                    "--binary",
+                    "--whitespace=nowarn",
+                    input_text=patch,
+                )
+                if applied.returncode != 0:
+                    recovery = _save_recovery_patch(
+                        target_workspace,
+                        f"{comparison.get('id', 'comparison')}-{agent}-resolution",
+                        patch,
+                    )
+                    return {
+                        "applied": False,
+                        "error": "Agent 冲突重做后的补丁应用失败，已停止应用。",
+                        "recovery_patch": str(recovery or ""),
+                        "changed_files": [],
+                    }
+            after = capture_change_baseline(target_workspace)
+            rollback = _save_rollback_metadata(
+                target_workspace,
+                _baseline_from_comparison_base(base),
+                after,
+                f"{comparison.get('id', 'comparison')}-{agent}-resolution",
+            )
+            self.cleanup_comparison(comparison)
+            return {
+                "applied": True,
+                "error": "",
+                "recovery_patch": "",
+                "rollback": rollback,
+            }
         if not current.available or current.tree != str(base.get("tree") or ""):
             patch = _comparison_patch(candidate, target_workspace)
             recovery = _save_recovery_patch(
@@ -240,6 +422,12 @@ class WorkspaceCoordinator:
                     "候选补丁已保留，请先处理主工作区变化后再重试。"
                 ),
                 "recovery_patch": str(recovery or ""),
+                "changed_files": _workspace_drift(
+                    target_workspace,
+                    str(base.get("tree") or ""),
+                    current,
+                    str(base.get("pathspec") or "."),
+                ),
             }
         patch = _comparison_patch(candidate, target_workspace)
         if patch:
@@ -260,6 +448,12 @@ class WorkspaceCoordinator:
                     "applied": False,
                     "error": "候选补丁无法安全应用到主工作区，已停止应用。",
                     "recovery_patch": str(recovery or ""),
+                    "changed_files": _workspace_drift(
+                        target_workspace,
+                        str(base.get("tree") or ""),
+                        current,
+                        str(base.get("pathspec") or "."),
+                    ),
                 }
         after = capture_change_baseline(target_workspace)
         rollback = _save_rollback_metadata(
@@ -274,6 +468,46 @@ class WorkspaceCoordinator:
             "error": "",
             "recovery_patch": "",
             "rollback": rollback,
+        }
+
+    def recheck_comparison(self, comparison: dict[str, Any]) -> dict[str, Any]:
+        """Revalidate the main checkout after an application conflict."""
+
+        target_workspace, base = _comparison_target(comparison)
+        current = capture_change_baseline(target_workspace)
+        if not current.available:
+            return {
+                "status": "conflict",
+                "safe": False,
+                "error": current.reason or "无法读取主工作区状态。",
+            }
+        preview = comparison.get("preview") if isinstance(comparison.get("preview"), dict) else {}
+        active_agent = str(preview.get("active_agent") or "")
+        if active_agent:
+            active_candidate = _comparison_candidate(comparison, active_agent)
+            active_tree = _candidate_tree(active_candidate)
+            if active_tree and current.tree == active_tree:
+                return {"status": "previewing", "safe": True, "error": ""}
+            if current.tree != str(base.get("tree") or ""):
+                return {
+                    "status": "conflict",
+                    "safe": False,
+                    "error": "主工作区仍有变化，请先处理这些变化后再重新检查。",
+                }
+            preview["active_agent"] = ""
+            preview["main_tree"] = current.tree
+        if current.tree == str(base.get("tree") or ""):
+            return {"status": "review", "safe": True, "error": ""}
+        return {
+            "status": "conflict",
+            "safe": False,
+            "error": "主工作区仍有变化，请先处理这些变化后再重新检查。",
+            "changed_files": _workspace_drift(
+                target_workspace,
+                str(base.get("tree") or ""),
+                current,
+                str(base.get("pathspec") or "."),
+            ),
         }
 
     def rollback_patch(self, metadata: object) -> dict[str, Any]:
@@ -539,6 +773,18 @@ class WorkspaceCoordinator:
                 except WorkspaceCoordinatorError as exc:
                     candidate["error"] = str(exc)
                     candidate["status"] = "unavailable"
+        if recovered.get("status") == "conflict":
+            try:
+                target_workspace, base = _comparison_target(recovered)
+                current = capture_change_baseline(target_workspace)
+                recovered["changed_files"] = _workspace_drift(
+                    target_workspace,
+                    str(base.get("tree") or ""),
+                    current,
+                    str(base.get("pathspec") or "."),
+                )
+            except WorkspaceCoordinatorError:
+                recovered["changed_files"] = []
         if recovered.get("status") in {"running", "applying"}:
             recovered["status"] = "review"
         return recovered
@@ -852,6 +1098,56 @@ def _candidate_tree(candidate: dict[str, Any]) -> str:
     return baseline.tree if baseline.available else ""
 
 
+def _workspace_drift(
+    workspace: Path,
+    before_tree: str,
+    current: WorkspaceChangeBaseline,
+    pathspec: str,
+) -> list[dict[str, str]]:
+    """Return the exact files that changed since a comparison baseline."""
+
+    if not before_tree or not current.available or not current.tree:
+        return []
+    repository, detected = _repository_context(workspace)
+    if repository is None or detected != pathspec:
+        return []
+    result = _git(
+        repository,
+        "diff",
+        "--name-status",
+        "-z",
+        "--no-renames",
+        before_tree,
+        current.tree,
+        "--",
+        pathspec,
+    )
+    if result.returncode != 0:
+        return []
+    fields = [field for field in result.stdout.split("\0") if field]
+    changed: list[dict[str, str]] = []
+    index = 0
+    while index < len(fields):
+        status = fields[index]
+        index += 1
+        if index >= len(fields):
+            break
+        path = fields[index]
+        index += 1
+        changed.append({"status": status, "path": _display_drift_path(path, pathspec)})
+        if status.startswith("R") or status.startswith("C"):
+            if index < len(fields):
+                index += 1
+    return changed[:100]
+
+
+def _display_drift_path(path: str, pathspec: str) -> str:
+    if pathspec == ".":
+        return path
+    prefix = f"{pathspec.rstrip('/')}/"
+    return path[len(prefix):] if path.startswith(prefix) else path
+
+
 def _baseline_from_comparison_base(base: dict[str, Any]) -> WorkspaceChangeBaseline:
     baseline = WorkspaceChangeBaseline.from_dict(base)
     if baseline is None:
@@ -942,6 +1238,32 @@ def _comparison_patch(candidate: dict[str, Any], target_workspace: Path) -> str:
         base_commit=base_commit,
     )
     return _worktree_patch(lease)
+
+
+def _tree_diff_patch(
+    repository: Path,
+    before_tree: str,
+    after_tree: str,
+    pathspec: str,
+) -> str:
+    if not before_tree or not after_tree or before_tree == after_tree:
+        return ""
+    result = _git(
+        repository,
+        "diff",
+        "--binary",
+        "--no-ext-diff",
+        "--no-renames",
+        before_tree,
+        after_tree,
+        "--",
+        pathspec,
+    )
+    if result.returncode != 0:
+        raise WorkspaceCoordinatorError(
+            result.stderr.strip() or "无法生成冲突重做补丁"
+        )
+    return result.stdout
 
 
 def _apply_patch(workspace: Path, patch: str, *, reverse: bool = False) -> None:

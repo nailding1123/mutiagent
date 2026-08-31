@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import copy
 import itertools
+import json
 import re
+import shlex
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -24,7 +26,11 @@ from .context_compaction import (
     build_context_projection,
     estimate_tokens,
 )
-from .workspace_state import capture_change_baseline, summarize_workspace_changes
+from .workspace_state import (
+    WorkspaceChangeBaseline,
+    capture_change_baseline,
+    summarize_workspace_changes,
+)
 from .workspace_coordinator import WorkspaceCoordinator, WorkspaceCoordinatorError
 GROUP_CHAT_PROTOCOL = "multiagent.group_chat.v2"
 GROUP_CHAT_AGENTS = ("claude", "codex")
@@ -210,6 +216,7 @@ class GroupChatEngine:
                 comparison["status"] = "conflict"
                 comparison["error"] = str(result.get("error") or "候选方案应用失败")
                 comparison["recovery_patch"] = str(result.get("recovery_patch") or "")
+                comparison["changed_files"] = list(result.get("changed_files") or [])
             return copy.deepcopy(comparison)
 
     def preview_comparison(self, agent: str) -> dict[str, Any]:
@@ -250,6 +257,236 @@ class GroupChatEngine:
             comparison["selected_agent"] = None
             comparison["error"] = ""
             return copy.deepcopy(comparison)
+
+    def recheck_comparison(self) -> dict[str, Any]:
+        """Recheck whether a conflicted comparison can safely continue."""
+
+        with self._lock:
+            comparison = self._state.get("comparison")
+            if not isinstance(comparison, dict):
+                raise BridgeError("当前群聊没有可重新检查的 A/B 对比方案")
+            if comparison.get("status") not in {"conflict", "review", "previewing"}:
+                raise BridgeError("当前 A/B 对比状态不能重新检查")
+        try:
+            result = self.workspace_coordinator.recheck_comparison(comparison)
+        except WorkspaceCoordinatorError as exc:
+            with self._lock:
+                comparison["status"] = "conflict"
+                comparison["error"] = str(exc)
+                return copy.deepcopy(comparison)
+        with self._lock:
+            comparison["status"] = str(result.get("status") or "conflict")
+            comparison["error"] = str(result.get("error") or "")
+            comparison["changed_files"] = list(result.get("changed_files") or [])
+            if comparison["status"] == "review":
+                comparison["recovery_patch"] = ""
+            return copy.deepcopy(comparison)
+
+    def assess_comparison_conflict(self, agent: str) -> dict[str, Any]:
+        """Ask one native Agent for a read-only conflict safety assessment.
+
+        The assessment is advisory.  It never changes the main checkout and a
+        ``safe`` answer does not bypass the comparison tree guard, recheck, or
+        the user's explicit apply confirmation.
+        """
+
+        if agent not in self.agent_names:
+            raise BridgeError("候选 Agent 必须是 Claude 或 Codex")
+        with self._lock:
+            comparison = self._state.get("comparison")
+            if not isinstance(comparison, dict):
+                raise BridgeError("当前群聊没有冲突中的 A/B 对比方案")
+            if comparison.get("status") != "conflict":
+                raise BridgeError("只有发生应用冲突时才能让 Agent 评估")
+            candidate = (
+                comparison.get("candidates", {}).get(agent)
+                if isinstance(comparison.get("candidates"), dict)
+                else None
+            )
+            if not isinstance(candidate, dict) or candidate.get("status") not in {
+                "ready",
+                "no_changes",
+            }:
+                raise BridgeError("该候选方案不可评估，请先等待其完成或查看错误信息")
+            candidate_name = self.adapters[agent].display_name
+
+        try:
+            context = self.workspace_coordinator.collect_conflict_context(
+                comparison,
+                agent,
+            )
+            prompt = _conflict_assessment_prompt(candidate_name, context)
+            result = self.adapters[agent].run(
+                prompt,
+                workspace=Path(str(context["candidate_workspace"])),
+                mode="read",
+                session_id=None,
+                on_event=None,
+                step_id=f"comparison_conflict_assessment_{comparison.get('id', 'unknown')}_{agent}",
+            )
+            after_context = self.workspace_coordinator.collect_conflict_context(
+                comparison,
+                agent,
+            )
+            candidate_changed = (
+                str(after_context.get("candidate_tree") or "")
+                != str(context.get("candidate_tree") or "")
+            )
+            assessment = _parse_conflict_assessment(result.final_text)
+            if candidate_changed:
+                assessment.update(
+                    {
+                        "decision": "needs_review",
+                        "confidence": "low",
+                        "status": "failed",
+                        "error": "评估过程中候选 Worktree 发生了变化，未采纳 Agent 判断。",
+                        "candidate_invalidated": True,
+                    }
+                )
+            else:
+                assessment["status"] = "completed"
+        except BaseException as exc:
+            assessment = {
+                "status": "failed",
+                "decision": "needs_review",
+                "confidence": "low",
+                "summary": "",
+                "reason": "",
+                "files": [],
+                "checks": [],
+                "raw": "",
+                "error": str(exc) or exc.__class__.__name__,
+            }
+
+        assessment["agent"] = agent
+        assessment["created_at"] = _timestamp()
+        with self._lock:
+            comparison = self._state.get("comparison")
+            if not isinstance(comparison, dict):
+                raise BridgeError("A/B 对比状态已不存在")
+            candidate = comparison.get("candidates", {}).get(agent)
+            if not isinstance(candidate, dict):
+                raise BridgeError("候选方案已不存在")
+            if assessment.get("candidate_invalidated") is True:
+                candidate["status"] = "unavailable"
+                candidate["error"] = str(assessment.get("error") or "评估过程中候选 Worktree 发生了变化")
+            candidate["conflict_assessment"] = assessment
+            return copy.deepcopy(comparison)
+
+    def resolve_comparison_conflict(self, agent: str) -> dict[str, Any]:
+        """Let an Agent re-implement its candidate on the current main tree."""
+
+        if agent not in self.agent_names:
+            raise BridgeError("候选 Agent 必须是 Claude 或 Codex")
+        with self._lock:
+            comparison = self._state.get("comparison")
+            if not isinstance(comparison, dict) or comparison.get("status") != "conflict":
+                raise BridgeError("只有发生应用冲突时才能让 Agent 重做方案")
+            candidate = (
+                comparison.get("candidates", {}).get(agent)
+                if isinstance(comparison.get("candidates"), dict)
+                else None
+            )
+            if not isinstance(candidate, dict) or candidate.get("status") not in {
+                "ready",
+                "no_changes",
+            }:
+                raise BridgeError("该候选方案不可重做，请先等待其完成或查看错误信息")
+            agent_name = self.adapters[agent].display_name
+
+        original_context = self.workspace_coordinator.collect_conflict_context(
+            comparison,
+            agent,
+        )
+        resolution: dict[str, Any] | None = None
+        try:
+            resolution = self.workspace_coordinator.prepare_conflict_resolution(
+                comparison,
+                agent,
+            )
+            prompt = _conflict_resolution_prompt(agent_name, original_context)
+            result = self.adapters[agent].run(
+                prompt,
+                workspace=Path(str(resolution["workspace"])),
+                mode="write",
+                session_id=None,
+                on_event=None,
+                step_id=f"comparison_conflict_resolution_{comparison.get('id', 'unknown')}_{agent}",
+            )
+            resolved_baseline = capture_change_baseline(
+                Path(str(resolution["workspace"]))
+            )
+            changes = summarize_workspace_changes(
+                Path(str(resolution["workspace"])),
+                WorkspaceChangeBaseline.from_dict(resolution.get("baseline")),
+            )
+            if not resolved_baseline.available or not resolved_baseline.tree:
+                raise BridgeError("Agent 重做后无法读取候选工作区快照")
+            resolution["base_tree"] = str(
+                resolution.get("target_baseline", {}).get("tree") or ""
+            )
+            resolution["result_tree"] = resolved_baseline.tree
+            resolution["resolved_at"] = _timestamp()
+            resolution["response"] = str(result.final_text or "")[:20_000]
+            if not resolution["base_tree"]:
+                raise BridgeError("冲突重做缺少主工作区基线")
+            current_main = capture_change_baseline(
+                Path(str(original_context["main_workspace"]))
+            )
+            with self._lock:
+                comparison = self._state.get("comparison")
+                candidate = (
+                    comparison.get("candidates", {}).get(agent)
+                    if isinstance(comparison, dict)
+                    and isinstance(comparison.get("candidates"), dict)
+                    else None
+                )
+                if not isinstance(comparison, dict) or not isinstance(candidate, dict):
+                    raise BridgeError("A/B 候选方案已不存在")
+                old_root = str(candidate.get("worktree_root") or "")
+                candidate.update(
+                    {
+                        "workspace": resolution["workspace"],
+                        "worktree_root": resolution["worktree_root"],
+                        "base_commit": resolution["base_commit"],
+                        "baseline": resolution["baseline"],
+                        "changes": changes,
+                        "result_tree": resolved_baseline.tree,
+                        "status": _comparison_candidate_status(changes),
+                        "error": "",
+                        "cleaned": False,
+                        "preview_commands": [
+                            f"cd {shlex.quote(str(resolution['workspace']))}",
+                            "git status --short",
+                            "git diff --stat",
+                            "git diff",
+                            "git diff --check",
+                        ],
+                        "conflict_assessment": None,
+                        "resolution": resolution,
+                    }
+                )
+                comparison["selected_agent"] = None
+                comparison["error"] = "Agent 已基于当前主工作区重新实现候选方案。"
+                comparison["recovery_patch"] = ""
+                comparison["changed_files"] = []
+                comparison["status"] = (
+                    "review"
+                    if current_main.available and current_main.tree == resolution["base_tree"]
+                    else "conflict"
+                )
+                if comparison["status"] == "conflict":
+                    comparison["error"] = "Agent 重做期间主工作区又发生了变化，请先重新检查。"
+                result_state = copy.deepcopy(comparison)
+            if old_root and old_root != str(resolution["worktree_root"]):
+                self.workspace_coordinator.discard_conflict_resolution(
+                    {"worktree_root": old_root}
+                )
+            return result_state
+        except BaseException:
+            if resolution is not None:
+                self.workspace_coordinator.discard_conflict_resolution(resolution)
+            raise
 
     def discard_comparison(self) -> dict[str, Any]:
         with self._lock:
@@ -1167,6 +1404,22 @@ def resolve_directive(
     return recipients, action
 
 
+def is_explicit_comparison_execution_request(text: str) -> bool:
+    """Return whether a message explicitly targets both Agents for execution."""
+
+    if not _MENTION_RE.search(text):
+        return False
+    try:
+        recipients, action = resolve_directive(
+            text,
+            GROUP_CHAT_AGENTS,
+            default_agents=GROUP_CHAT_AGENTS,
+        )
+    except BridgeError:
+        return False
+    return action == "execute" and set(recipients) == set(GROUP_CHAT_AGENTS)
+
+
 def _channel_keys(action: str) -> tuple[str, str]:
     if action == "execute":
         return "execution_sessions", "execution_cursors"
@@ -1260,6 +1513,166 @@ def _comparison_candidate_status(changes: dict[str, Any] | None) -> str:
     if not isinstance(changes, dict) or changes.get("available") is False:
         return "unavailable"
     return "ready" if _has_file_changes(changes) else "no_changes"
+
+
+def _conflict_assessment_prompt(
+    agent_name: str,
+    context: dict[str, Any],
+) -> str:
+    changed_files = context.get("changed_files")
+    changed_summary = "\n".join(
+        f"- {item.get('status', 'M')} {item.get('path', '')}"
+        for item in changed_files
+        if isinstance(item, dict) and item.get("path")
+    ) if isinstance(changed_files, list) else ""
+    return f"""你是 {agent_name}，正在为 MultiAgent 做一次只读的候选应用冲突评估。
+
+这不是实现任务。禁止修改、创建或删除任何文件，也不要执行会改变 Git 索引或工作区的命令。
+你只需要判断：把候选方案相对共同基线的完整修改应用到当前主工作区，是否能够在不覆盖用户新改动、不丢失功能的前提下安全完成。
+
+评估规则：
+1. 同一文件甚至同一行被双方修改时，不能仅凭 Git 可能三方合并就判定安全；必须考虑语义冲突。
+2. 删除、重命名、二进制文件、生成文件或信息不足时，优先返回 needs_review。
+3. safe 仅表示你认为可以继续尝试；系统仍会执行 Git 校验并要求用户确认。
+4. 不要尝试应用补丁，不要给出内部思考过程。
+
+主工作区：{context.get('main_workspace', '')}
+候选工作区：{context.get('candidate_workspace', '')}
+共同基线树：{context.get('base_tree', '')}
+当前主工作区树：{context.get('main_tree', '')}
+候选树：{context.get('candidate_tree', '')}
+
+主工作区在对比开始后的变化文件：
+{changed_summary or '- 未能列出'}
+
+主工作区相对共同基线的变更：
+{_compact_change_context(context.get('main_changes'))}
+
+候选方案相对共同基线的变更：
+{_compact_change_context(context.get('candidate_changes'))}
+
+只输出一个 JSON 对象，不要使用 Markdown 代码块：
+{{"decision":"safe|unsafe|needs_review","confidence":"high|medium|low","reason":"简洁说明判断依据","files":["需要关注的文件"],"checks":["应用前后应执行的校验"]}}
+"""
+
+
+def _conflict_resolution_prompt(
+    agent_name: str,
+    context: dict[str, Any],
+) -> str:
+    return f"""你是 {agent_name}，正在为 MultiAgent 解决一次候选方案应用冲突。
+
+当前工作目录已经是“冲突发生后主工作区”的隔离副本。请在这个目录中直接修改代码，重新实现你原候选方案的目标，同时完整保留主工作区中用户刚刚已有的修改。不要修改主工作区路径中的文件。
+
+要求：
+1. 先阅读当前工作区和下面给出的原候选 Diff，理解原方案想解决的问题。
+2. 将原候选方案的有效意图改写成适配当前工作区的实现；不要机械覆盖用户修改。
+3. 只在当前隔离工作区中写入文件；可以运行必要的只读检查或项目测试。
+4. 完成后说明实际修改的文件、冲突如何处理、验证结果。不要输出内部思考过程。
+
+主工作区基线（当前隔离副本已包含）：{context.get('main_tree', '')}
+原对比基线：{context.get('base_tree', '')}
+主工作区发生变化的文件：
+{_compact_change_context({"available": True, "files": [{"path": item.get("path"), "status": item.get("status")} for item in context.get("changed_files", []) if isinstance(item, dict)]})}
+
+主工作区相对原基线的变更：
+{_compact_change_context(context.get('main_changes'))}
+
+你的原候选方案相对原基线的变更：
+{_compact_change_context(context.get('candidate_changes'))}
+"""
+
+
+def _compact_change_context(value: object, *, limit: int = 45_000) -> str:
+    if not isinstance(value, dict):
+        return "无法读取变更摘要"
+    if value.get("available") is False:
+        return str(value.get("reason") or "无法生成变更摘要")
+    files = value.get("files")
+    if not isinstance(files, list) or not files:
+        return "没有文件变化"
+    parts: list[str] = []
+    used = 0
+    for item in files:
+        if not isinstance(item, dict):
+            continue
+        header = (
+            f"\n--- {item.get('status', 'modified')} {item.get('path', '')} "
+            f"(+{item.get('additions', '?')} -{item.get('deletions', '?')}) ---\n"
+        )
+        patch = str(item.get("patch") or "")
+        block = header + (patch or "[二进制文件或无可用文本 Diff]")
+        remaining = limit - used
+        if remaining <= 0:
+            break
+        if len(block) > remaining:
+            parts.append(block[:remaining].rstrip() + "\n… 评估上下文已截断 …")
+            used = limit
+            break
+        parts.append(block)
+        used += len(block)
+    return "".join(parts).strip() or "没有可用的文本 Diff"
+
+
+def _parse_conflict_assessment(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    parsed: dict[str, Any] | None = None
+    candidates = [raw]
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        candidates.append(fenced.group(1))
+    first = raw.find("{")
+    last = raw.rfind("}")
+    if first >= 0 and last > first:
+        candidates.append(raw[first : last + 1])
+    for candidate in candidates:
+        try:
+            value = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(value, dict):
+            parsed = value
+            break
+
+    data = parsed or {}
+    decision = str(data.get("decision") or "").strip().lower()
+    decision_aliases = {
+        "yes": "safe",
+        "can_apply": "safe",
+        "可应用": "safe",
+        "no": "unsafe",
+        "cannot_apply": "unsafe",
+        "不可应用": "unsafe",
+        "review": "needs_review",
+        "manual_review": "needs_review",
+        "需人工复核": "needs_review",
+    }
+    decision = decision_aliases.get(decision, decision)
+    if decision not in {"safe", "unsafe", "needs_review"}:
+        decision = "needs_review"
+    confidence = str(data.get("confidence") or "").strip().lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "low"
+    reason = str(data.get("reason") or data.get("summary") or "").strip()
+    if not reason:
+        reason = raw[:2_000] if raw else "Agent 未返回可解析的结构化判断。"
+
+    def string_list(key: str) -> list[str]:
+        values = data.get(key)
+        if not isinstance(values, list):
+            return []
+        return [str(value).strip() for value in values if str(value).strip()][:50]
+
+    return {
+        "decision": decision,
+        "confidence": confidence,
+        "summary": reason,
+        "reason": reason,
+        "files": string_list("files"),
+        "checks": string_list("checks"),
+        "raw": raw[:10_000],
+        "error": "" if parsed is not None else "Agent 输出不是有效 JSON，已按需人工复核处理。",
+    }
 
 
 def _next_message_id() -> str:
