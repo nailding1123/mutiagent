@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import posixpath
 import secrets
 import subprocess
 import sys
@@ -1553,7 +1554,15 @@ class CodexAdapter(BaseCLIAdapter):
                 elif method == "error":
                     raise BridgeError(f"Codex app-server 错误：{params.get('message') or params}")
             if not turn_complete:
-                exit_code = process.poll()
+                # On Windows the child may have already closed stdout while
+                # its process handle is still being reaped. Give it a short
+                # bounded wait before reporting a premature exit; otherwise
+                # ``poll()`` can transiently return None and turn a successful
+                # fake/real app-server completion into a false failure.
+                try:
+                    exit_code = process.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    exit_code = process.poll()
                 if timed_out.is_set():
                     raise AgentTimeoutError(f"Codex CLI 超过 {self.settings.timeout:g} 秒未完成，已终止")
                 raise BridgeError(f"Codex app-server 提前退出（退出码 {exit_code}）")
@@ -1777,7 +1786,7 @@ def _claude_permission_prompt_request(
     if not cwd:
         path = tool_input.get("file_path") or tool_input.get("path")
         if isinstance(path, str):
-            cwd = str(Path(path).parent)
+            cwd = _path_parent_for_display(path)
     return NativeInteractionRequest(
         id=request_id,
         source=source,
@@ -1793,6 +1802,17 @@ def _claude_permission_prompt_request(
         ),
         metadata={"provider": "claude", "tool_name": tool_name},
     )
+
+
+def _path_parent_for_display(path: str) -> str:
+    """Preserve provider path spelling in cross-platform UI payloads."""
+
+    value = str(path or "")
+    # Provider payloads can contain POSIX paths even when the bridge itself is
+    # running on Windows (for example in protocol compatibility tests or WSL).
+    if value.startswith("/") and not value.startswith("//"):
+        return posixpath.dirname(value) or "/"
+    return str(Path(value).parent)
 
 
 def _claude_permission_prompt_response(

@@ -75,6 +75,8 @@ GROUP_CHAT_PROMPT = """你正在 MultiAgent 的群聊协作模式中，以 {agen
 {transcript}
 </group_chat_context>
 
+{comparison_note}
+
 本轮路由：{routing_note}
 """
 
@@ -1250,6 +1252,10 @@ class GroupChatEngine:
             "若修改了文件，说明修改内容、验证结果和尚存风险；"
             "若无需修改，直接回答用户问题。"
         )
+        comparison_note = _comparison_outcome_note(
+            self._state.get("comparison"),
+            self.adapters,
+        )
         return (
             "<multiagent_identity>\n"
             f"{identity}\n"
@@ -1260,6 +1266,7 @@ class GroupChatEngine:
                 routing_note=route,
                 permission_note=permission_note,
                 completion_note=completion_note,
+                comparison_note=comparison_note,
             )
         ), effective_session
 
@@ -1513,6 +1520,50 @@ def _comparison_candidate_status(changes: dict[str, Any] | None) -> str:
     if not isinstance(changes, dict) or changes.get("available") is False:
         return "unavailable"
     return "ready" if _has_file_changes(changes) else "no_changes"
+
+
+def _comparison_outcome_note(
+    comparison: object,
+    adapters: Mapping[str, BaseCLIAdapter],
+) -> str:
+    """Render the durable A/B decision into each subsequent Agent prompt."""
+
+    if not isinstance(comparison, dict):
+        return ""
+    status = str(comparison.get("status") or "")
+    if status == "applied":
+        selected = str(comparison.get("selected_agent") or "")
+        if selected not in adapters:
+            return ""
+        selected_name = adapters[selected].display_name
+        candidates = comparison.get("candidates")
+        discarded = []
+        if isinstance(candidates, dict):
+            for agent, candidate in candidates.items():
+                if agent == selected or not isinstance(candidate, dict):
+                    continue
+                if candidate.get("apply_status") == "discarded":
+                    discarded.append(
+                        adapters.get(agent).display_name
+                        if adapters.get(agent) is not None
+                        else str(agent)
+                    )
+        discarded_text = "、".join(discarded) or "另一候选"
+        return (
+            "<comparison_outcome>\n"
+            f"上一轮 A/B 对比已结束：用户采用了 {selected_name} 方案；"
+            f"{discarded_text} 方案未被采用，候选工作区已清理。"
+            "主工作区保留所采用方案的未提交修改。\n"
+            "</comparison_outcome>"
+        )
+    if status == "discarded":
+        return (
+            "<comparison_outcome>\n"
+            "上一轮 A/B 对比已放弃：Claude Code 和 Codex 的候选方案都未被采用，"
+            "主工作区未因该对比任务发生修改。\n"
+            "</comparison_outcome>"
+        )
+    return ""
 
 
 def _conflict_assessment_prompt(

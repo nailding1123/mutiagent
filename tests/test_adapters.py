@@ -560,13 +560,12 @@ send({"jsonrpc": "2.0", "method": "item/agentMessage/delta", "params": {"itemId"
 final_item["text"] = "修复完成，测试通过。"
 send({"jsonrpc": "2.0", "method": "item/completed", "params": {"item": final_item}})
 send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"status": "completed"}}})
-sys.stdin.read()
 """
         with tempfile.TemporaryDirectory() as directory:
             fake_cli = Path(directory) / "codex-app-server.py"
             fake_cli.write_text(script_text, encoding="utf-8")
             adapter = CodexAdapter(
-                AgentCommandSettings((sys.executable, str(fake_cli)), timeout=2)
+                AgentCommandSettings((sys.executable, str(fake_cli)), timeout=5)
             )
             events = []
 
@@ -623,13 +622,12 @@ item = {"type": "agentMessage", "id": "final", "text": "完成", "phase": "final
 send({"jsonrpc": "2.0", "method": "item/started", "params": {"item": item}})
 send({"jsonrpc": "2.0", "method": "item/completed", "params": {"item": item}})
 send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"status": "completed"}}})
-sys.stdin.read()
 """
         with tempfile.TemporaryDirectory() as directory:
             fake_cli = Path(directory) / "codex-request-id-reuse.py"
             fake_cli.write_text(script_text, encoding="utf-8")
             adapter = CodexAdapter(
-                AgentCommandSettings((sys.executable, str(fake_cli)), timeout=2)
+                AgentCommandSettings((sys.executable, str(fake_cli)), timeout=5)
             )
 
             result = adapter.run(
@@ -708,7 +706,6 @@ item = {"type": "agentMessage", "id": "final", "text": "done", "phase": "final_a
 send({"jsonrpc": "2.0", "method": "item/started", "params": {"item": item}})
 send({"jsonrpc": "2.0", "method": "item/completed", "params": {"item": item}})
 send({"jsonrpc": "2.0", "method": "turn/completed", "params": {"turn": {"status": "completed"}}})
-sys.stdin.read()
 """
         with tempfile.TemporaryDirectory() as directory:
             fake_cli = Path(directory) / "active-codex-app-server.py"

@@ -50,6 +50,11 @@ def _git_repository(root: Path) -> Path:
     repository.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
     subprocess.run(
+        ["git", "config", "core.autocrlf", "false"],
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
         ["git", "config", "user.email", "test@example.com"],
         cwd=repository,
         check=True,
@@ -503,6 +508,56 @@ class GroupChatTests(unittest.TestCase):
             discarded = engine.discard_comparison()
             self.assertEqual(discarded["status"], "discarded")
 
+    def test_subsequent_prompt_includes_selected_and_discarded_comparison_outcome(self) -> None:
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                if kwargs.get("mode") == "write":
+                    (Path(kwargs["workspace"]) / f"{self.display_name}.txt").write_text(
+                        "candidate",
+                        encoding="utf-8",
+                    )
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            claude = WritingAdapter(
+                "Claude",
+                [AgentRunResult("Claude", "A"), AgentRunResult("Claude", "后续")],
+            )
+            codex = WritingAdapter("Codex", [AgentRunResult("Codex", "B")])
+            engine = GroupChatEngine(
+                settings(repository),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
+            )
+            engine.ask("@all 执行：分别实现")
+            applied = engine.apply_comparison("claude")
+            self.assertEqual(applied["status"], "applied")
+
+            engine.ask("@Claude 检查采用后的实现")
+
+        follow_up_prompt = claude.calls[-1]["prompt"]
+        self.assertIn("上一轮 A/B 对比已结束", follow_up_prompt)
+        self.assertIn("采用了 Claude 方案", follow_up_prompt)
+        self.assertIn("Codex 方案未被采用", follow_up_prompt)
+
+    def test_subsequent_prompt_includes_discarded_comparison_outcome(self) -> None:
+        claude = FakeAdapter(
+            "Claude",
+            [AgentRunResult("Claude", "后续")],
+        )
+        codex = FakeAdapter("Codex", [])
+        with tempfile.TemporaryDirectory() as directory:
+            engine = GroupChatEngine(
+                settings(Path(directory)),
+                {"claude": claude, "codex": codex},  # type: ignore[arg-type]
+            )
+            engine._state["comparison"] = {"id": "comparison-old", "status": "discarded"}
+            engine.ask("@Claude 继续讨论")
+
+        self.assertIn("上一轮 A/B 对比已放弃", claude.calls[0]["prompt"])
+        self.assertIn("主工作区未因该对比任务发生修改", claude.calls[0]["prompt"])
+
     def test_agent_can_assess_conflict_without_applying_or_mutating_main(self) -> None:
         class WritingAdapter(FakeAdapter):
             def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
@@ -591,7 +646,10 @@ class GroupChatTests(unittest.TestCase):
             )
             applied = engine.apply_comparison("claude")
             self.assertEqual(applied["status"], "applied")
-            self.assertEqual((repository / "resolved.txt").read_text(encoding="utf-8"), "adapted")
+            self.assertEqual(
+                (repository / "resolved.txt").read_text(encoding="utf-8").rstrip("\r\n"),
+                "adapted",
+            )
             self.assertEqual(
                 (repository / "tracked.txt").read_text(encoding="utf-8"),
                 "user change",

@@ -64,6 +64,7 @@ class UIServerTests(unittest.TestCase):
             workspace = Path(directory) / "repo"
             workspace.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "core.autocrlf", "false"], cwd=workspace, check=True)
             subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
             subprocess.run(["git", "config", "user.name", "Test"], cwd=workspace, check=True)
             (workspace / "tracked.txt").write_text("base", encoding="utf-8")
@@ -130,6 +131,7 @@ class UIServerTests(unittest.TestCase):
             workspace = Path(directory) / "repo"
             workspace.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "core.autocrlf", "false"], cwd=workspace, check=True)
             subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
             subprocess.run(["git", "config", "user.name", "Test"], cwd=workspace, check=True)
             (workspace / "tracked.txt").write_text("base", encoding="utf-8")
@@ -208,6 +210,7 @@ class UIServerTests(unittest.TestCase):
             workspace = Path(directory) / "repo"
             workspace.mkdir()
             subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "core.autocrlf", "false"], cwd=workspace, check=True)
             subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
             subprocess.run(["git", "config", "user.name", "Test"], cwd=workspace, check=True)
             (workspace / "tracked.txt").write_text("base", encoding="utf-8")
@@ -1797,6 +1800,7 @@ if (!keys.includes('msg-active-run-1-m-user-codex')) throw new Error('Codex load
                 encoding="utf-8",
             )
             subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "core.autocrlf", "false"], cwd=workspace, check=True)
             subprocess.run(
                 ["git", "config", "user.email", "test@example.com"],
                 cwd=workspace,
