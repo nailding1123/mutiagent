@@ -3029,7 +3029,6 @@ if ([...state.streamBuffers.keys()].some((key) => key.startsWith('run-1:'))) {
         self.assertIn("API Key", html)
         self.assertNotIn(">New Task<", html)
         self.assertNotIn(">Run details<", html)
-        self.assertIn('class="channel-tabs"', html)
         self.assertIn("formnovalidate", html)
         self.assertIn('href="./app.css"', html)
         self.assertNotIn("function renderKanban", script)

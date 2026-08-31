@@ -90,7 +90,14 @@ class BridgeConfigTests(unittest.TestCase):
 
     def test_resolves_worktree_toggle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            settings = resolve_bridge_settings({"worktree": False}, workspace=directory)
+            settings = resolve_bridge_settings(
+                {
+                    "worktree": False,
+                    "claude": {"command": "/bin/echo"},
+                    "codex": {"command": "/bin/echo"},
+                },
+                workspace=directory,
+            )
         self.assertFalse(settings.worktree)
 
     def test_rejects_invalid_worktree_toggle(self) -> None:
@@ -100,7 +107,13 @@ class BridgeConfigTests(unittest.TestCase):
 
     def test_default_group_chat_identities_are_shared(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            settings = resolve_bridge_settings({}, workspace=directory)
+            settings = resolve_bridge_settings(
+                {
+                    "claude": {"command": "/bin/echo"},
+                    "codex": {"command": "/bin/echo"},
+                },
+                workspace=directory,
+            )
 
         self.assertEqual(
             settings.group_chat_agent_a_identity,
@@ -115,7 +128,9 @@ class BridgeConfigTests(unittest.TestCase):
                     "group_chat_identities": {
                         "agent_a": LEGACY_GROUP_CHAT_AGENT_A_IDENTITY,
                         "agent_b": LEGACY_GROUP_CHAT_AGENT_B_IDENTITY,
-                    }
+                    },
+                    "claude": {"command": "/bin/echo"},
+                    "codex": {"command": "/bin/echo"},
                 },
                 workspace=directory,
             )
@@ -133,7 +148,9 @@ class BridgeConfigTests(unittest.TestCase):
                     "group_chat_identities": {
                         "agent_a": "自定义身份 A",
                         "agent_b": "自定义身份 B",
-                    }
+                    },
+                    "claude": {"command": "/bin/echo"},
+                    "codex": {"command": "/bin/echo"},
                 },
                 workspace=directory,
             )
@@ -167,7 +184,9 @@ class BridgeConfigTests(unittest.TestCase):
                         "context_compaction": {
                             "threshold_tokens": 1000,
                             "target_tokens": 1000,
-                        }
+                        },
+                        "claude": {"command": "/bin/echo"},
+                        "codex": {"command": "/bin/echo"},
                     },
                     workspace=directory,
                 )

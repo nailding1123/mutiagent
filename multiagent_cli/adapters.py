@@ -32,6 +32,7 @@ from .process_control import isolated_process_kwargs, signal_process_tree, stop_
 
 EventCallback = Callable[[AgentEvent], None]
 InteractionCallback = Callable[[NativeInteractionRequest], NativeInteractionResponse]
+STARTUP_TIMEOUT_GRACE_SECONDS = 0.5
 
 
 class _InactivityTimeout:
@@ -45,8 +46,25 @@ class _InactivityTimeout:
         self._paused = False
         self._closed = False
 
-    def start(self) -> None:
-        self.reset()
+    def start(self, *, startup_grace_seconds: float = 0) -> None:
+        """Arm the timeout after allowing the native process to start.
+
+        CI machines and first-run CLIs can spend longer than a deliberately
+        short test timeout before producing their first event. Once the first
+        event arrives, ``reset`` switches back to the configured inactivity
+        timeout. This grace period only affects the initial arm.
+        """
+
+        with self._lock:
+            if self._closed or self._paused:
+                return
+            if self._timer is not None:
+                self._timer.cancel()
+            delay = max(self._seconds, max(0.0, float(startup_grace_seconds)))
+            timer = threading.Timer(delay, self._expire)
+            timer.daemon = True
+            self._timer = timer
+            timer.start()
 
     def reset(self) -> None:
         with self._lock:
@@ -785,7 +803,9 @@ class BaseCLIAdapter:
         inactivity_timeout = _InactivityTimeout(self.settings.timeout, stop_on_timeout)
         if timeout_bridge is not None:
             timeout_bridge.bind(inactivity_timeout)
-        inactivity_timeout.start()
+        inactivity_timeout.start(
+            startup_grace_seconds=STARTUP_TIMEOUT_GRACE_SECONDS
+        )
         stdin_lock = threading.Lock()
         writer: threading.Thread | None = None
         writer_errors: list[BaseException] = []
@@ -1354,7 +1374,9 @@ class CodexAdapter(BaseCLIAdapter):
             signal_process_tree(process, force=True)
 
         inactivity_timeout = _InactivityTimeout(self.settings.timeout, stop_on_timeout)
-        inactivity_timeout.start()
+        inactivity_timeout.start(
+            startup_grace_seconds=STARTUP_TIMEOUT_GRACE_SECONDS
+        )
         rpc_id = itertools.count(1)
         stdin_lock = threading.Lock()
         messages = _CodexMessageCollector()
