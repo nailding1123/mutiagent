@@ -1385,6 +1385,15 @@ body[data-theme="botanical"] .message-row.message-highlight .message-main { box-
     padding: 0;
     font-size: 15px;
   }
+  .sidebar.mobile-open + .workspace-main .mobile-sidebar-toggle {
+    position: fixed;
+    z-index: 12;
+    top: 19px;
+    left: 230px;
+    color: var(--ink);
+    background: var(--card);
+    border-color: var(--line-soft);
+  }
   .member-count { display: none; }
   .channel-actions { gap: 4px; }
   .header-button { padding: 0 7px; }

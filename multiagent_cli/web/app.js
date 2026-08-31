@@ -226,6 +226,11 @@ function bindEvents() {
   el.mobileSidebarToggle.addEventListener('click', () => {
     setMobileSidebarOpen(!el.sidebar.classList.contains('mobile-open'));
   });
+  el.sidebar.addEventListener('click', (event) => {
+    if (window.matchMedia('(max-width: 720px)').matches && event.target.closest('button')) {
+      setMobileSidebarOpen(false);
+    }
+  });
   [el.newTask, el.emptyNewTask].forEach((button) => {
     button.addEventListener('click', openNewTask);
   });
@@ -590,6 +595,8 @@ function setMobileSidebarOpen(open) {
   el.sidebar.classList.toggle('mobile-open', visible);
   el.mobileSidebarToggle.setAttribute('aria-expanded', String(visible));
   el.mobileSidebarToggle.setAttribute('aria-label', visible ? '关闭导航' : '打开导航');
+  const icon = el.mobileSidebarToggle.querySelector('span');
+  if (icon) icon.textContent = visible ? '×' : '☰';
 }
 
 function handleComposerKeydown(event) {
