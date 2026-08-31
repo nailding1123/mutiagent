@@ -103,8 +103,12 @@
           </div>
           <div class="channel-actions">
             <button id="stop-task-button" class="header-button stop-task-button hidden" type="button" title="停止当前任务">■ 停止</button>
-            <button id="header-settings-button" class="header-button" type="button" title="设置">⚙</button>
-            <button id="header-details-button" class="header-button" type="button" title="运行详情">▣</button>
+            <button id="header-settings-button" class="header-button header-button-labeled" type="button" title="设置">
+              <span class="header-button-icon" aria-hidden="true">⚙</span><span class="header-button-label">设置</span>
+            </button>
+            <button id="header-details-button" class="header-button header-button-labeled" type="button" title="运行详情">
+              <span class="header-button-icon" aria-hidden="true">▣</span><span class="header-button-label">详情</span>
+            </button>
             <span id="run-status-badge" class="status-badge" role="status" aria-live="polite">等待任务</span>
             <span class="member-count">♧ 2</span>
           </div>
@@ -259,18 +263,23 @@
                   <label><span>目标预算（估算 token）</span><input id="settings-context-compaction-target" data-context-compaction-setting type="number" min="1" step="1" required /></label>
                   <label><span>最近原文消息数</span><input id="settings-context-compaction-recent" data-context-compaction-setting type="number" min="1" max="100" step="1" required /></label>
                 </div>
-                <div class="settings-switches">
-                  <div class="setting-switch setting-static"><span class="setting-static-icon">@</span><span><strong>点名路由</strong><small>@Claude（Claude Code）、@Codex 或 @all 会覆盖默认响应者；@all 会同时通知双方，由各自的原生 Agent 判断是否需要修改。</small></span></div>
-                  <div class="setting-switch setting-static"><span class="setting-static-icon">A</span><span><strong>原生读写决策</strong><small>MultiAgent 不再按消息关键词切换只读或写入模式。每个 Agent 根据用户请求和自身原生规则决定读取、修改与验证范围。</small></span></div>
-                  <div class="setting-switch setting-static"><span class="setting-static-icon">1</span><span><strong>Git 写入隔离</strong><small>Git 工作区已有 Agent 写入时，另一 Agent 使用唯一临时 Worktree，完成后自动合并并清理。非 Git 目录无法隔离，并发 Agent 会共享目标目录。</small></span></div>
-                  <div class="setting-switch setting-static"><span class="setting-static-icon">!</span><span><strong>原生权限与提问</strong><small>Claude Code 或 Codex 请求执行命令、修改文件、扩展权限或补充信息时，会暂停对应 Agent 并在页面弹窗；群聊中的其他 Agent 仍可继续工作。</small></span></div>
-                </div>
+                <details class="settings-guidance">
+                  <summary><span>协作行为说明</span><small>4 条固定规则</small></summary>
+                  <div class="settings-guidance-grid">
+                    <div class="setting-switch setting-static"><span class="setting-static-icon">@</span><span><strong>点名路由</strong><small>@Claude（Claude Code）、@Codex 或 @all 会覆盖默认响应者；@all 会同时通知双方，由各自的原生 Agent 判断是否需要修改。</small></span></div>
+                    <div class="setting-switch setting-static"><span class="setting-static-icon">A</span><span><strong>原生读写决策</strong><small>MultiAgent 不再按消息关键词切换只读或写入模式。每个 Agent 根据用户请求和自身原生规则决定读取、修改与验证范围。</small></span></div>
+                    <div class="setting-switch setting-static"><span class="setting-static-icon">1</span><span><strong>Git 写入隔离</strong><small>Git 工作区已有 Agent 写入时，另一 Agent 使用唯一临时 Worktree，完成后自动合并并清理。非 Git 目录无法隔离，并发 Agent 会共享目标目录。</small></span></div>
+                    <div class="setting-switch setting-static"><span class="setting-static-icon">!</span><span><strong>原生权限与提问</strong><small>Claude Code 或 Codex 请求执行命令、修改文件、扩展权限或补充信息时，会暂停对应 Agent 并在页面弹窗；群聊中的其他 Agent 仍可继续工作。</small></span></div>
+                  </div>
+                </details>
               </div>
             </section>
 
             <section class="settings-panel hidden" data-settings-panel="agents">
               <h3>智能体</h3>
               <p>一个 Token API Key 同时供 Claude Code 和 Codex CLI 使用；Key 只保存在本机私密状态目录。</p>
+              <section class="settings-block">
+                <div class="settings-block-heading"><div><h4>凭据</h4><small>可选；仅在需要统一 Token API 时配置。</small></div></div>
               <article class="settings-card token-api-card">
                 <div class="token-api-heading">
                   <div><h4>公司 Token API</h4><small id="settings-token-api-status">尚未配置 API Key</small></div>
@@ -282,9 +291,10 @@
                 </div>
                 <small>不会写入工作区的 .multiagent.json、任务快照或命令参数；也不会由设置接口回显。</small>
               </article>
+              </section>
               <div class="agent-settings-grid">
                 <article class="settings-card">
-                  <h4>Claude Code / Agent A</h4>
+                  <header class="settings-card-heading"><div><span class="settings-card-kicker">Agent A</span><h4>Claude Code</h4></div><small>模型与群聊身份</small></header>
                   <div class="model-picker">
                     <span class="field-label">模型优先顺序</span>
                     <div class="model-picker-row"><select id="settings-claude-model-add" aria-label="选择 Claude Code 模型"></select><button class="secondary-button" data-add-model="claude" type="button">添加</button></div>
@@ -296,13 +306,18 @@
                     <label><span>群聊身份提示词</span><textarea id="settings-group-chat-agent-a-identity" rows="7" required></textarea></label>
                     <small>只用于群聊协作；路由由系统控制，是否读取或修改由 Claude Code 自行判断。</small>
                   </div>
-                  <label class="setting-switch compact-setting-switch"><input id="settings-claude-fallback" type="checkbox" /><span><strong>异常自动切换</strong><small>候选模型超时或请求协议不兼容时自动尝试下一个。</small></span></label>
-                  <label><span>连续无活动超时（秒）</span><input id="settings-claude-timeout" type="number" min="1" step="1" required /></label>
-                  <label><span>CLI 命令</span><input id="settings-claude-command" type="text" placeholder="自动发现 claude" /></label>
-                  <label><span>附加参数（每行一个）</span><textarea id="settings-claude-extra-args" rows="3"></textarea></label>
+                  <details class="settings-advanced">
+                    <summary><span>高级运行参数</span><small>故障切换、超时、CLI 参数</small></summary>
+                    <div class="settings-advanced-body">
+                      <label class="setting-switch compact-setting-switch"><input id="settings-claude-fallback" type="checkbox" /><span><strong>异常自动切换</strong><small>候选模型超时或请求协议不兼容时自动尝试下一个。</small></span></label>
+                      <label><span>连续无活动超时（秒）</span><input id="settings-claude-timeout" type="number" min="1" step="1" required /></label>
+                      <label><span>CLI 命令</span><input id="settings-claude-command" type="text" placeholder="自动发现 claude" /></label>
+                      <label><span>附加参数（每行一个）</span><textarea id="settings-claude-extra-args" rows="3"></textarea></label>
+                    </div>
+                  </details>
                 </article>
                 <article class="settings-card">
-                  <h4>Codex / Agent B</h4>
+                  <header class="settings-card-heading"><div><span class="settings-card-kicker">Agent B</span><h4>Codex</h4></div><small>模型与群聊身份</small></header>
                   <div class="model-picker">
                     <span class="field-label">模型优先顺序</span>
                     <div class="model-picker-row"><select id="settings-codex-model-add" aria-label="选择 Codex 模型"></select><button class="secondary-button" data-add-model="codex" type="button">添加</button></div>
@@ -315,10 +330,15 @@
                     <label><span>群聊身份提示词</span><textarea id="settings-group-chat-agent-b-identity" rows="7" required></textarea></label>
                     <small>只用于群聊协作；路由由系统控制，是否读取或修改由 Codex 自行判断。</small>
                   </div>
-                  <label class="setting-switch compact-setting-switch"><input id="settings-codex-fallback" type="checkbox" /><span><strong>超时自动切换</strong><small>每个候选模型使用下方的单次超时。</small></span></label>
-                  <label><span>单次调用超时（秒）</span><input id="settings-codex-timeout" type="number" min="1" step="1" required /></label>
-                  <label><span>CLI 命令</span><input id="settings-codex-command" type="text" placeholder="自动发现 codex" /></label>
-                  <label><span>附加参数（每行一个）</span><textarea id="settings-codex-extra-args" rows="3"></textarea><small>网页审批模式支持 -c/--config、--enable、--disable 与 --strict-config；其他仅适用于 codex exec 的参数会明确报错。</small></label>
+                  <details class="settings-advanced">
+                    <summary><span>高级运行参数</span><small>故障切换、超时、CLI 参数</small></summary>
+                    <div class="settings-advanced-body">
+                      <label class="setting-switch compact-setting-switch"><input id="settings-codex-fallback" type="checkbox" /><span><strong>超时自动切换</strong><small>每个候选模型使用下方的单次超时。</small></span></label>
+                      <label><span>单次调用超时（秒）</span><input id="settings-codex-timeout" type="number" min="1" step="1" required /></label>
+                      <label><span>CLI 命令</span><input id="settings-codex-command" type="text" placeholder="自动发现 codex" /></label>
+                      <label><span>附加参数（每行一个）</span><textarea id="settings-codex-extra-args" rows="3"></textarea><small>网页审批模式支持 -c/--config、--enable、--disable 与 --strict-config；其他仅适用于 codex exec 的参数会明确报错。</small></label>
+                    </div>
+                  </details>
                 </article>
               </div>
               <div class="settings-security-note">安全说明：仅把 Key 作为子进程环境变量传给 Claude Code/Codex；界面只显示是否已配置和末四位。</div>
@@ -387,6 +407,17 @@
         <div id="native-interaction-error" class="form-error hidden"></div>
         <div id="native-interaction-actions" class="dialog-actions native-interaction-actions"></div>
       </form>
+    </dialog>
+
+    <dialog id="image-lightbox" class="image-lightbox" aria-labelledby="image-lightbox-name">
+      <button id="image-lightbox-close" class="image-lightbox-close" type="button" aria-label="关闭图片预览">×</button>
+      <figure>
+        <div class="image-lightbox-stage"><img id="image-lightbox-image" alt="" /></div>
+        <figcaption>
+          <span><strong id="image-lightbox-name">图片预览</strong><small id="image-lightbox-size"></small></span>
+          <a id="image-lightbox-download" class="secondary-button" href="#" download>下载原图</a>
+        </figcaption>
+      </figure>
     </dialog>
 
     <div id="toast" class="toast hidden" role="status"></div>
