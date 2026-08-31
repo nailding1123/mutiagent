@@ -749,12 +749,22 @@ if (!calls[0].files[0].name.endsWith('.png')) {
   throw new Error('unnamed screenshot did not receive a png filename');
 }
 
+const pasted2 = {name: '', type: 'image/png', size: 43, lastModified: 8};
 handleComposerPaste({
   currentTarget: el.quickTaskInput,
-  clipboardData: {items: [{kind: 'file', getAsFile: () => pasted}], files: [pasted]},
+  clipboardData: {items: [{kind: 'file', getAsFile: () => pasted2}], files: [pasted2]},
   preventDefault() {},
 });
-if (calls[1].files.length !== 1) throw new Error('clipboard file was added twice');
+if (calls.length !== 2 || calls[1].files.length !== 1) throw new Error('clipboard file was added twice');
+
+// A second paste event carrying the same image immediately afterwards must
+// not create another attachment chip.
+handleComposerPaste({
+  currentTarget: el.quickTaskInput,
+  clipboardData: {items: [], files: [pasted2]},
+  preventDefault() {},
+});
+if (calls.length !== 2) throw new Error('duplicate paste event was not ignored');
 
 class Node {
   constructor() {
@@ -2411,6 +2421,35 @@ if (!keys.includes('msg-active-run-1-m-user-codex')) throw new Error('Codex load
             session.status = "complete"
             manager.ensure_shutdown_safe()
 
+    def test_last_web_client_release_shuts_down_idle_service(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            shutdown = threading.Event()
+            manager.bind_shutdown_callback(shutdown.set)
+            with patch.object(ui_server, "CLIENT_DISCONNECT_GRACE_SECONDS", 0.01):
+                self.assertEqual(manager.claim_client("browser-1")["clients"], 1)
+                self.assertEqual(manager.release_client("browser-1")["clients"], 0)
+                self.assertTrue(shutdown.wait(1))
+
+    def test_reclaimed_web_client_cancels_pending_shutdown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            shutdown = threading.Event()
+            manager.bind_shutdown_callback(shutdown.set)
+            with patch.object(ui_server, "CLIENT_DISCONNECT_GRACE_SECONDS", 0.05):
+                manager.claim_client("browser-1")
+                manager.release_client("browser-1")
+                manager.claim_client("browser-1")
+                self.assertFalse(shutdown.wait(0.15))
+
     def test_manager_archives_only_finished_runs_and_can_restore_them(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -3134,6 +3173,9 @@ if (!keys.includes('msg-active-run-1-m-user-codex')) throw new Error('Codex load
         self.assertNotIn("phase.includes('review')", script)
         self.assertIn("function renderDirectFileNotice", script)
         self.assertIn("function shutdownUiService", script)
+        self.assertIn("function claimWebClient", script)
+        self.assertIn("function releaseWebClient", script)
+        self.assertIn("window.addEventListener('pagehide'", script)
         self.assertIn("function loadWorkspaceDirectory", script)
         self.assertIn("function renderModelOrder", script)
         self.assertIn("dragHandle.addEventListener('dragstart'", script)

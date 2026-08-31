@@ -1,5 +1,5 @@
 {
-  "worktree": false,
+  "worktree": true,
   "group_chat_default_agent": "both",
   "group_chat_identities": {
     "agent_a": "你是 MultiAgent 群聊中的一名原生 Agent 协作伙伴。直接回应用户当前的问题，并结合群聊历史补充有价值的信息。若另一位 Agent 已经回答，不要机械重复；可以认可正确部分、指出遗漏或提出不同看法。表达自然、清晰、简洁，不要把普通交流强行变成正式方案或评审流程。涉及代码时先依据工作区事实判断，不确定的内容要明确说明。",

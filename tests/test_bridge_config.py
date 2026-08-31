@@ -100,6 +100,17 @@ class BridgeConfigTests(unittest.TestCase):
             )
         self.assertFalse(settings.worktree)
 
+    def test_worktree_defaults_to_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = resolve_bridge_settings(
+                {
+                    "claude": {"command": "/bin/echo"},
+                    "codex": {"command": "/bin/echo"},
+                },
+                workspace=directory,
+            )
+        self.assertTrue(settings.worktree)
+
     def test_rejects_invalid_worktree_toggle(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(ConfigError, "worktree"):

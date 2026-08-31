@@ -46,6 +46,9 @@ const state = {
   notificationsEnabled: false,
   draftSaveTimer: null,
   draftLoadedRunId: null,
+  clientId: '',
+  clientClaimed: false,
+  pageUnloading: false,
 };
 
 const ACTIVE_RUN_STATUSES = new Set(['starting', 'running', 'awaiting_interaction', 'stopping']);
@@ -196,6 +199,7 @@ async function bootstrap() {
   bindEvents();
   try {
     state.health = await api('/api/health');
+    await claimWebClient();
     loadUnreadRuns(state.health.workspace);
     el.workspaceChip.textContent = state.health.workspace;
     el.sidebarWorkspace.textContent = workspaceFolderName(state.health.workspace);
@@ -206,6 +210,55 @@ async function bootstrap() {
   } catch (error) {
     setConnection(false);
     showToast(error.message, true);
+  }
+}
+
+function webClientId() {
+  try {
+    const generated = typeof globalThis.crypto?.randomUUID === 'function'
+      ? globalThis.crypto.randomUUID()
+      : `web-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return generated;
+  } catch {
+    return `web-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  }
+}
+
+async function claimWebClient() {
+  state.clientId = webClientId();
+  try {
+    await api('/api/clients/claim', {
+      method: 'POST',
+      body: JSON.stringify({client_id: state.clientId}),
+    });
+    state.clientClaimed = true;
+  } catch {
+    // Older already-running services do not have client lifecycle endpoints;
+    // the page should still load, but automatic shutdown will activate after
+    // the service is restarted with the new backend.
+  }
+}
+
+function releaseWebClient() {
+  if (!state.clientClaimed || state.pageUnloading) return;
+  state.pageUnloading = true;
+  const body = JSON.stringify({client_id: state.clientId});
+  const blob = new Blob([body], {type: 'application/json'});
+  const url = '/api/clients/release';
+  let sent = false;
+  try {
+    sent = typeof globalThis.navigator?.sendBeacon === 'function'
+      && globalThis.navigator.sendBeacon(url, blob);
+  } catch {}
+  if (!sent) {
+    try {
+      void fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body,
+        keepalive: true,
+      });
+    } catch {}
   }
 }
 
@@ -229,6 +282,14 @@ function renderDirectFileNotice() {
 }
 
 function bindEvents() {
+  // Closing or navigating away from the last Web page releases the browser
+  // client. The backend uses a short reload grace period, so a normal refresh
+  // does not leave the service running forever or stop it mid-reconnect.
+  window.addEventListener('pagehide', (event) => {
+    if (event.persisted) return;
+    releaseWebClient();
+    state.eventSource?.close();
+  });
   el.mobileSidebarToggle.addEventListener('click', () => {
     setMobileSidebarOpen(!el.sidebar.classList.contains('mobile-open'));
   });
@@ -712,6 +773,23 @@ function handleComposerKeydown(event) {
 function handleComposerPaste(event) {
   const clipboard = event.clipboardData;
   if (!clipboard) return;
+  // Some desktop clipboard providers emit two paste events for one image.
+  // Prevent the same DataTransfer object (or an identical payload arriving
+  // immediately afterwards) from adding a second attachment.
+  if (!handleComposerPaste.handledPasteData) {
+    handleComposerPaste.handledPasteData = new WeakMap();
+  }
+  if (!handleComposerPaste.recentPasteFingerprints) {
+    handleComposerPaste.recentPasteFingerprints = new Map();
+  }
+  const pasteNow = Date.now();
+  const handledAt = typeof clipboard === 'object'
+    ? handleComposerPaste.handledPasteData.get(clipboard)
+    : 0;
+  if (handledAt && pasteNow - handledAt < 750) {
+    event.preventDefault();
+    return;
+  }
   const itemFiles = Array.from(clipboard.items || [])
     .filter((item) => item.kind === 'file')
     .map((item) => {
@@ -724,33 +802,74 @@ function handleComposerPaste(event) {
     .filter(Boolean);
   // Finder and some desktop apps expose a copied file through files rather
   // than DataTransferItem.getAsFile(). Read both sources and de-duplicate the
-  // same clipboard entry when a browser exposes it through both APIs.
-  const seen = new Set();
-  const files = [...itemFiles, ...Array.from(clipboard.files || [])]
-    .filter((file) => {
-      const key = [file.name || '', file.size || 0, file.lastModified || 0, file.type || ''].join('|');
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    })
-    .map((file) => {
-      const name = String(file.name || '');
-      if (name.includes('.')) return file;
-      const mime = String(file.type || '').toLowerCase();
-      const extension = ({
-        'image/jpeg': 'jpg',
-        'image/jpg': 'jpg',
-        'image/png': 'png',
-        'image/gif': 'gif',
-        'image/webp': 'webp',
-        'image/bmp': 'bmp',
-      })[mime] || 'png';
-      const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-      return new File([file], `paste-${stamp}.${extension}`, { type: file.type || `image/${extension}` });
+  // same clipboard entry when a browser exposes it through both APIs. Some
+  // browsers give the two File wrappers different names or timestamps, so a
+  // name-only/metadata-only key is not sufficient here.
+  const sourceFiles = [...itemFiles];
+  Array.from(clipboard.files || []).forEach((file) => {
+    const duplicateItem = itemFiles.some((previous) => {
+      if (previous === file) return true;
+      const sameShape = Number(previous.size || 0) === Number(file.size || 0)
+        && String(previous.type || '') === String(file.type || '');
+      if (!sameShape) return false;
+      const previousName = String(previous.name || '');
+      const currentName = String(file.name || '');
+      const previousModified = Number(previous.lastModified || 0);
+      const currentModified = Number(file.lastModified || 0);
+      return previousName === currentName
+        || !previousName
+        || !currentName
+        || previousModified === currentModified
+        || !previousModified
+        || !currentModified;
     });
-  if (!files.length) return;
-  event.preventDefault();
+    // Only de-duplicate the browser's two representations of the same
+    // clipboard entry. Do not collapse two distinct files in clipboard.files
+    // merely because they happen to share size/type metadata.
+    if (!duplicateItem) sourceFiles.push(file);
+  });
+  if (!sourceFiles.length) return;
+  if (typeof clipboard === 'object') handleComposerPaste.handledPasteData.set(clipboard, pasteNow);
   const target = event.currentTarget === el.taskInput ? 'task' : 'composer';
+  const fingerprint = sourceFiles
+    .map((file) => {
+      const type = String(file.type || '').toLowerCase();
+      const image = type.startsWith('image/');
+      // Clipboard wrappers for the same screenshot can receive different
+      // generated names. Image shape metadata is more stable across events;
+      // keep names for documents so two distinct files remain distinguishable.
+      return image
+        ? ['image', type, file.size || 0].join('|')
+        : [file.name || '', file.size || 0, file.lastModified || 0, type].join('|');
+    })
+    .sort()
+    .join(';;');
+  const now = Date.now();
+  const previous = handleComposerPaste.recentPasteFingerprints.get(target);
+  if (previous && previous.fingerprint === fingerprint && now - previous.timestamp < 750) {
+    event.preventDefault();
+    return;
+  }
+  handleComposerPaste.recentPasteFingerprints.set(target, { fingerprint, timestamp: now });
+  const files = sourceFiles.map((file) => {
+    const name = String(file.name || '');
+    if (name.includes('.')) return file;
+    const mime = String(file.type || '').toLowerCase();
+    const extension = ({
+      'image/jpeg': 'jpg',
+      'image/jpg': 'jpg',
+      'image/png': 'png',
+      'image/gif': 'gif',
+      'image/webp': 'webp',
+      'image/bmp': 'bmp',
+    })[mime] || 'png';
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    return new File([file], `paste-${stamp}.${extension}`, {
+      type: file.type || `image/${extension}`,
+      lastModified: Number(file.lastModified) || 0,
+    });
+  });
+  event.preventDefault();
   addTaskFiles(files, target);
   showToast(`已粘贴 ${files.length} 个图片附件。`);
 }
@@ -3563,6 +3682,8 @@ function renderGroupChat(record, session) {
         sender,
         session?.active_agents,
       );
+    const waitingWorkspace = loadingReply
+      && String(session?.agent_events?.[sender]?.status || '').toLowerCase() === 'waiting_workspace';
     const confirmingStream = streamingReply
       && finalizingReply;
     const failureReason = String(message.failure_reason || '');
@@ -3579,7 +3700,7 @@ function renderGroupChat(record, session) {
       : finalizingReply
       ? '回复已生成 · 正在确认文件变更'
       : loadingReply
-      ? '正在回复 · 等待内容'
+      ? waitingWorkspace ? '等待工作区租约' : '正在回复 · 等待内容'
       : failedReply
       ? `${failureReason === 'timeout' ? '响应超时' : failureReason === 'model_incompatible' ? '模型不兼容' : '回复失败'} · ${contextStatus}`
       : optimistic
@@ -3605,6 +3726,7 @@ function renderGroupChat(record, session) {
         pending: optimistic,
         loading: loadingReply,
         finalizing: finalizingReply,
+        waiting_workspace: waitingWorkspace,
         streaming: streamingReply,
         loading_agent: loadingReply ? sender : '',
         failed: failedReply,
@@ -3916,6 +4038,7 @@ function messageCard(name, role, result, agent, tag, details = false, highlight 
   const pending = result.pending === true;
   const loading = result.loading === true;
   const finalizing = result.finalizing === true;
+  const waitingWorkspace = result.waiting_workspace === true;
   const streaming = result.streaming === true;
   const failed = result.failed === true;
   const recalled = result.recalled === true;
@@ -3934,7 +4057,7 @@ function messageCard(name, role, result, agent, tag, details = false, highlight 
       </div>
       ${tag ? `<span class="message-tag">${escapeHtml(tag)}</span>` : ''}
       ${workspace ? `<div class="execution-workspace"><strong>写入工作区</strong><code title="${escapeHtml(workspace)}">${escapeHtml(workspace)}</code></div>` : ''}
-      ${loading && !streaming ? replyLoadingMarkup(name, finalizing) : `<div class="markdown-body">${renderMarkdown(normalizeContent(text))}</div>`}
+      ${loading && !streaming ? replyLoadingMarkup(name, finalizing, waitingWorkspace) : `<div class="markdown-body">${renderMarkdown(normalizeContent(text))}</div>`}
       ${changeSummaryMarkup(changes, result.changes_key, result.message_id || '')}
       ${attachmentMarkup(attachments, result.run_id)}
       ${details ? '<div class="message-actions"><button class="thread-button" data-open-detail="overview" type="button">▢ 查看详情</button></div>' : ''}
@@ -3975,10 +4098,11 @@ function messageToolsMarkup(feedKey, quotable, messageId = '') {
   </div>`;
 }
 
-function replyLoadingMarkup(name, finalizing = false) {
-  return `<div class="reply-loading" role="status" aria-label="${escapeHtml(name)} 正在回复">
+function replyLoadingMarkup(name, finalizing = false, waitingWorkspace = false) {
+  const label = waitingWorkspace ? '等待工作区租约' : '正在回复';
+  return `<div class="reply-loading" role="status" aria-label="${escapeHtml(name)} ${label}">
     <span class="reply-loading-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-    <span>${escapeHtml(name)} ${finalizing ? '已生成最终输出，正在确认文件变更并保存回复…' : '正在思考并组织回复…'}</span>
+    <span>${escapeHtml(name)} ${waitingWorkspace ? '等待工作区租约，前一个 Agent 完成后继续…' : finalizing ? '已生成最终输出，正在确认文件变更并保存回复…' : '正在思考并组织回复…'}</span>
   </div>`;
 }
 
@@ -4289,6 +4413,7 @@ function activityIcon(type) {
 
 function activityStatusLabel(status) {
   const value = String(status || '').toLowerCase();
+  if (value === 'waiting_workspace') return '等待工作区租约';
   if (['working', 'starting', 'waiting_model', 'in_progress'].includes(value)) return '进行中';
   if (['failed', 'error'].includes(value)) return '失败';
   if (['warning', 'waiting_user'].includes(value)) return '需处理';
@@ -4445,6 +4570,7 @@ function statusKey(status) {
   if (value.includes('fail') || value.includes('error') || value === 'open') return 'failed';
   if (value.includes('interrupt')) return 'interrupted';
   if (value.includes('cancel') || value === 'blocked') return 'cancelled';
+  if (value === 'waiting_workspace') return 'running';
   if (value === 'awaiting_interaction' || value === 'waiting_user') return 'awaiting_interaction';
   if (value === 'waiting_model') return 'running';
   if (value.includes('await')) return 'working';
@@ -4468,6 +4594,7 @@ function statusLabel(status) {
     cancelled: '已取消',
     interrupted: '已中断',
     waiting: '等待中',
+    waiting_workspace: '等待工作区租约',
     pending: '待处理',
     in_progress: '进行中',
     working: '进行中',

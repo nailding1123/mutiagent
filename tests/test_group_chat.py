@@ -771,6 +771,7 @@ class GroupChatTests(unittest.TestCase):
         claude_started = threading.Event()
         release_claude = threading.Event()
         codex_started = threading.Event()
+        codex_events: list[Any] = []
 
         class BlockingAdapter(FakeAdapter):
             def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
@@ -804,12 +805,19 @@ class GroupChatTests(unittest.TestCase):
 
             second = engine.reserve("@Codex second")
             second_thread = threading.Thread(
-                target=lambda: engine.ask("@Codex second", reservation=second),
+                target=lambda: engine.ask(
+                    "@Codex second",
+                    reservation=second,
+                    on_event=codex_events.append,
+                ),
                 daemon=True,
             )
             second_thread.start()
             time.sleep(0.1)
             self.assertFalse(codex_started.is_set())
+            self.assertTrue(
+                any(event.status == "waiting_workspace" for event in codex_events)
+            )
             release_claude.set()
             first_thread.join(2)
             second_thread.join(2)

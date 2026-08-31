@@ -61,6 +61,7 @@ _EVENT_DEFAULT_STATUSES = {
     "log": "working",
     "interaction_request": "waiting_user",
     "interaction_response": "working",
+    "waiting_workspace": "waiting_workspace",
 }
 
 _SAFE_TEXT_KINDS = {
@@ -158,9 +159,9 @@ class BridgeSettings:
     group_chat_agent_a_identity: str = DEFAULT_GROUP_CHAT_AGENT_A_IDENTITY
     group_chat_agent_b_identity: str = DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY
     group_chat_default_agent: str = "both"
-    # Isolated Git worktrees are opt-in: overlapping Agent edits are safer when
-    # serialized in the shared checkout than merged after both have finished.
-    worktree: bool = False
+    # Isolated Git worktrees are enabled by default; callers can explicitly opt
+    # out when they need serialized writes in the shared checkout.
+    worktree: bool = True
     context_compaction: ContextCompactionSettings = field(
         default_factory=ContextCompactionSettings
     )

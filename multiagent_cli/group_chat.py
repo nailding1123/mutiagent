@@ -1037,12 +1037,28 @@ class GroupChatEngine:
         on_event: Callable[[AgentEvent], None] | None,
         step_id: str,
     ) -> tuple[AgentRunResult, dict[str, Any] | None]:
+        def notify_workspace_wait() -> None:
+            if on_event is None:
+                return
+            display_name = self.adapters[agent].display_name
+            on_event(
+                AgentEvent(
+                    display_name,
+                    "lifecycle",
+                    "waiting_workspace",
+                    status="waiting_workspace",
+                    step_id=step_id,
+                    safe_summary=f"{display_name} · 等待工作区租约",
+                )
+            )
+
         try:
             lease = self.workspace_coordinator.acquire(
                 self.settings.workspace,
                 owner=step_id,
                 access="write",
                 isolate=self.settings.worktree,
+                on_wait=notify_workspace_wait,
             )
         except WorkspaceCoordinatorError as exc:
             raise BridgeError(str(exc)) from exc

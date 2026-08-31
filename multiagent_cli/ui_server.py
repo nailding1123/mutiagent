@@ -74,6 +74,10 @@ MAX_SESSION_EVENTS = 240
 MAX_RETAINED_SESSIONS = 50
 # 持久化到 run record 的公开活动事件上限。
 MAX_RECORD_EVENTS = 500
+# A page reload briefly disconnects the old document before the new document
+# can claim the same browser client. Keep the grace period short while still
+# allowing a normal reload to reconnect without stopping the local service.
+CLIENT_DISCONNECT_GRACE_SECONDS = 2.0
 # 不持久化 progress 原文，避免把模型输出全文写进记录。
 TIMELINE_EVENT_KINDS = {
     "lifecycle",
@@ -713,8 +717,107 @@ class UISessionManager:
         self._sessions: dict[str, UISession] = {}
         self._lock = threading.RLock()
         self._subscribers: set[queue.Queue[dict[str, Any]]] = set()
+        self._clients: set[str] = set()
+        self._client_shutdown_timer: threading.Timer | None = None
+        self._client_shutdown_generation = 0
+        self._shutdown_callback: Callable[[], None] | None = None
         # 界面偏好「显示模型原文流」的内存镜像，避免每个事件都读配置文件
         self._stream_model_text = _stream_preference(default_workspace)
+
+    def bind_shutdown_callback(self, callback: Callable[[], None]) -> None:
+        """Bind the HTTP server shutdown hook used when the last Web client leaves."""
+
+        with self._lock:
+            self._shutdown_callback = callback
+
+    def claim_client(self, client_id: object) -> dict[str, Any]:
+        value = str(client_id or "").strip()
+        if not value or len(value) > 200:
+            raise UIError("client_id 无效")
+        with self._lock:
+            self._clients.add(value)
+            self._client_shutdown_generation += 1
+            timer = self._client_shutdown_timer
+            self._client_shutdown_timer = None
+        if timer is not None:
+            timer.cancel()
+        return {"ok": True, "clients": len(self._clients)}
+
+    def release_client(self, client_id: object) -> dict[str, Any]:
+        value = str(client_id or "").strip()
+        if not value:
+            return {"ok": True, "clients": len(self._clients)}
+        with self._lock:
+            self._clients.discard(value)
+            if self._clients or self._client_shutdown_timer is not None:
+                return {"ok": True, "clients": len(self._clients)}
+            self._client_shutdown_generation += 1
+            generation = self._client_shutdown_generation
+            timer = threading.Timer(
+                CLIENT_DISCONNECT_GRACE_SECONDS,
+                self._shutdown_after_last_client,
+                args=(generation,),
+            )
+            timer.daemon = True
+            self._client_shutdown_timer = timer
+            timer.start()
+            return {"ok": True, "clients": 0}
+
+    def _shutdown_after_last_client(self, generation: int) -> None:
+        with self._lock:
+            if generation != self._client_shutdown_generation or self._clients:
+                return
+            self._client_shutdown_timer = None
+            active = [
+                session
+                for session in self._sessions.values()
+                if session.status in ACTIVE_STATUSES
+            ]
+            callback = self._shutdown_callback
+        # Closing the last page is an explicit client lifecycle signal. Stop
+        # owned Agent processes before shutting down the detached Web service.
+        for session in active:
+            try:
+                session.request_stop()
+            except Exception:
+                pass
+        if active:
+            # The service itself is a detached launcher process. Once the last
+            # page is gone, stopping the owned adapters and exiting immediately
+            # is preferable to waiting on a worker that may be blocked on a
+            # workspace lease; daemon workers will be reaped with the service.
+            if callback is not None:
+                callback()
+            return
+        if callback is not None:
+            callback()
+
+    def _shutdown_when_idle(self, generation: int) -> None:
+        with self._lock:
+            if generation != self._client_shutdown_generation or self._clients:
+                self._client_shutdown_timer = None
+                return
+            active = [
+                session
+                for session in self._sessions.values()
+                if session.status in ACTIVE_STATUSES
+            ]
+            callback = self._shutdown_callback
+            if active:
+                timer = threading.Timer(
+                    0.25,
+                    self._shutdown_when_idle,
+                    args=(generation,),
+                )
+                timer.daemon = True
+                self._client_shutdown_timer = timer
+            else:
+                self._client_shutdown_timer = None
+                timer = None
+        if timer is not None:
+            timer.start()
+        elif callback is not None:
+            callback()
 
     def ensure_shutdown_safe(self) -> None:
         """Refuse to exit while this server still owns running agent processes."""
@@ -2302,6 +2405,7 @@ def serve_ui(
         if not quiet:
             print(f"错误：无法启动 UI 服务：{exc}")
         return 1
+    manager.bind_shutdown_callback(server.shutdown)
     url = f"http://127.0.0.1:{server.server_port}/"
     if not quiet:
         print(f"MultiAgent UI 已启动：{url}")
@@ -2465,6 +2569,16 @@ def make_request_handler(manager: UISessionManager, static_root: Path):
                 if path == "/api/tasks":
                     session = manager.start_task(payload)
                     self._json(session, status=HTTPStatus.ACCEPTED)
+                    return
+                if path == "/api/clients/claim":
+                    if not isinstance(payload, dict):
+                        raise UIError("请求正文必须是 JSON 对象")
+                    self._json(manager.claim_client(payload.get("client_id")))
+                    return
+                if path == "/api/clients/release":
+                    if not isinstance(payload, dict):
+                        raise UIError("请求正文必须是 JSON 对象")
+                    self._json(manager.release_client(payload.get("client_id")))
                     return
                 if path == "/api/shutdown":
                     manager.ensure_shutdown_safe()

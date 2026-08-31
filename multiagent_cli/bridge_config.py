@@ -89,7 +89,9 @@ def resolve_bridge_settings(
         default_a=DEFAULT_GROUP_CHAT_AGENT_A_IDENTITY,
         default_b=DEFAULT_GROUP_CHAT_AGENT_B_IDENTITY,
     )
-    worktree = data.get("worktree", False)
+    # Isolated Git Worktrees are the safe default for concurrent Agent writes.
+    # Existing config files that explicitly set ``false`` remain opt-out.
+    worktree = data.get("worktree", True)
     if not isinstance(worktree, bool):
         raise ConfigError("worktree 必须是布尔值")
     claude = _resolve_agent_settings("claude", data.get("claude", {}))

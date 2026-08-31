@@ -23,7 +23,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .workspace_state import (
     WorkspaceChangeBaseline,
@@ -796,6 +796,7 @@ class WorkspaceCoordinator:
         owner: str,
         access: str,
         isolate: bool = True,
+        on_wait: Callable[[], None] | None = None,
     ) -> WorkspaceLease:
         target = workspace
         if access != "write":
@@ -815,6 +816,20 @@ class WorkspaceCoordinator:
                 state = _WorkspaceState(threading.Condition(self._lock))
                 self._states[key] = state
 
+            notified_wait = False
+
+            def notify_waiting() -> None:
+                nonlocal notified_wait
+                if notified_wait or on_wait is None:
+                    return
+                notified_wait = True
+                try:
+                    on_wait()
+                except Exception:
+                    # Status reporting must never prevent the lease from
+                    # eventually being acquired.
+                    pass
+
             while True:
                 if not isolate:
                     # A shared checkout cannot safely host overlapping writes.
@@ -823,6 +838,7 @@ class WorkspaceCoordinator:
                     if state.main_writer is None and state.worktree_owner is None:
                         state.main_writer = owner
                         return WorkspaceLease(self, target, target, owner, "write")
+                    notify_waiting()
                     state.condition.wait()
                     continue
                 # The first writer owns the real checkout.  A second, distinct
@@ -860,6 +876,7 @@ class WorkspaceCoordinator:
                         base_commit=base_commit,
                     )
 
+                notify_waiting()
                 state.condition.wait()
 
     def release(self, lease: WorkspaceLease) -> dict[str, Any]:
