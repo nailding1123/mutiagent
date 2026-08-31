@@ -86,6 +86,8 @@ const el = {
   emptyState: document.querySelector('#empty-state'),
   runView: document.querySelector('#run-view'),
   chatView: document.querySelector('#chat-view'),
+  sidebar: document.querySelector('.sidebar'),
+  mobileSidebarToggle: document.querySelector('#mobile-sidebar-toggle'),
   workspaceChip: document.querySelector('#workspace-chip'),
   sidebarWorkspace: document.querySelector('#sidebar-workspace'),
   connectionDot: document.querySelector('#connection-dot'),
@@ -157,6 +159,12 @@ const el = {
   nativeInteractionError: document.querySelector('#native-interaction-error'),
   nativeInteractionActions: document.querySelector('#native-interaction-actions'),
   nativeInteractionClose: document.querySelector('#native-interaction-close'),
+  imageLightbox: document.querySelector('#image-lightbox'),
+  imageLightboxImage: document.querySelector('#image-lightbox-image'),
+  imageLightboxName: document.querySelector('#image-lightbox-name'),
+  imageLightboxSize: document.querySelector('#image-lightbox-size'),
+  imageLightboxDownload: document.querySelector('#image-lightbox-download'),
+  imageLightboxClose: document.querySelector('#image-lightbox-close'),
   toast: document.querySelector('#toast'),
 };
 
@@ -221,6 +229,14 @@ function renderDirectFileNotice() {
 }
 
 function bindEvents() {
+  el.mobileSidebarToggle.addEventListener('click', () => {
+    setMobileSidebarOpen(!el.sidebar.classList.contains('mobile-open'));
+  });
+  el.sidebar.addEventListener('click', (event) => {
+    if (window.matchMedia('(max-width: 720px)').matches && event.target.closest('button')) {
+      setMobileSidebarOpen(false);
+    }
+  });
   [el.newTask, el.emptyNewTask].forEach((button) => {
     button.addEventListener('click', openNewTask);
   });
@@ -259,6 +275,12 @@ function bindEvents() {
   });
 
   el.artifactFeed.addEventListener('click', (event) => {
+    const attachmentPreview = event.target.closest('[data-image-lightbox]');
+    if (attachmentPreview) {
+      event.preventDefault();
+      openImageLightbox(attachmentPreview);
+      return;
+    }
     const detail = event.target.closest('[data-open-detail]');
     if (detail) {
       openDetails(detail.dataset.openDetail);
@@ -340,6 +362,15 @@ function bindEvents() {
       return;
     }
   });
+  el.artifactFeed.addEventListener('load', (event) => {
+    const image = event.target.closest?.('[data-image-lightbox] img');
+    if (!image) return;
+    const preview = image.closest('[data-image-lightbox]');
+    const dimensions = `${image.naturalWidth} × ${image.naturalHeight} px`;
+    preview.dataset.imageWidth = String(image.naturalWidth);
+    preview.dataset.imageHeight = String(image.naturalHeight);
+    updateAttachmentDimensions(preview, dimensions);
+  }, true);
   el.artifactFeed.addEventListener('toggle', handleChangeToggle, true);
   el.artifactFeed.addEventListener('scroll', () => {
     state.feedPinnedToBottom = isFeedNearBottom();
@@ -519,6 +550,14 @@ function bindEvents() {
     if (!button) return;
     void submitNativeInteraction(button.dataset.nativeAction, button);
   });
+  el.imageLightboxClose.addEventListener('click', closeImageLightbox);
+  el.imageLightbox.addEventListener('click', (event) => {
+    if (event.target === el.imageLightbox) closeImageLightbox();
+  });
+  el.imageLightbox.addEventListener('close', () => {
+    el.imageLightboxImage.removeAttribute('src');
+    el.imageLightboxImage.alt = '';
+  });
 
   el.contextMenu.addEventListener('click', (event) => {
     const button = event.target.closest('[data-context-action]');
@@ -539,6 +578,11 @@ function bindEvents() {
   });
 
   document.addEventListener('pointerdown', (event) => {
+    if (el.sidebar.classList.contains('mobile-open')
+      && !el.sidebar.contains(event.target)
+      && !el.mobileSidebarToggle.contains(event.target)) {
+      setMobileSidebarOpen(false);
+    }
     if (!el.contextMenu.contains(event.target)) closeRunContextMenu();
     if (!el.messageForm.contains(event.target)) hideMentionMenu();
   });
@@ -564,11 +608,58 @@ function bindEvents() {
       openNewTask();
     }
     if (event.key === 'Escape') {
+      if (el.sidebar.classList.contains('mobile-open')) {
+        setMobileSidebarOpen(false);
+        return;
+      }
       if (!el.contextMenu.classList.contains('hidden')) closeRunContextMenu();
       else if (!el.searchPanel.classList.contains('hidden')) closeRunSearch();
       else if (!el.detailPanel.classList.contains('hidden')) closeDetails();
     }
   });
+}
+
+function setMobileSidebarOpen(open) {
+  const visible = Boolean(open) && window.matchMedia('(max-width: 720px)').matches;
+  el.sidebar.classList.toggle('mobile-open', visible);
+  el.mobileSidebarToggle.setAttribute('aria-expanded', String(visible));
+  el.mobileSidebarToggle.setAttribute('aria-label', visible ? '关闭导航' : '打开导航');
+  const icon = el.mobileSidebarToggle.querySelector('span');
+  if (icon) icon.textContent = visible ? '×' : '☰';
+}
+
+function openImageLightbox(preview) {
+  const image = preview.querySelector('img');
+  const source = preview.dataset.imageLightbox || image?.currentSrc || image?.src || '';
+  if (!source) return;
+  const name = preview.dataset.imageName || image?.alt || '图片附件';
+  const fileSize = preview.dataset.imageFileSize || '';
+  const width = Number(image?.naturalWidth || preview.dataset.imageWidth || 0);
+  const height = Number(image?.naturalHeight || preview.dataset.imageHeight || 0);
+  const dimensions = width > 0 && height > 0 ? `${width} × ${height} px` : '正在读取图片尺寸';
+  el.imageLightboxImage.src = source;
+  el.imageLightboxImage.alt = name;
+  el.imageLightboxName.textContent = name;
+  el.imageLightboxSize.textContent = [dimensions, fileSize].filter(Boolean).join(' · ');
+  el.imageLightboxDownload.href = preview.dataset.imageDownload || source;
+  el.imageLightboxDownload.download = name;
+  el.imageLightboxImage.onload = () => {
+    const loadedDimensions = `${el.imageLightboxImage.naturalWidth} × ${el.imageLightboxImage.naturalHeight} px`;
+    el.imageLightboxSize.textContent = [loadedDimensions, fileSize].filter(Boolean).join(' · ');
+    preview.dataset.imageWidth = String(el.imageLightboxImage.naturalWidth);
+    preview.dataset.imageHeight = String(el.imageLightboxImage.naturalHeight);
+    updateAttachmentDimensions(preview, loadedDimensions);
+  };
+  if (!el.imageLightbox.open) el.imageLightbox.showModal();
+}
+
+function closeImageLightbox() {
+  if (el.imageLightbox.open) el.imageLightbox.close();
+}
+
+function updateAttachmentDimensions(preview, dimensions) {
+  const meta = preview.closest('.message-attachment-image')?.querySelector('.message-attachment-dimensions');
+  if (meta) meta.textContent = dimensions;
 }
 
 function handleComposerKeydown(event) {
@@ -1165,7 +1256,7 @@ async function shutdownUiService() {
     el.settingsDialog.close();
     setConnection(false);
     el.statusBadge.textContent = '服务已关闭';
-    el.statusBadge.dataset.status = 'completed';
+    el.statusBadge.dataset.status = 'complete';
     el.workspaceChip.textContent = '本地服务已关闭';
     showToast('本地服务已关闭，可以关闭此页面。');
   } catch (error) {
@@ -3979,8 +4070,8 @@ function attachmentMarkup(attachments, runId) {
       // ?inline=1 is served with a content type derived from the validated
       // extension, so rendering it in an <img> cannot smuggle active content.
       return `<figure class="message-attachment message-attachment-image" title="${title}">
-        <a class="message-attachment-preview" href="${escapeHtml(href)}?inline=1" target="_blank" rel="noopener" aria-label="预览 ${escapeHtml(name)}"><img src="${escapeHtml(href)}?inline=1" alt="${escapeHtml(name)}" loading="lazy" /></a>
-        <figcaption><span><strong>${escapeHtml(name)}</strong><small>${size}</small></span><a href="${escapeHtml(href)}" download="${escapeHtml(name)}">下载</a></figcaption>
+        <a class="message-attachment-preview" href="${escapeHtml(href)}?inline=1" data-image-lightbox="${escapeHtml(href)}?inline=1" data-image-download="${escapeHtml(href)}" data-image-name="${escapeHtml(name)}" data-image-file-size="${size}" aria-label="全屏预览 ${escapeHtml(name)}"><img src="${escapeHtml(href)}?inline=1" alt="${escapeHtml(name)}" loading="lazy" /></a>
+        <figcaption><span><strong>${escapeHtml(name)}</strong><small>${size}</small><small class="message-attachment-dimensions">读取图片尺寸中</small></span><a href="${escapeHtml(href)}" download="${escapeHtml(name)}">下载</a></figcaption>
       </figure>`;
     }
     return `<a class="message-attachment message-attachment-link" href="${escapeHtml(href)}" download="${escapeHtml(name)}" title="${title}">${label}</a>`;
@@ -4315,7 +4406,9 @@ function isSpecialLine(lines, index) {
 
 function setConnection(connected) {
   el.connectionDot.className = `status-dot ${connected ? 'status-complete' : 'status-running'}`;
-  el.connectionDot.title = connected ? '本地事件流已连接' : '事件流正在重连';
+  const label = connected ? '本地事件流已连接' : '事件流正在重连';
+  el.connectionDot.title = label;
+  el.connectionDot.setAttribute('aria-label', label);
 }
 
 function statusKey(status) {
