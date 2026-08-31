@@ -3499,6 +3499,34 @@ function renderGroupChat(record, session) {
       reply_to: turn.server_user_id || turn.client_id,
     })).filter((reply) => !serverReplyKeys.has(groupChatReplyKey(reply)))
   ));
+  const activeTurnMessages = new Map(
+    rawServerMessages
+      .filter((message) => message && message.role === 'user')
+      .map((message) => [String(message.id || ''), message]),
+  );
+  const activeReplies = (Array.isArray(session?.active_chat_turns) ? session.active_chat_turns : [])
+    .flatMap((turn) => {
+      const messageId = String(turn?.message_id || '');
+      const agents = Array.isArray(turn?.agents) ? turn.agents : [];
+      if (!messageId) return [];
+      const sourceMessage = activeTurnMessages.get(messageId);
+      return agents.map((agent) => ({
+        id: `active-${runId}-${messageId}-${agent}`,
+        sender: agent,
+        role: 'assistant',
+        content: '',
+        recipients: ['user'],
+        created_at: sourceMessage?.created_at || new Date().toISOString(),
+        action: sourceMessage?.action || 'discuss',
+        loading_reply: true,
+        reply_to: messageId,
+      }));
+    })
+    .filter((reply) => !serverReplyKeys.has(groupChatReplyKey(reply))
+      && !pendingReplies.some((pending) => (
+        pending.sender === reply.sender && pending.reply_to === reply.reply_to
+      )));
+  pendingReplies.push(...activeReplies);
   reconcileStreamBuffers(
     runId,
     pendingReplies,

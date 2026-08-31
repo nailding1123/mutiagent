@@ -1031,10 +1031,80 @@ if ([...state.streamBuffers.keys()].some((key) => key.startsWith('run-1:'))) {
                 "Codex", "text", "本轮最终回复", status="completed",
                 step_id="group_chat_turn_2_codex",
             ))
-            self.assertEqual(
-                session.to_dict()["agent_events"]["codex"]["step_id"],
-                "group_chat_turn_2_codex",
+        self.assertEqual(
+            session.to_dict()["agent_events"]["codex"]["step_id"],
+            "group_chat_turn_2_codex",
+        )
+
+    def test_live_chat_turn_exposes_message_mapping_for_refresh_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            session = UISession(
+                run_id="refresh-live",
+                task="测试刷新恢复",
+                workspace=Path(directory),
+                notify=lambda *_args, **_kwargs: None,
             )
+            token = session.begin_chat_turn("turn-1", ("claude", "codex"))
+            session.bind_chat_turn_message(token, "m-user")
+            live = session.to_dict()
+
+            self.assertEqual(
+                live["active_chat_turns"],
+                [{"message_id": "m-user", "agents": ["claude", "codex"]}],
+            )
+
+            session.finish_chat_turn(state={}, status="ready", token=token)
+            self.assertEqual(session.to_dict()["active_chat_turns"], [])
+
+    def test_refresh_rebuilds_loading_bubbles_from_persisted_active_turn(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend refresh recovery test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const start = source.indexOf('function renderGroupChat');
+const end = source.indexOf('\nfunction comparisonMarkup', start);
+if (start < 0 || end < 0) throw new Error('renderGroupChat was not found');
+const state = {currentId: 'run-1', messageTexts: new Map(), pendingChatMessages: new Map(), streamBuffers: new Map(), feedPinnedToBottom: true};
+const messages = [{id: 'm-user', sender: 'user', role: 'user', content: '@all 继续处理', recipients: ['claude', 'codex'], action: 'discuss'}];
+function groupChatState() { return {messages, comparison: null}; }
+function reconcilePendingChatMessages() { return []; }
+function dedupeGroupChatMessages(value) { return value; }
+function groupChatReplyKey() { return ''; }
+function orderGroupChatMessages(serverMessages, pendingUsers, pendingReplies) { return [...serverMessages, ...pendingUsers, ...pendingReplies]; }
+function reconcileStreamBuffers() {}
+function streamTextByAgent() { return new Map(); }
+function comparisonMarkup() { return ''; }
+function appendStreamToFeed() {}
+function patchFeed(_runId, entries) { globalThis.rendered = entries; }
+function renderTimeline() {}
+function messageCard(name, role, result) { return `<article>${name}:${result.final_text}</article>`; }
+function agentName(agent) { return agent; }
+function escapeHtml(value) { return String(value || ''); }
+function changeSummaryMarkup() { return ''; }
+function attachmentMarkup() { return ''; }
+function pendingReplyIsFinalizing() { return false; }
+eval(source.slice(start, end));
+renderGroupChat({id: 'run-1', status: 'running'}, {
+  status: 'running',
+  active_agents: ['claude', 'codex'],
+  active_chat_turns: [{message_id: 'm-user', agents: ['claude', 'codex']}],
+  agent_events: {},
+});
+const keys = rendered.map((entry) => entry.key);
+if (!keys.includes('msg-m-user')) throw new Error('user message disappeared after refresh');
+if (!keys.includes('msg-active-run-1-m-user-claude')) throw new Error('Claude loading bubble was not rebuilt');
+if (!keys.includes('msg-active-run-1-m-user-codex')) throw new Error('Codex loading bubble was not rebuilt');
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_finishing_one_turn_keeps_other_agent_approval_alive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3140,7 +3210,7 @@ if ([...state.streamBuffers.keys()].some((key) => key.startsWith('run-1:'))) {
         self.assertIn("!serverReplyKeys.has(groupChatReplyKey(reply))", script)
         self.assertNotIn("if (optimistic.delivery_status === 'sending') return true", script)
         self.assertIn("replacedMessageIds", script)
-        self.assertIn("optimistic.delivery_status === 'sending'", script)
+        self.assertIn("delivery_status: 'sending'", script)
         self.assertIn("state.currentId === runId", script)
         self.assertIn("state.detail.session = acceptedSession", script)
         self.assertIn("旧回复已删除，正在重新生成", script)

@@ -687,6 +687,15 @@ class UISession:
                         for agent in agents
                     }
                 ),
+                "active_chat_turns": [
+                    {
+                        "message_id": self._active_chat_messages[token],
+                        "agents": list(self._active_chat_agents.get(token, ())),
+                    }
+                    for token in sorted(self._active_chat_turns)
+                    if self._active_chat_messages.get(token)
+                    and self._active_chat_agents.get(token)
+                ],
                 "native_interactions": [
                     dict(request)
                     for interaction_id, request in self._native_interactions.items()
@@ -1199,6 +1208,7 @@ class UISessionManager:
                     status="running",
                     error="",
                     group_chat=state,
+                    active_chat_turns=session.to_dict().get("active_chat_turns", []),
                 )
             except (KeyError, OSError):
                 pass
@@ -1231,6 +1241,7 @@ class UISessionManager:
                     status=terminal_status,
                     error=terminal_error,
                     group_chat=state,
+                    active_chat_turns=[],
                 )
             except (KeyError, OSError):
                 pass
@@ -1240,7 +1251,12 @@ class UISessionManager:
                 status=terminal_status,
                 token=getattr(reservation, "token", None),
             )
-            self.store.update(session.id, status=session.status, group_chat=state)
+            self.store.update(
+                session.id,
+                status=session.status,
+                group_chat=state,
+                active_chat_turns=[],
+            )
             return
         except Exception:
             safe_error = "群聊处理失败"
@@ -1254,6 +1270,7 @@ class UISessionManager:
                     status="ready" if recalled else "failed",
                     error=safe_error,
                     group_chat=state,
+                    active_chat_turns=[],
                 )
             except (KeyError, OSError):
                 pass
@@ -1263,7 +1280,12 @@ class UISessionManager:
                 status="ready" if recalled else "failed",
                 token=getattr(reservation, "token", None),
             )
-            self.store.update(session.id, status=session.status, group_chat=state)
+            self.store.update(
+                session.id,
+                status=session.status,
+                group_chat=state,
+                active_chat_turns=[],
+            )
             return
 
         state = engine.to_dict()
@@ -1282,6 +1304,7 @@ class UISessionManager:
                     error="",
                     group_chat=state,
                     summary=_group_chat_summary(state),
+                    active_chat_turns=[],
                 )
             except (KeyError, OSError):
                 pass
@@ -1312,6 +1335,7 @@ class UISessionManager:
                 error=session.error,
                 group_chat=state,
                 summary=summary,
+                active_chat_turns=[],
             )
         except (KeyError, OSError):
             pass
