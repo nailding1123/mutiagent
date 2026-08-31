@@ -211,6 +211,16 @@ class UIServerTests(unittest.TestCase):
             subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
             subprocess.run(["git", "config", "user.name", "Test"], cwd=workspace, check=True)
             (workspace / "tracked.txt").write_text("base", encoding="utf-8")
+            # Configuration resolution happens before the adapter factory is
+            # patched below. Use harmless local commands so this test remains
+            # independent of whether native CLIs are installed in CI.
+            (workspace / ".multiagent.json").write_text(
+                json.dumps({
+                    "claude": {"command": "/bin/echo"},
+                    "codex": {"command": "/bin/echo"},
+                }),
+                encoding="utf-8",
+            )
             subprocess.run(["git", "add", "."], cwd=workspace, check=True)
             subprocess.run(["git", "commit", "-qm", "initial"], cwd=workspace, check=True)
             manager = UISessionManager(
