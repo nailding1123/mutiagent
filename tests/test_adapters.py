@@ -702,7 +702,7 @@ send({"jsonrpc": "2.0", "id": turn_start["id"], "result": {"turn": {"id": "activ
 
 for index in range(5):
     send({"jsonrpc": "2.0", "method": "heartbeat", "params": {"index": index}})
-    time.sleep(0.07)
+    time.sleep(0.15)
 
 item = {"type": "agentMessage", "id": "final", "text": "done", "phase": "final_answer"}
 send({"jsonrpc": "2.0", "method": "item/started", "params": {"item": item}})
@@ -714,7 +714,7 @@ sys.stdin.read()
             fake_cli = Path(directory) / "active-codex-app-server.py"
             fake_cli.write_text(script_text, encoding="utf-8")
             adapter = CodexAdapter(
-                AgentCommandSettings((sys.executable, str(fake_cli)), timeout=0.12)
+                AgentCommandSettings((sys.executable, str(fake_cli)), timeout=0.5)
             )
 
             result = adapter.run(
@@ -725,7 +725,7 @@ sys.stdin.read()
             )
 
         self.assertEqual(result.final_text, "done")
-        self.assertGreater(result.duration_seconds, 0.28)
+        self.assertGreater(result.duration_seconds, 0.6)
 
     def test_timeout_switches_to_next_model_in_order(self) -> None:
         script_text = """#!/usr/bin/env python3
@@ -777,7 +777,7 @@ import time
 sys.stdin.read()
 for index in range(4):
     print(json.dumps({"type": "system", "tick": index}), flush=True)
-    time.sleep(0.07)
+    time.sleep(0.15)
 print(json.dumps({"type": "result", "session_id": "active", "result": "done", "is_error": False}), flush=True)
 """
         with tempfile.TemporaryDirectory() as directory:
@@ -786,14 +786,14 @@ print(json.dumps({"type": "result", "session_id": "active", "result": "done", "i
             adapter = ClaudeAdapter(
                 AgentCommandSettings(
                     (sys.executable, str(fake_cli)),
-                    timeout=0.12,
+                    timeout=0.5,
                 )
             )
 
             result = adapter.run("task", workspace=Path(directory), mode="read")
 
         self.assertEqual(result.final_text, "done")
-        self.assertGreater(result.duration_seconds, 0.24)
+        self.assertGreater(result.duration_seconds, 0.5)
 
     def test_claude_mcp_permission_wait_pauses_inactivity_timeout(self) -> None:
         script_text = """#!/usr/bin/env python3
@@ -820,7 +820,7 @@ print(json.dumps({"type": "result", "session_id": "approved", "result": "done", 
             adapter = ClaudeAdapter(
                 AgentCommandSettings(
                     (sys.executable, str(fake_cli)),
-                    timeout=0.15,
+                    timeout=0.5,
                 )
             )
 

@@ -398,6 +398,8 @@ button:disabled { cursor: not-allowed; opacity: .48; }
   box-shadow: 0 1px 0 rgba(255, 255, 255, .7);
 }
 
+.mobile-sidebar-toggle { display: none; }
+
 .channel-icon {
   display: grid;
   flex: 0 0 44px;
@@ -1372,8 +1374,17 @@ body[data-theme="botanical"] .message-row.message-highlight .message-main { box-
 @media (max-width: 720px) {
   .sidebar { position: fixed; z-index: 9; width: 220px; transform: translateX(-190px); transition: transform .18s ease; }
   .sidebar:hover,
-  .sidebar:focus-within { transform: translateX(0); }
+  .sidebar:focus-within,
+  .sidebar.mobile-open { transform: translateX(0); }
   .workspace-main { margin-left: 30px; }
+  .mobile-sidebar-toggle {
+    display: inline-flex;
+    flex: 0 0 34px;
+    width: 34px;
+    min-height: 34px;
+    padding: 0;
+    font-size: 15px;
+  }
   .member-count { display: none; }
   .channel-actions { gap: 4px; }
   .header-button { padding: 0 7px; }
@@ -1554,6 +1565,16 @@ body[data-theme="botanical"] .message-row.message-highlight .message-main { box-
   .composer-tools button { min-width: 62px; padding-inline: 7px; }
   .composer-settings { padding-inline: 5px; font-size: 9px; }
   .send-button { padding-inline: 11px; }
+}
+
+/* Touch devices do not have a hover state, so keep message actions reachable
+   instead of hiding the only copy/quote/retry controls behind hover. */
+@media (hover: none) and (pointer: coarse) {
+  .message-tools {
+    opacity: 1;
+    pointer-events: auto;
+    transform: none;
+  }
 }
 
 /* Taste pass: quiet premium workspace surfaces with stronger hierarchy. */

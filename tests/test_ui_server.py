@@ -3133,7 +3133,7 @@ if ([...state.streamBuffers.keys()].some((key) => key.startsWith('run-1:'))) {
         self.assertIn("settings-browser-notifications", html)
         self.assertIn("function notifyBrowser", script)
         self.assertIn("selectRun(update.run_id);", script)
-        self.assertIn("已切换到需要权限决定或补充信息的任务", script)
+        self.assertIn("正在等待你的权限决定或补充信息", script)
         self.assertIn("function dedupeGroupChatMessages", script)
         self.assertIn("function groupChatReplyKey", script)
         self.assertIn("serverMessages.slice(optimistic.server_message_count)", script)

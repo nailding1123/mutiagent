@@ -88,13 +88,14 @@
         <footer class="sidebar-footer">
           <span class="avatar avatar-user avatar-small">YO</span>
           <span class="local-user"><strong>本地用户</strong><small id="sidebar-workspace">工作区</small></span>
-          <span id="connection-dot" class="status-dot status-waiting"></span>
+          <span id="connection-dot" class="status-dot status-waiting" role="status" aria-live="polite" aria-label="正在连接本地事件流"></span>
           <button id="settings-button" class="footer-settings" type="button" title="设置">⚙</button>
         </footer>
       </aside>
 
       <main class="workspace-main">
         <header class="channel-header">
+          <button id="mobile-sidebar-toggle" class="mobile-sidebar-toggle header-button" type="button" aria-label="打开导航" aria-expanded="false"><span aria-hidden="true">☰</span></button>
           <span class="channel-icon">#</span>
           <div class="channel-heading">
             <div><strong>协作大厅</strong></div>
@@ -104,7 +105,7 @@
             <button id="stop-task-button" class="header-button stop-task-button hidden" type="button" title="停止当前任务">■ 停止</button>
             <button id="header-settings-button" class="header-button" type="button" title="设置">⚙</button>
             <button id="header-details-button" class="header-button" type="button" title="运行详情">▣</button>
-            <span id="run-status-badge" class="status-badge">等待任务</span>
+            <span id="run-status-badge" class="status-badge" role="status" aria-live="polite">等待任务</span>
             <span class="member-count">♧ 2</span>
           </div>
         </header>

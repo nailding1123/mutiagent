@@ -86,6 +86,8 @@ const el = {
   emptyState: document.querySelector('#empty-state'),
   runView: document.querySelector('#run-view'),
   chatView: document.querySelector('#chat-view'),
+  sidebar: document.querySelector('.sidebar'),
+  mobileSidebarToggle: document.querySelector('#mobile-sidebar-toggle'),
   workspaceChip: document.querySelector('#workspace-chip'),
   sidebarWorkspace: document.querySelector('#sidebar-workspace'),
   connectionDot: document.querySelector('#connection-dot'),
@@ -221,6 +223,9 @@ function renderDirectFileNotice() {
 }
 
 function bindEvents() {
+  el.mobileSidebarToggle.addEventListener('click', () => {
+    setMobileSidebarOpen(!el.sidebar.classList.contains('mobile-open'));
+  });
   [el.newTask, el.emptyNewTask].forEach((button) => {
     button.addEventListener('click', openNewTask);
   });
@@ -539,6 +544,11 @@ function bindEvents() {
   });
 
   document.addEventListener('pointerdown', (event) => {
+    if (el.sidebar.classList.contains('mobile-open')
+      && !el.sidebar.contains(event.target)
+      && !el.mobileSidebarToggle.contains(event.target)) {
+      setMobileSidebarOpen(false);
+    }
     if (!el.contextMenu.contains(event.target)) closeRunContextMenu();
     if (!el.messageForm.contains(event.target)) hideMentionMenu();
   });
@@ -564,11 +574,22 @@ function bindEvents() {
       openNewTask();
     }
     if (event.key === 'Escape') {
+      if (el.sidebar.classList.contains('mobile-open')) {
+        setMobileSidebarOpen(false);
+        return;
+      }
       if (!el.contextMenu.classList.contains('hidden')) closeRunContextMenu();
       else if (!el.searchPanel.classList.contains('hidden')) closeRunSearch();
       else if (!el.detailPanel.classList.contains('hidden')) closeDetails();
     }
   });
+}
+
+function setMobileSidebarOpen(open) {
+  const visible = Boolean(open) && window.matchMedia('(max-width: 720px)').matches;
+  el.sidebar.classList.toggle('mobile-open', visible);
+  el.mobileSidebarToggle.setAttribute('aria-expanded', String(visible));
+  el.mobileSidebarToggle.setAttribute('aria-label', visible ? '关闭导航' : '打开导航');
 }
 
 function handleComposerKeydown(event) {
@@ -1165,7 +1186,7 @@ async function shutdownUiService() {
     el.settingsDialog.close();
     setConnection(false);
     el.statusBadge.textContent = '服务已关闭';
-    el.statusBadge.dataset.status = 'completed';
+    el.statusBadge.dataset.status = 'complete';
     el.workspaceChip.textContent = '本地服务已关闭';
     showToast('本地服务已关闭，可以关闭此页面。');
   } catch (error) {
@@ -4315,7 +4336,9 @@ function isSpecialLine(lines, index) {
 
 function setConnection(connected) {
   el.connectionDot.className = `status-dot ${connected ? 'status-complete' : 'status-running'}`;
-  el.connectionDot.title = connected ? '本地事件流已连接' : '事件流正在重连';
+  const label = connected ? '本地事件流已连接' : '事件流正在重连';
+  el.connectionDot.title = label;
+  el.connectionDot.setAttribute('aria-label', label);
 }
 
 function statusKey(status) {
