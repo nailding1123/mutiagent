@@ -257,6 +257,7 @@
               </div>
               <div data-collaboration-only="group_chat">
                 <label><span>未点名时响应者</span><select id="settings-group-chat-default-agent"><option value="both">Claude Code + Codex</option><option value="claude">仅 Claude Code</option><option value="codex">仅 Codex</option></select></label>
+                <label class="setting-switch compact-setting-switch"><input id="settings-worktree-enabled" type="checkbox" /><span><strong>Git 写入隔离</strong><small>开启后，并发写入会自动使用临时 Worktree，避免 Agent 互相阻塞。关闭后，后续写入会等待工作区租约。保存后立即影响等待中的租约和后续消息，已取得租约的 Agent 不会被强行切换。</small></span></label>
                 <label class="setting-switch compact-setting-switch"><input id="settings-context-compaction-enabled" type="checkbox" /><span><strong>自动压缩共同上下文</strong><small>完整群聊仍保存在本地；达到预算后会摘要较早记录，Claude 会自动切换到承接压缩上下文的新原生会话。</small></span></label>
                 <div class="settings-number-grid">
                   <label><span>触发预算（估算 token）</span><input id="settings-context-compaction-threshold" data-context-compaction-setting type="number" min="2" step="1" required /></label>
@@ -268,7 +269,7 @@
                   <div class="settings-guidance-grid">
                     <div class="setting-switch setting-static"><span class="setting-static-icon">@</span><span><strong>点名路由</strong><small>@Claude（Claude Code）、@Codex 或 @all 会覆盖默认响应者；@all 会同时通知双方，由各自的原生 Agent 判断是否需要修改。</small></span></div>
                     <div class="setting-switch setting-static"><span class="setting-static-icon">A</span><span><strong>原生读写决策</strong><small>MultiAgent 不再按消息关键词切换只读或写入模式。每个 Agent 根据用户请求和自身原生规则决定读取、修改与验证范围。</small></span></div>
-                    <div class="setting-switch setting-static"><span class="setting-static-icon">1</span><span><strong>Git 写入隔离</strong><small>Git 工作区已有 Agent 写入时，另一 Agent 使用唯一临时 Worktree，完成后自动合并并清理。非 Git 目录无法隔离，并发 Agent 会共享目标目录。</small></span></div>
+                    <div class="setting-switch setting-static"><span class="setting-static-icon">1</span><span><strong>工作区租约</strong><small>上方开关控制 Git 写入隔离。开启时并发写入使用临时 Worktree；关闭时写入按租约排队。非 Git 目录无法创建 Worktree。</small></span></div>
                     <div class="setting-switch setting-static"><span class="setting-static-icon">!</span><span><strong>原生权限与提问</strong><small>Claude Code 或 Codex 请求执行命令、修改文件、扩展权限或补充信息时，会暂停对应 Agent 并在页面弹窗；群聊中的其他 Agent 仍可继续工作。</small></span></div>
                   </div>
                 </details>
@@ -309,6 +310,7 @@
                   <details class="settings-advanced">
                     <summary><span>高级运行参数</span><small>故障切换、超时、CLI 参数</small></summary>
                     <div class="settings-advanced-body">
+                      <label><span>权限模式</span><select id="settings-claude-permission-mode"><option value="default">按任务选择（默认）</option><option value="auto">Auto mode（原生自动判断）</option><option value="acceptEdits">自动接受编辑</option><option value="plan">仅规划/只读</option><option value="manual">手动确认</option><option value="dontAsk">不主动询问</option></select><small>Auto mode 由 Claude Code 原生分类器决定哪些操作自动允许、哪些操作需要审批。</small></label>
                       <label class="setting-switch compact-setting-switch"><input id="settings-claude-fallback" type="checkbox" /><span><strong>异常自动切换</strong><small>候选模型超时或请求协议不兼容时自动尝试下一个。</small></span></label>
                       <label><span>连续无活动超时（秒）</span><input id="settings-claude-timeout" type="number" min="1" step="1" required /></label>
                       <label><span>CLI 命令</span><input id="settings-claude-command" type="text" placeholder="自动发现 claude" /></label>

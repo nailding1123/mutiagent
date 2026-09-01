@@ -985,6 +985,8 @@ function populateSettingsForm(settings) {
   };
   setValue('settings-workspace', settings.workspace);
   setValue('settings-group-chat-default-agent', values.group_chat_default_agent || 'both');
+  setChecked('settings-worktree-enabled', values.worktree !== false);
+  setValue('settings-claude-permission-mode', values.claude?.permission_mode || 'default');
   const contextCompaction = values.context_compaction || {};
   setChecked('settings-context-compaction-enabled', contextCompaction.enabled !== false);
   setValue('settings-context-compaction-threshold', contextCompaction.threshold_tokens ?? 16000);
@@ -1412,6 +1414,7 @@ function collectSettingsValues() {
   const compactionTarget = positiveInteger('settings-context-compaction-target', '上下文压缩目标预算');
   if (compactionTarget >= compactionThreshold) throw new Error('上下文压缩目标预算必须小于触发预算。');
   return {
+    worktree: get('settings-worktree-enabled').checked,
     group_chat_default_agent: get('settings-group-chat-default-agent').value,
     group_chat_identities: {
       agent_a: get('settings-group-chat-agent-a-identity').value.trim(),
@@ -1427,7 +1430,10 @@ function collectSettingsValues() {
       enabled: get('settings-token-api-enabled').checked,
       base_url: get('settings-token-api-base-url').value.trim(),
     },
-    claude: agent('claude'),
+    claude: {
+      ...agent('claude'),
+      permission_mode: get('settings-claude-permission-mode')?.value || 'default',
+    },
     codex: { ...agent('codex'), reasoning_effort: codexReasoningEffort },
     ui: {
       theme: document.querySelector('input[name="settings-theme"]:checked')?.value || 'paper',
@@ -1959,10 +1965,21 @@ function comparisonSupported() {
 function updateComparisonComposeHint() {
   if (!el.comparisonComposeHint) return;
   const comparison = currentComparison();
+  const operation = comparison?.operation && typeof comparison.operation === 'object'
+    ? comparison.operation : null;
+  const detail = typeof state !== 'undefined' ? state.detail : null;
+  const runStatus = String(
+    detail?.session?.status || detail?.record?.status || '',
+  ).toLowerCase();
   let message = '';
   let kind = '';
-  if (comparison?.status === 'running') {
+  if (['interrupted', 'cancelled', 'failed'].includes(runStatus)) {
+    message = '';
+  } else if (comparison?.status === 'running') {
     message = 'A/B 对比执行中：两个 Agent 正在各自的隔离 Worktree 中工作；完成前暂不能发送下一条群聊消息。';
+  } else if (operation?.status === 'running') {
+    const name = agentName(operation.agent || '');
+    message = `${name} ${operation.kind === 'resolve' ? '正在重做冲突' : '正在评估冲突'}，请等待完成。`;
   } else if (['review', 'conflict'].includes(comparison?.status)) {
     message = comparison.status === 'conflict'
       ? '候选应用已停止：主工作区发生变化。候选补丁仍保留，可处理后重试或放弃。'
@@ -2309,6 +2326,11 @@ function currentComparison() {
 }
 
 function comparisonBlocksComposer(comparison = currentComparison()) {
+  const detail = typeof state !== 'undefined' ? state.detail : null;
+  const runStatus = String(
+    detail?.session?.status || detail?.record?.status || '',
+  ).toLowerCase();
+  if (['interrupted', 'cancelled', 'failed'].includes(runStatus)) return false;
   return ['running', 'review', 'previewing', 'applying', 'conflict']
     .includes(String(comparison?.status || ''));
 }
@@ -2453,6 +2475,7 @@ async function assessComparisonConflict(agent) {
     button.disabled = true;
     button.textContent = '正在评估…';
   }
+  showToast(`${agentName(agent)} 正在评估冲突，请稍候。`);
   try {
     const payload = await api(
       `/api/sessions/${encodeURIComponent(state.currentId)}/comparisons/${encodeURIComponent(comparison.id)}/assess`,
@@ -2500,6 +2523,7 @@ async function resolveComparisonConflict(agent) {
     button.disabled = true;
     button.textContent = '正在重做…';
   }
+  showToast(`${name} 正在隔离工作区中重做方案，请稍候。`);
   try {
     const payload = await api(
       `/api/sessions/${encodeURIComponent(state.currentId)}/comparisons/${encodeURIComponent(comparison.id)}/resolve`,
@@ -3798,10 +3822,26 @@ function renderGroupChat(record, session) {
 function comparisonMarkup(comparison, runId) {
   const candidates = comparison?.candidates && typeof comparison.candidates === 'object'
     ? comparison.candidates : {};
-  const status = String(comparison?.status || 'running');
+  const detail = typeof state !== 'undefined' ? state.detail : null;
+  const runStatus = String(
+    detail?.session?.status || detail?.record?.status || '',
+  ).toLowerCase();
+  const persistedStatus = String(comparison?.status || 'running');
+  const operation = comparison?.operation && typeof comparison.operation === 'object'
+    ? comparison.operation : null;
+  const operationRunning = operation?.status === 'running';
+  const operationFailed = operation?.status === 'failed';
+  const operationAgent = String(operation?.agent || '');
+  const operationName = agentName(operationAgent);
+  const operationLabel = operation?.kind === 'resolve' ? '正在重做冲突' : '正在评估冲突';
+  const status = ['interrupted', 'cancelled', 'failed'].includes(runStatus)
+    && ['running', 'review', 'previewing', 'applying', 'conflict'].includes(persistedStatus)
+    ? 'interrupted'
+    : persistedStatus;
   const terminal = ['review', 'previewing', 'applied', 'conflict', 'discarded'].includes(status);
   const statusLabelText = {
     running: '正在执行 · 主工作区尚未修改',
+    interrupted: '任务已中断 · 主工作区未修改',
     review: '两个候选已完成 · 等待你选择',
     applying: '正在应用所选方案',
     previewing: `正在主工作区预览 ${agentName(comparison?.preview?.active_agent || '')} 方案`,
@@ -3809,7 +3849,7 @@ function comparisonMarkup(comparison, runId) {
     conflict: '应用冲突 · 主工作区未被覆盖',
     discarded: '已放弃 · 主工作区未修改',
   }[status] || '处理中';
-  const mainWorkspace = state.detail?.session?.workspace || state.detail?.record?.workspace || '';
+  const mainWorkspace = detail?.session?.workspace || detail?.record?.workspace || '';
   const driftFiles = Array.isArray(comparison?.changed_files)
     ? comparison.changed_files.filter((item) => item && item.path).slice(0, 20)
     : [];
@@ -3821,6 +3861,11 @@ function comparisonMarkup(comparison, runId) {
     : status === 'applied'
       ? `<div class="comparison-panel-notice comparison-panel-success"><strong>已采用 ${escapeHtml(agentName(comparison?.selected_agent || ''))} 方案，修改已写入主工作区</strong><span>当前仍是未提交 Git 的修改；未选中的候选 Worktree 已清理。</span>${mainWorkspace ? `<code>${escapeHtml(mainWorkspace)}</code>` : ''}</div>`
       : '';
+  const operationNotice = operationRunning
+    ? `<div class="comparison-panel-notice comparison-panel-progress"><strong>${escapeHtml(operationName)} ${operationLabel}…</strong><span>正在读取当前主工作区和候选 Diff；完成后会自动更新结果。此过程可能需要一段时间，请不要重复点击。</span>${sessionAgentActivity(operationAgent) ? `<small>${escapeHtml(sessionAgentActivity(operationAgent))}</small>` : ''}</div>`
+    : operationFailed
+      ? `<div class="comparison-panel-notice comparison-panel-conflict"><strong>${escapeHtml(operationName)} ${operationLabel}失败</strong><span>${escapeHtml(operation.error || comparison?.error || '操作未完成，请检查 Agent 活动或稍后重试。')}</span></div>`
+    : '';
   const previewNotice = status === 'previewing'
     ? `<div class="comparison-panel-notice comparison-panel-preview"><strong>当前主工作区正在显示 ${escapeHtml(agentName(comparison?.preview?.active_agent || ''))} 方案</strong><span>切换预览会先恢复对比基线，再应用另一套候选修改；主工作区未正式采用任何方案。</span></div>`
     : '';
@@ -3832,7 +3877,7 @@ function comparisonMarkup(comparison, runId) {
     const candidate = candidates[agent];
     return candidate && ['ready', 'no_changes', 'failed', 'unavailable'].includes(String(candidate.status || ''));
   });
-  const selectionNotice = ['running', 'review', 'previewing'].includes(status) && selectableAgents.length
+  const selectionNotice = !operationRunning && ['running', 'review', 'previewing'].includes(status) && selectableAgents.length
     ? `<div class="comparison-selection-notice"><strong>${status === 'running' ? '已完成的候选可以先预览' : status === 'previewing' ? '可以切换预览或正式采用当前实现' : '先在主工作区查看 A/B 效果'}</strong><span>${status === 'running' ? '已完成的候选可以立即临时显示在主工作区；另一个 Agent 会继续在隔离 Worktree 中执行。另一个 Agent 完成后，才可以正式采用方案。' : '预览只临时替换主工作区文件，不会自动提交；确认后再点击“采用”。'}</span><div class="comparison-selection-actions">${selectableAgents.map((agent) => `<button class="secondary-button" type="button" data-comparison-action="preview" data-comparison-agent="${agent}">预览 ${escapeHtml(agentName(agent))}</button>${candidatesFinished ? `<button class="primary-button" type="button" data-comparison-action="apply" data-comparison-agent="${agent}">采用 ${escapeHtml(agentName(agent))}</button>` : ''}`).join('')}${status !== 'running' ? '<button class="secondary-button" type="button" data-comparison-action="discard">放弃全部</button>' : ''}</div></div>`
     : '';
   const headerNotice = status === 'previewing'
@@ -3843,11 +3888,16 @@ function comparisonMarkup(comparison, runId) {
   const cards = ['claude', 'codex'].map((agent) => {
     const candidate = candidates[agent] && typeof candidates[agent] === 'object'
       ? candidates[agent] : {};
-    const candidateStatus = String(candidate.status || 'running');
+    const rawCandidateStatus = String(candidate.status || 'running');
+    const candidateStatus = status === 'interrupted' && rawCandidateStatus === 'running'
+      ? 'interrupted'
+      : rawCandidateStatus;
     const candidateLabel = candidate.apply_status === 'applied'
       ? '已采用'
       : candidate.apply_status === 'discarded'
         ? '已清理 · 未采用'
+        : candidate.apply_status === 'interrupted'
+          ? '已中断 · 未采用'
         : status === 'running' && ['ready', 'no_changes'].includes(candidateStatus)
           ? candidateStatus === 'no_changes' ? '已完成 · 可预览（无文件修改）' : '已完成 · 可预览'
         : status === 'conflict' && ['ready', 'no_changes'].includes(candidateStatus)
@@ -3856,6 +3906,7 @@ function comparisonMarkup(comparison, runId) {
           ? '已完成冲突重做 · 可采用'
         : {
       running: '正在执行',
+      interrupted: '已中断 · 未完成',
       ready: '可以查看和采用',
       no_changes: '已完成 · 没有文件修改',
       failed: '执行失败',
@@ -3864,7 +3915,7 @@ function comparisonMarkup(comparison, runId) {
     const changes = candidate.changes;
     const usable = ['ready', 'no_changes'].includes(candidateStatus);
     const applyDisabled = !usable || !terminal || !['review', 'previewing'].includes(status);
-    const previewDisabled = !usable || !['running', 'review', 'previewing'].includes(status);
+    const previewDisabled = operationRunning || !usable || !['running', 'review', 'previewing'].includes(status);
     const isPreviewed = comparison?.preview?.active_agent === agent;
     const commands = Array.isArray(candidate.preview_commands)
       ? candidate.preview_commands.join('\n') : '';
@@ -3900,7 +3951,8 @@ function comparisonMarkup(comparison, runId) {
     const canInspectCandidate = usable
       && !candidateCleaned
       && ['running', 'review', 'previewing', 'conflict'].includes(status);
-    const canAssessConflict = usable
+    const canAssessConflict = !operationRunning
+      && usable
       && !candidateCleaned
       && status === 'conflict';
     const canResolveConflict = canAssessConflict;
@@ -3943,11 +3995,18 @@ function comparisonMarkup(comparison, runId) {
   return `<section class="comparison-panel" data-feed-key="comparison-${escapeHtml(comparison?.id || runId)}">
     <header class="comparison-panel-header"><div><span class="comparison-kicker">A/B 对比执行</span><strong>两个候选都从同一工作区快照开始</strong><small>${escapeHtml(headerNotice)}</small></div><span class="comparison-panel-status">${escapeHtml(statusLabelText)}</span></header>
     ${conflictNotice}
+    ${operationNotice}
     ${previewNotice}
     ${selectionNotice}
     <div class="comparison-candidates">${cards}</div>
-    <footer class="comparison-panel-footer"><span>${status === 'review' ? '可分别预览 A、B 的实现效果，再决定采用哪一个。' : status === 'previewing' ? '主工作区当前只临时显示一个候选方案，切换不会提交 Git。' : status === 'conflict' ? '主工作区有变化，采用入口已暂停；处理后点击“重新检查”。' : status === 'applied' ? '所选方案已保留为主工作区中的未提交修改。' : status === 'discarded' ? '两个候选已清理，主工作区未修改。' : '候选工作区只在采用或放弃后清理。'}</span><div class="comparison-footer-actions">${mainWorkspace ? '<button class="secondary-button" type="button" data-comparison-action="copy-main-path">复制主工作区路径</button>' : ''}<button class="secondary-button" type="button" data-comparison-action="refresh">${status === 'conflict' ? '重新检查主工作区' : '重新检查'}</button><button class="secondary-button" type="button" data-comparison-action="discard"${['running', 'applying', 'applied', 'discarded'].includes(status) ? ' disabled' : ''}>放弃全部方案</button></div></footer>
+    <footer class="comparison-panel-footer"><span>${status === 'review' ? '可分别预览 A、B 的实现效果，再决定采用哪一个。' : status === 'previewing' ? '主工作区当前只临时显示一个候选方案，切换不会提交 Git。' : status === 'conflict' ? '主工作区有变化，采用入口已暂停；处理后点击“重新检查”。' : status === 'applied' ? '所选方案已保留为主工作区中的未提交修改。' : status === 'discarded' ? '两个候选已清理，主工作区未修改。' : status === 'interrupted' ? '本轮已中断，主工作区未修改；候选 Worktree 已清理。' : '候选工作区只在采用或放弃后清理。'}</span><div class="comparison-footer-actions">${mainWorkspace ? '<button class="secondary-button" type="button" data-comparison-action="copy-main-path">复制主工作区路径</button>' : ''}<button class="secondary-button" type="button" data-comparison-action="refresh">${status === 'conflict' ? '重新检查主工作区' : '重新检查'}</button><button class="secondary-button" type="button" data-comparison-action="discard"${['running', 'applying', 'applied', 'discarded', 'interrupted'].includes(status) ? ' disabled' : ''}>放弃全部方案</button></div></footer>
   </section>`;
+}
+
+function sessionAgentActivity(agent) {
+  if (typeof state === 'undefined') return '';
+  const event = state.detail?.session?.agent_events?.[agent];
+  return event?.safe_summary || event?.text || '';
 }
 
 const feedHtmlCache = new Map();

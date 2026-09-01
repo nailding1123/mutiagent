@@ -136,6 +136,9 @@ class AgentCommandSettings:
     timeout: float = 900
     # Codex Responses reasoning effort. None delegates to the native default.
     reasoning_effort: str | None = None
+    # Claude Code permission mode. None keeps MultiAgent's task-aware default;
+    # explicit values are forwarded to the native CLI.
+    permission_mode: str | None = None
 
 
 @dataclass(frozen=True)

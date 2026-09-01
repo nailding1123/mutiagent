@@ -607,6 +607,8 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .comparison-drift-files small { display: block; margin-top: 4px; opacity: .78; }
 .comparison-panel-success { background: var(--success-soft); }
 .comparison-panel-preview { background: var(--highlight-soft); }
+.comparison-panel-progress { background: var(--highlight-soft); border-color: var(--focus); }
+.comparison-panel-progress strong { color: var(--focus); }
 .comparison-selection-notice { display: grid; gap: 4px; margin-bottom: 9px; padding: 8px; background: var(--highlight-soft); border: 1.5px solid var(--ink); border-radius: 5px; font-size: 10px; }
 .comparison-selection-notice strong { font-size: 11px; }
 .comparison-selection-notice span { color: var(--muted); }
@@ -651,6 +653,7 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .comparison-candidate-status.status-no_changes { background: var(--success-soft); }
 .comparison-candidate-status.status-failed,
 .comparison-candidate-status.status-unavailable { background: var(--danger-soft); }
+.comparison-candidate-status.status-interrupted { background: var(--warning-soft); }
 
 @media (max-width: 760px) {
   .comparison-candidates { grid-template-columns: 1fr; }

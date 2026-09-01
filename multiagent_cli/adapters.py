@@ -1068,7 +1068,9 @@ class ClaudeAdapter(BaseCLIAdapter):
         # Writable turns keep Claude's native workspace editing behavior. Any
         # protected operation outside that baseline is routed through the MCP
         # permission prompt tool when the UI interaction bridge is attached.
-        permission_mode = "acceptEdits" if mode == "write" else "plan"
+        permission_mode = self.settings.permission_mode or (
+            "acceptEdits" if mode == "write" else "plan"
+        )
         command = [
             *self.settings.command,
             "-p",

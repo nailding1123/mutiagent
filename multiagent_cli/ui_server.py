@@ -981,7 +981,36 @@ class UISessionManager:
 
         with self._lock:
             self.default_workspace = workspace
+            live_sessions = [
+                session
+                for session in self._sessions.values()
+                if Path(session.workspace).expanduser().resolve() == workspace
+            ]
         self._refresh_stream_preference(workspace)
+        # Project settings are normally captured when a task starts. The
+        # workspace-isolation toggle is safe to apply to live sessions too:
+        # already-running leases remain unchanged, while their next turn uses
+        # the newly saved value. Persist the refreshed snapshot for recovery.
+        if live_sessions:
+            from .runtime import settings_snapshot
+
+            for session in live_sessions:
+                try:
+                    engine = session.chat_engine()
+                    engine.update_worktree_setting(
+                        resolved_settings.worktree
+                    )
+                    engine.workspace_coordinator.wake_waiters(workspace)
+                    # Preserve this task's model, timeout and context settings;
+                    # only the Worktree preference is live-updated.
+                    self.store.update(
+                        session.id,
+                        settings=settings_snapshot(engine.settings),
+                    )
+                except (BridgeError, KeyError, OSError, UIError, ValueError):
+                    # A session may finish between the snapshot and update;
+                    # saving the project config itself must still succeed.
+                    pass
         self.publish("settings", "")
         return self.get_settings(str(workspace))
 
@@ -1339,6 +1368,13 @@ class UISessionManager:
             terminal_status = "ready" if recalled else "interrupted"
             terminal_error = "" if recalled else "用户中断"
             try:
+                engine.interrupt_comparison(
+                    "用户消息已撤回" if recalled else terminal_error
+                )
+            except (BridgeError, WorkspaceCoordinatorError):
+                pass
+            state = engine.to_dict()
+            try:
                 self.store.update(
                     session.id,
                     status=terminal_status,
@@ -1362,15 +1398,20 @@ class UISessionManager:
             )
             return
         except Exception:
-            safe_error = "群聊处理失败"
             state = engine.to_dict()
             recalled = recalled_turn(state)
-            if recalled:
-                safe_error = ""
+            interrupted = session.status == "stopping" or session.chat_requires_restore()
+            safe_error = "" if recalled else "用户中断" if interrupted else "群聊处理失败"
+            if interrupted and not recalled:
+                try:
+                    engine.interrupt_comparison(safe_error)
+                except (BridgeError, WorkspaceCoordinatorError):
+                    pass
+            terminal_status = "ready" if recalled else "interrupted" if interrupted else "failed"
             try:
                 self.store.update(
                     session.id,
-                    status="ready" if recalled else "failed",
+                    status=terminal_status,
                     error=safe_error,
                     group_chat=state,
                     active_chat_turns=[],
@@ -1380,7 +1421,7 @@ class UISessionManager:
             session.finish_chat_turn(
                 state=state,
                 error=safe_error,
-                status="ready" if recalled else "failed",
+                status=terminal_status,
                 token=getattr(reservation, "token", None),
             )
             self.store.update(
@@ -1653,6 +1694,23 @@ class UISessionManager:
         except ConfigError as exc:
             raise UIError(f"配置错误：{exc}") from exc
         engine = GroupChatEngine(settings, adapters, record.get("group_chat"))
+        recovered_status = str(record.get("status", "ready"))
+        recovered_comparison = engine.comparison()
+        if (
+            recovered_status in {"interrupted", "failed", "cancelled"}
+            and isinstance(recovered_comparison, dict)
+            and recovered_comparison.get("status") in {
+                "running",
+                "applying",
+                "previewing",
+                "review",
+                "conflict",
+            }
+        ):
+            # Older records could leave an A/B panel in an active state after
+            # the task itself was interrupted. Reconcile it on restore so the
+            # UI cannot remain locked behind a stale preview or running card.
+            engine.interrupt_comparison("上次任务已中断")
         session = UISession(
             run_id=str(record["id"]),
             task=str(record.get("display_task") or record.get("task") or "群聊"),
@@ -1663,7 +1721,7 @@ class UISessionManager:
             notify=self.publish,
             stream_gate=self._stream_enabled,
         )
-        restored_status = str(record.get("status", "ready"))
+        restored_status = recovered_status
         recovered_comparison = engine.comparison()
         if (
             restored_status in ACTIVE_STATUSES
@@ -1678,6 +1736,14 @@ class UISessionManager:
             else str(record.get("error", ""))
         )
         session.bind_chat_engine(engine)
+        if recovered_status in {"interrupted", "failed", "cancelled"}:
+            try:
+                self.store.update(
+                    session.id,
+                    group_chat=engine.to_dict(),
+                )
+            except (KeyError, OSError):
+                pass
 
         def stop_adapters() -> None:
             for adapter in adapters.values():
@@ -2206,10 +2272,23 @@ class UISessionManager:
                 or current.get("id") != comparison_id
             ):
                 raise UIError("A/B 对比任务 ID 不匹配")
-            comparison = engine.assess_comparison_conflict(agent)
-            state = engine.to_dict()
-            session.update_group_chat_state(state)
-            self.store.update(run_id, group_chat=state)
+            operation = engine.begin_comparison_operation("assess", agent)
+            operation_state = engine.to_dict()
+            session.update_group_chat_state(operation_state)
+            self.store.update(run_id, group_chat=operation_state)
+            self.publish("comparison_updated", run_id, {"status": "conflict", "operation": "assess", "agent": agent})
+            try:
+                comparison = engine.assess_comparison_conflict(
+                    agent,
+                    on_event=session.on_event,
+                    step_id=str(operation.get("operation", {}).get("step_id") or ""),
+                )
+                state = engine.to_dict()
+            finally:
+                engine.finish_comparison_operation()
+                state = engine.to_dict()
+                session.update_group_chat_state(state)
+                self.store.update(run_id, group_chat=state)
         except (BridgeError, WorkspaceCoordinatorError) as exc:
             raise UIError(str(exc)) from exc
         except (KeyError, OSError) as exc:
@@ -2220,6 +2299,121 @@ class UISessionManager:
             {"status": comparison.get("status"), "assessment_agent": agent},
         )
         return {"comparison": comparison, "group_chat": state, "session": session.to_dict()}
+
+    def start_comparison_operation(
+        self,
+        run_id: str,
+        agent: object,
+        comparison_id: str,
+        kind: str,
+    ) -> dict[str, Any]:
+        """Start conflict assessment/resolution without blocking the HTTP request."""
+
+        if kind not in {"assess", "resolve"}:
+            raise UIError("未知的 A/B 操作")
+        if not isinstance(agent, str) or agent not in {"claude", "codex"}:
+            raise UIError("agent 必须是 claude 或 codex")
+        record = self.store.get(run_id)
+        if record is None:
+            raise UIError("找不到群聊对话")
+        session = self.session(run_id)
+        if session is None:
+            session = self._restore_group_chat_session(record)
+        if session.has_active_chat_turns():
+            raise UIError("Agent 正在回复，请等待当前任务完成后再处理冲突")
+        engine = session.chat_engine()
+        current = engine.comparison()
+        if comparison_id and (
+            not isinstance(current, dict)
+            or current.get("id") != comparison_id
+        ):
+            raise UIError("A/B 对比任务 ID 不匹配")
+        operation_state = engine.begin_comparison_operation(kind, agent)
+        state = engine.to_dict()
+        session.update_group_chat_state(state)
+        self.store.update(run_id, group_chat=state)
+        self.publish(
+            "comparison_updated",
+            run_id,
+            {"status": "conflict", "operation": kind, "agent": agent},
+        )
+        worker = threading.Thread(
+            target=self._run_comparison_operation,
+            args=(session, engine, agent, kind),
+            name=f"multiagent-comparison-{kind}-{agent}",
+            daemon=True,
+        )
+        worker.start()
+        return {
+            "comparison": operation_state,
+            "group_chat": state,
+            "session": session.to_dict(),
+        }
+
+    def _run_comparison_operation(
+        self,
+        session: UISession,
+        engine: GroupChatEngine,
+        agent: str,
+        kind: str,
+    ) -> None:
+        try:
+            comparison_id = str((engine.comparison() or {}).get("id") or "unknown")
+            operation = engine.comparison() or {}
+            step_id = str(
+                operation.get("operation", {}).get("step_id")
+                if isinstance(operation.get("operation"), dict)
+                else ""
+            )
+            if kind == "assess":
+                engine.assess_comparison_conflict(
+                    agent,
+                    on_event=session.on_event,
+                    step_id=step_id or f"comparison_conflict_assessment_{comparison_id}_{agent}",
+                )
+            else:
+                engine.resolve_comparison_conflict(
+                    agent,
+                    on_event=session.on_event,
+                    step_id=step_id or f"comparison_conflict_resolution_{comparison_id}_{agent}",
+                )
+        except BaseException as exc:
+            with engine._lock:
+                comparison = engine._state.get("comparison")
+                if isinstance(comparison, dict):
+                    comparison["error"] = str(exc) or exc.__class__.__name__
+                    comparison["operation"] = {
+                        "kind": kind,
+                        "agent": agent,
+                        "status": "failed",
+                        "error": str(exc) or exc.__class__.__name__,
+                    }
+        finally:
+            with engine._lock:
+                comparison = engine._state.get("comparison")
+                failed_operation = (
+                    isinstance(comparison, dict)
+                    and isinstance(comparison.get("operation"), dict)
+                    and comparison["operation"].get("status") == "failed"
+                )
+            if not failed_operation:
+                engine.finish_comparison_operation()
+            state = engine.to_dict()
+            session.update_group_chat_state(state)
+            try:
+                self.store.update(session.id, group_chat=state)
+            except (KeyError, OSError):
+                pass
+            comparison = state.get("comparison") or {}
+            self.publish(
+                "comparison_updated",
+                session.id,
+                {
+                    "status": comparison.get("status"),
+                    "operation": kind,
+                    "agent": agent,
+                },
+            )
 
     def resolve_comparison_conflict(
         self,
@@ -2245,10 +2439,23 @@ class UISessionManager:
                 or current.get("id") != comparison_id
             ):
                 raise UIError("A/B 对比任务 ID 不匹配")
-            comparison = engine.resolve_comparison_conflict(agent)
-            state = engine.to_dict()
-            session.update_group_chat_state(state)
-            self.store.update(run_id, group_chat=state)
+            operation = engine.begin_comparison_operation("resolve", agent)
+            operation_state = engine.to_dict()
+            session.update_group_chat_state(operation_state)
+            self.store.update(run_id, group_chat=operation_state)
+            self.publish("comparison_updated", run_id, {"status": "conflict", "operation": "resolve", "agent": agent})
+            try:
+                comparison = engine.resolve_comparison_conflict(
+                    agent,
+                    on_event=session.on_event,
+                    step_id=str(operation.get("operation", {}).get("step_id") or ""),
+                )
+                state = engine.to_dict()
+            finally:
+                engine.finish_comparison_operation()
+                state = engine.to_dict()
+                session.update_group_chat_state(state)
+                self.store.update(run_id, group_chat=state)
         except (BridgeError, WorkspaceCoordinatorError) as exc:
             raise UIError(str(exc)) from exc
         except (KeyError, OSError) as exc:
@@ -2682,12 +2889,13 @@ def make_request_handler(manager: UISessionManager, static_root: Path):
                     path,
                 )
                 if match:
-                    result = manager.assess_comparison_conflict(
+                    result = manager.start_comparison_operation(
                         match.group(1),
                         payload.get("agent") if isinstance(payload, dict) else None,
                         match.group(2),
+                        "assess",
                     )
-                    self._json(result)
+                    self._json(result, status=HTTPStatus.ACCEPTED)
                     return
                 match = re.fullmatch(
                     r"/api/sessions/([A-Za-z0-9._-]+)/comparisons/"
@@ -2695,12 +2903,13 @@ def make_request_handler(manager: UISessionManager, static_root: Path):
                     path,
                 )
                 if match:
-                    result = manager.resolve_comparison_conflict(
+                    result = manager.start_comparison_operation(
                         match.group(1),
                         payload.get("agent") if isinstance(payload, dict) else None,
                         match.group(2),
+                        "resolve",
                     )
-                    self._json(result)
+                    self._json(result, status=HTTPStatus.ACCEPTED)
                     return
                 match = re.fullmatch(
                     r"/api/sessions/([A-Za-z0-9._-]+)/comparisons/"
@@ -3380,10 +3589,21 @@ def _config_for_ui(data: dict[str, Any]) -> dict[str, Any]:
                     else "auto"
                 ),
             }
+        else:
+            agent_data["permission_mode"] = (
+                raw.get("permission_mode")
+                if isinstance(raw.get("permission_mode"), str)
+                else "default"
+            )
         return agent_data
 
     group_chat_default_agent = data.get("group_chat_default_agent", "both")
     return {
+        "worktree": (
+            data.get("worktree")
+            if isinstance(data.get("worktree"), bool)
+            else True
+        ),
         "group_chat_default_agent": (
             group_chat_default_agent
             if group_chat_default_agent in {"both", "claude", "codex"}
@@ -3458,7 +3678,13 @@ def _config_for_ui(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _config_from_ui(values: dict[str, Any]) -> dict[str, Any]:
-    config = {"group_chat_default_agent": values.get("group_chat_default_agent")}
+    worktree = values.get("worktree", True)
+    if not isinstance(worktree, bool):
+        raise UIError("Git 写入隔离必须是布尔值")
+    config = {
+        "worktree": worktree,
+        "group_chat_default_agent": values.get("group_chat_default_agent"),
+    }
     group_chat_identities = values.get("group_chat_identities")
     ui = values.get("ui")
     token_api = values.get("token_api")
@@ -3541,6 +3767,8 @@ def _config_from_ui(values: dict[str, Any]) -> dict[str, Any]:
         }
         if name == "codex":
             agent["reasoning_effort"] = raw.get("reasoning_effort") or "auto"
+        else:
+            agent["permission_mode"] = raw.get("permission_mode") or "default"
         command = raw.get("command")
         if command is not None and command != "":
             agent["command"] = command
@@ -3571,6 +3799,7 @@ def _merge_known_config(
         "group_chat_execution",
     ):
         merged.pop(obsolete, None)
+    merged["worktree"] = config["worktree"]
     merged["group_chat_default_agent"] = config["group_chat_default_agent"]
     for section, known_keys in (
         ("group_chat_identities", ("agent_a", "agent_b")),
@@ -3581,7 +3810,7 @@ def _merge_known_config(
         ("token_api", ("enabled", "base_url")),
         (
             "claude",
-            ("command", "model", "models", "fallback_on_timeout", "timeout", "extra_args"),
+            ("command", "model", "models", "fallback_on_timeout", "timeout", "extra_args", "permission_mode"),
         ),
         (
             "codex",

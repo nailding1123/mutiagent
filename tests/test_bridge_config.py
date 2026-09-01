@@ -79,6 +79,25 @@ class BridgeConfigTests(unittest.TestCase):
                     },
                     workspace=directory,
                 )
+
+    def test_resolves_claude_permission_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            settings = resolve_bridge_settings(
+                {
+                    "claude": {"command": "/bin/echo", "permission_mode": "auto"},
+                    "codex": {"command": "/bin/echo"},
+                },
+                workspace=directory,
+            )
+            self.assertEqual(settings.claude.permission_mode, "auto")
+            with self.assertRaisesRegex(ConfigError, "permission_mode"):
+                resolve_bridge_settings(
+                    {
+                        "claude": {"command": "/bin/echo", "permission_mode": "bypassPermissions"},
+                        "codex": {"command": "/bin/echo"},
+                    },
+                    workspace=directory,
+                )
             with self.assertRaisesRegex(ConfigError, "reasoning_effort"):
                 resolve_bridge_settings(
                     {

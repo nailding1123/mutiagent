@@ -139,7 +139,9 @@ multiagent -C /path/to/your-project
 
 - 默认响应者：Claude、Codex 或双方；
 - 上下文压缩开关；
+- Git 写入隔离开关（默认开启；关闭后并发写入会等待工作区租约）；
 - Claude/Codex 的模型顺序和超时切换；
+- Claude Code 权限模式（默认按任务选择，也可选择原生 `auto`）；
 - Codex GPT 模型的思考强度（自动、最小、低、中、高、极高）；
 - 界面主题、流式回复和浏览器通知；
 - 公司 Token API（Key 保存在本机私密状态目录，不写入项目配置）。

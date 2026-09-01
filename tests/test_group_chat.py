@@ -424,6 +424,65 @@ class GroupChatTests(unittest.TestCase):
             self.assertFalse((repository / "claude.txt").exists())
             self.assertFalse((repository / "codex.txt").exists())
 
+    def test_interrupting_comparison_cleans_preview_and_marks_pending_candidates(self) -> None:
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                (Path(kwargs["workspace"]) / f"{self.display_name.lower()}.txt").write_text(
+                    self.display_name,
+                    encoding="utf-8",
+                )
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            engine = GroupChatEngine(
+                settings(repository),
+                {
+                    "claude": WritingAdapter("Claude", [AgentRunResult("Claude", "A")]),
+                    "codex": WritingAdapter("Codex", [AgentRunResult("Codex", "B")]),
+                },  # type: ignore[arg-type]
+            )
+            engine.ask("@all 执行：分别实现")
+            engine.preview_comparison("codex")
+            engine._state["comparison"]["candidates"]["claude"]["status"] = "running"
+            comparison = engine.interrupt_comparison()
+
+            self.assertEqual(comparison["status"], "interrupted")
+            self.assertEqual(comparison["candidates"]["claude"]["apply_status"], "interrupted")
+            self.assertEqual(comparison["candidates"]["codex"]["apply_status"], "discarded")
+            self.assertFalse((repository / "claude.txt").exists())
+            self.assertFalse((repository / "codex.txt").exists())
+            for candidate in comparison["candidates"].values():
+                self.assertFalse(Path(candidate["workspace"]).exists())
+
+    def test_recovering_comparison_marks_stale_conflict_operation_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            state = {
+                "protocol": "multiagent.group_chat.v2",
+                "turn": 0,
+                "messages": [],
+                "sessions": {"claude": None, "codex": None},
+                "cursors": {"claude": 0, "codex": 0},
+                "execution_sessions": {"claude": None, "codex": None},
+                "execution_cursors": {"claude": 0, "codex": 0},
+                "comparison": {
+                    "id": "comparison-stale",
+                    "status": "conflict",
+                    "operation": {"kind": "resolve", "agent": "claude", "status": "running"},
+                    "candidates": {},
+                    "base": {"repository": str(repository), "pathspec": ".", "tree": ""},
+                },
+            }
+            engine = GroupChatEngine(
+                settings(repository),
+                {"claude": FakeAdapter("Claude", []), "codex": FakeAdapter("Codex", [])},
+                state,
+            )
+            operation = (engine.comparison() or {}).get("operation") or {}
+            self.assertEqual(operation.get("status"), "failed")
+
     def test_completed_candidate_can_preview_while_peer_is_still_running(self) -> None:
         class WritingAdapter(FakeAdapter):
             def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:

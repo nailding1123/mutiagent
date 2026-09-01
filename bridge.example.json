@@ -25,6 +25,7 @@
   "claude": {
     "model": null,
     "models": [],
+    "permission_mode": "default",
     "fallback_on_timeout": true,
     "timeout": 900,
     "extra_args": []

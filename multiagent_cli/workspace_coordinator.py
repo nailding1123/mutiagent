@@ -739,6 +739,22 @@ class WorkspaceCoordinator:
             for agent, candidate in (comparison.get("candidates") or {}).items()
             if isinstance(agent, str) and isinstance(candidate, dict)
         }
+        operation = recovered.get("operation")
+        if isinstance(operation, dict) and operation.get("status") == "running":
+            recovered["operation"] = {
+                **operation,
+                "status": "failed",
+                "error": "上次服务在 A/B 冲突处理期间退出，操作未完成；可以重新发起。",
+            }
+        if recovered.get("status") == "interrupted":
+            for candidate in recovered["candidates"].values():
+                if not isinstance(candidate, dict):
+                    continue
+                if str(candidate.get("status") or "") == "running":
+                    candidate["status"] = "interrupted"
+                if str(candidate.get("apply_status") or "") in {"", "pending"}:
+                    candidate["apply_status"] = "interrupted"
+            return recovered
         if recovered.get("status") in {"applied", "discarded"}:
             return recovered
         for agent, candidate in recovered["candidates"].items():
@@ -796,6 +812,7 @@ class WorkspaceCoordinator:
         owner: str,
         access: str,
         isolate: bool = True,
+        isolate_supplier: Callable[[], bool] | None = None,
         on_wait: Callable[[], None] | None = None,
     ) -> WorkspaceLease:
         target = workspace
@@ -830,8 +847,16 @@ class WorkspaceCoordinator:
                     # eventually being acquired.
                     pass
 
+            def isolation_enabled() -> bool:
+                if isolate_supplier is None:
+                    return isolate
+                try:
+                    return bool(isolate_supplier())
+                except Exception:
+                    return isolate
+
             while True:
-                if not isolate:
+                if not isolation_enabled():
                     # A shared checkout cannot safely host overlapping writes.
                     # Queue the second writer instead of creating a Worktree
                     # whose patch may conflict with the first writer later.
@@ -878,6 +903,14 @@ class WorkspaceCoordinator:
 
                 notify_waiting()
                 state.condition.wait()
+
+    def wake_waiters(self, workspace: Path) -> None:
+        """Wake queued writers after a live isolation setting changes."""
+
+        with self._lock:
+            state = self._states.get(str(workspace))
+            if state is not None:
+                state.condition.notify_all()
 
     def release(self, lease: WorkspaceLease) -> dict[str, Any]:
         if lease.access != "write":

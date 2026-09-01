@@ -7,7 +7,7 @@ import re
 import shlex
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -152,6 +152,121 @@ class GroupChatEngine:
             value = self._state.get("comparison")
             return copy.deepcopy(value) if isinstance(value, dict) else None
 
+    def update_worktree_setting(self, enabled: bool) -> None:
+        """Apply the workspace-isolation preference to subsequent turns.
+
+        An in-flight native process keeps the lease it already acquired. The
+        next reservation reads the updated setting without rebuilding the
+        conversation or interrupting the current Agent.
+        """
+
+        if not isinstance(enabled, bool):
+            raise ValueError("worktree 必须是布尔值")
+        with self._lock:
+            self.settings = replace(self.settings, worktree=enabled)
+
+    def begin_comparison_operation(self, kind: str, agent: str) -> dict[str, Any]:
+        """Expose a long-running conflict assessment/resolution to the UI."""
+
+        if kind not in {"assess", "resolve"}:
+            raise BridgeError("未知的 A/B 操作")
+        if agent not in self.agent_names:
+            raise BridgeError("候选 Agent 必须是 Claude 或 Codex")
+        with self._lock:
+            comparison = self._state.get("comparison")
+            if not isinstance(comparison, dict):
+                raise BridgeError("当前群聊没有 A/B 对比方案")
+            operation = comparison.get("operation")
+            if isinstance(operation, dict) and operation.get("status") == "running":
+                raise BridgeError(
+                    f"{self.adapters.get(str(operation.get('agent'))).display_name if self.adapters.get(str(operation.get('agent'))) else 'Agent'} 正在处理 A/B 冲突"
+                )
+            comparison["operation"] = {
+                "kind": kind,
+                "agent": agent,
+                "status": "running",
+                "started_at": _timestamp(),
+                "step_id": f"comparison_conflict_{kind}_{comparison.get('id', 'unknown')}_{agent}",
+            }
+            return copy.deepcopy(comparison)
+
+    def finish_comparison_operation(self) -> dict[str, Any] | None:
+        with self._lock:
+            comparison = self._state.get("comparison")
+            if not isinstance(comparison, dict):
+                return None
+            comparison.pop("operation", None)
+            return copy.deepcopy(comparison)
+
+    def interrupt_comparison(self, reason: str = "用户中断") -> dict[str, Any] | None:
+        """Terminate an in-flight A/B comparison without leaving stale UI state.
+
+        A completed candidate remains inspectable in the persisted summary, but
+        no candidate is still eligible for preview/apply after interruption.
+        If a preview is active, the coordinator restores the base only when the
+        main tree still matches that candidate; otherwise it preserves the
+        worktrees and reports the cleanup problem instead of overwriting files.
+        """
+
+        with self._lock:
+            comparison = self._state.get("comparison")
+            if not isinstance(comparison, dict):
+                return None
+            status = str(comparison.get("status") or "")
+            if status in {"applied", "discarded", "interrupted"}:
+                return copy.deepcopy(comparison)
+            candidates = comparison.get("candidates")
+            if isinstance(candidates, dict):
+                for agent, candidate in candidates.items():
+                    if not isinstance(candidate, dict):
+                        continue
+                    if str(candidate.get("status") or "") == "running":
+                        try:
+                            changes = self.workspace_coordinator.collect_candidate_diff(
+                                comparison,
+                                str(agent),
+                            )
+                            candidate["changes"] = changes
+                        except WorkspaceCoordinatorError:
+                            pass
+
+        cleanup_error = ""
+        try:
+            self.workspace_coordinator.discard_comparison(comparison)
+        except WorkspaceCoordinatorError as exc:
+            cleanup_error = str(exc)
+
+        with self._lock:
+            comparison = self._state.get("comparison")
+            if not isinstance(comparison, dict):
+                return None
+            candidates = comparison.get("candidates")
+            if isinstance(candidates, dict):
+                for candidate in candidates.values():
+                    if not isinstance(candidate, dict):
+                        continue
+                    if str(candidate.get("status") or "") == "running":
+                        candidate["status"] = "interrupted"
+                        candidate["error"] = "本轮任务已中断，候选未完成。"
+                    if str(candidate.get("apply_status") or "") in {"", "pending"}:
+                        candidate["apply_status"] = (
+                            "interrupted"
+                            if str(candidate.get("status") or "") == "interrupted"
+                            else "discarded"
+                        )
+            comparison["status"] = "interrupted"
+            comparison["selected_agent"] = None
+            comparison.pop("operation", None)
+            comparison["error"] = cleanup_error or (
+                f"{reason}；主工作区已恢复，候选结果已保留。"
+            )
+            comparison["recovery_patch"] = ""
+            if not cleanup_error:
+                preview = comparison.get("preview")
+                if isinstance(preview, dict):
+                    preview["active_agent"] = ""
+            return copy.deepcopy(comparison)
+
     def apply_comparison(self, agent: str) -> dict[str, Any]:
         if agent not in self.agent_names:
             raise BridgeError("候选 Agent 必须是 Claude 或 Codex")
@@ -284,7 +399,13 @@ class GroupChatEngine:
                 comparison["recovery_patch"] = ""
             return copy.deepcopy(comparison)
 
-    def assess_comparison_conflict(self, agent: str) -> dict[str, Any]:
+    def assess_comparison_conflict(
+        self,
+        agent: str,
+        *,
+        on_event: Callable[[AgentEvent], None] | None = None,
+        step_id: str = "",
+    ) -> dict[str, Any]:
         """Ask one native Agent for a read-only conflict safety assessment.
 
         The assessment is advisory.  It never changes the main checkout and a
@@ -323,8 +444,8 @@ class GroupChatEngine:
                 workspace=Path(str(context["candidate_workspace"])),
                 mode="read",
                 session_id=None,
-                on_event=None,
-                step_id=f"comparison_conflict_assessment_{comparison.get('id', 'unknown')}_{agent}",
+                on_event=on_event,
+                step_id=step_id or f"comparison_conflict_assessment_{comparison.get('id', 'unknown')}_{agent}",
             )
             after_context = self.workspace_coordinator.collect_conflict_context(
                 comparison,
@@ -375,7 +496,13 @@ class GroupChatEngine:
             candidate["conflict_assessment"] = assessment
             return copy.deepcopy(comparison)
 
-    def resolve_comparison_conflict(self, agent: str) -> dict[str, Any]:
+    def resolve_comparison_conflict(
+        self,
+        agent: str,
+        *,
+        on_event: Callable[[AgentEvent], None] | None = None,
+        step_id: str = "",
+    ) -> dict[str, Any]:
         """Let an Agent re-implement its candidate on the current main tree."""
 
         if agent not in self.agent_names:
@@ -412,8 +539,8 @@ class GroupChatEngine:
                 workspace=Path(str(resolution["workspace"])),
                 mode="write",
                 session_id=None,
-                on_event=None,
-                step_id=f"comparison_conflict_resolution_{comparison.get('id', 'unknown')}_{agent}",
+                on_event=on_event,
+                step_id=step_id or f"comparison_conflict_resolution_{comparison.get('id', 'unknown')}_{agent}",
             )
             resolved_baseline = capture_change_baseline(
                 Path(str(resolution["workspace"]))
@@ -1058,6 +1185,7 @@ class GroupChatEngine:
                 owner=step_id,
                 access="write",
                 isolate=self.settings.worktree,
+                isolate_supplier=lambda: self.settings.worktree,
                 on_wait=notify_workspace_wait,
             )
         except WorkspaceCoordinatorError as exc:

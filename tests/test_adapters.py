@@ -224,6 +224,16 @@ class CommandBuilderTests(unittest.TestCase):
         self.assertIn("session-1", validator)
         self.assertIn("opus", writer)
 
+    def test_claude_auto_permission_mode_is_forwarded(self) -> None:
+        adapter = ClaudeAdapter(
+            AgentCommandSettings(("claude",), permission_mode="auto")
+        )
+        command = adapter.build_command(
+            workspace=Path("/tmp"), mode="write", session_id=None
+        )
+        self.assertIn("--permission-mode", command)
+        self.assertEqual(command[command.index("--permission-mode") + 1], "auto")
+
     def test_codex_uses_workspace_sandbox_and_resume(self) -> None:
         adapter = CodexAdapter(AgentCommandSettings(("codex",)))
         with tempfile.TemporaryDirectory() as directory:

@@ -25,6 +25,7 @@ from .token_api import (
 
 
 CODEX_REASONING_EFFORTS = {"minimal", "low", "medium", "high", "xhigh"}
+CLAUDE_PERMISSION_MODES = {"auto", "acceptEdits", "plan", "manual", "dontAsk"}
 
 
 class ConfigError(ValueError):
@@ -193,6 +194,16 @@ def _resolve_agent_settings(name: str, raw: Any) -> AgentCommandSettings:
                 f"codex.reasoning_effort 必须是 auto、{values} 之一"
             )
 
+    permission_mode = raw.get("permission_mode") if name == "claude" else None
+    if permission_mode is None or (
+        isinstance(permission_mode, str)
+        and permission_mode in {"", "task", "default"}
+    ):
+        permission_mode = None
+    elif not isinstance(permission_mode, str) or permission_mode not in CLAUDE_PERMISSION_MODES:
+        values = "、".join(sorted(CLAUDE_PERMISSION_MODES))
+        raise ConfigError(f"claude.permission_mode 必须是默认、{values} 之一")
+
     return AgentCommandSettings(
         command=command,
         model=models[0] if models else None,
@@ -201,6 +212,7 @@ def _resolve_agent_settings(name: str, raw: Any) -> AgentCommandSettings:
         extra_args=tuple(extra_args),
         timeout=float(timeout),
         reasoning_effort=reasoning_effort,
+        permission_mode=permission_mode,
     )
 
 

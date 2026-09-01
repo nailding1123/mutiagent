@@ -23,6 +23,7 @@ from multiagent_cli.bridge_models import (
     NativeInteractionOption,
     NativeInteractionRequest,
 )
+from multiagent_cli.bridge_config import resolve_bridge_settings
 from multiagent_cli.run_store import RunStore
 from multiagent_cli import ui_server
 from multiagent_cli.ui_server import (
@@ -649,7 +650,7 @@ if (!html.includes('让 Claude Code 评估')) throw new Error('Claude assessment
 if (!html.includes('让 Claude Code 解决冲突')) throw new Error('Claude conflict resolution button missing');
 if (!html.includes('Agent 判断：可以继续安全检查')) throw new Error('assessment result missing');
 if (!html.includes('data-comparison-action="assess" data-comparison-agent="codex"')) throw new Error('Codex assessment button missing');
-if (!html.includes('data-comparison-action="resolve" data-comparison-agent="codex"')) throw new Error('Codex conflict resolution button missing');
+        if (!html.includes('data-comparison-action="resolve" data-comparison-agent="codex"')) throw new Error('Codex conflict resolution button missing');
 if (!html.includes('data-comparison-action="apply" data-comparison-agent="claude" disabled')) throw new Error('assessment bypassed apply safety gate');
 """
         completed = subprocess.run(
@@ -659,6 +660,52 @@ if (!html.includes('data-comparison-action="apply" data-comparison-agent="claude
             text=True,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
+
+    def test_comparison_conflict_operation_returns_progress_state_before_completion(self) -> None:
+        class ComparisonAdapter(FakeChatAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                if kwargs.get("mode") == "write":
+                    (Path(kwargs["workspace"]) / f"{self.display_name}.txt").write_text(
+                        "candidate", encoding="utf-8"
+                    )
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "repo"
+            workspace.mkdir()
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=workspace, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=workspace, check=True)
+            (workspace / "tracked.txt").write_text("base", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=workspace, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=workspace, check=True)
+            claude = ComparisonAdapter("Claude", [AgentRunResult("Claude", "A"), AgentRunResult("Claude", "{\"decision\":\"safe\"}")])
+            codex = ComparisonAdapter("Codex", [AgentRunResult("Codex", "B")])
+            from multiagent_cli.group_chat import GroupChatEngine
+            engine = GroupChatEngine(
+                resolve_bridge_settings({"claude": {"command": "/bin/echo"}, "codex": {"command": "/bin/echo"}}, workspace=workspace),
+                {"claude": claude, "codex": codex},
+            )
+            engine.ask("@all 执行：分别实现")
+            (workspace / "tracked.txt").write_text("user change", encoding="utf-8")
+            engine.apply_comparison("claude")
+            manager = UISessionManager(store=RunStore(Path(directory) / "state"), default_workspace=workspace)
+            manager.store.start(task="x", workspace=workspace, run_id="operation-run")
+            session = UISession(run_id="operation-run", task="x", workspace=workspace, notify=manager.publish)
+            session.bind_chat_engine(engine)
+            manager._reserve_session(session)
+            comparison_id = engine.comparison()["id"]
+
+            started = manager.start_comparison_operation("operation-run", "claude", comparison_id, "assess")
+            self.assertEqual(started["comparison"]["operation"]["status"], "running")
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                current = engine.comparison() or {}
+                if "operation" not in current:
+                    break
+                time.sleep(0.01)
+            self.assertNotIn("operation", engine.comparison() or {})
 
     def test_terminal_comparison_clears_composer_status_hint(self) -> None:
         node = shutil.which("node")
@@ -814,6 +861,75 @@ if (el.composerAttachmentList.children.length !== 1) {
             values["group_chat_identities"]["agent_a"],
             values["group_chat_identities"]["agent_b"],
         )
+
+    def test_settings_ui_exposes_worktree_toggle_with_true_default(self) -> None:
+        values = ui_server._config_for_ui({})
+        self.assertTrue(values["worktree"])
+        self.assertFalse(ui_server._config_for_ui({"worktree": False})["worktree"])
+
+        script = (Path(ui_server.__file__).with_name("web") / "app.js").read_text(
+            encoding="utf-8"
+        )
+        html = (Path(ui_server.__file__).with_name("web") / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("settings-worktree-enabled", html)
+        self.assertIn("values.worktree !== false", script)
+        self.assertIn("worktree: get('settings-worktree-enabled').checked", script)
+
+    def test_saving_worktree_setting_updates_live_group_chat_engine(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            config_path = workspace / ".multiagent.json"
+            config_path.write_text(
+                json.dumps({
+                    "worktree": False,
+                    "claude": {"command": "/bin/echo"},
+                    "codex": {"command": "/bin/echo"},
+                }),
+                encoding="utf-8",
+            )
+            manager = UISessionManager(
+                store=RunStore(workspace / "state"),
+                default_workspace=workspace,
+            )
+            manager.store.start(
+                task="live",
+                workspace=workspace,
+                run_id="live-worktree-setting",
+            )
+            from multiagent_cli.group_chat import GroupChatEngine
+
+            engine = GroupChatEngine(
+                resolve_bridge_settings(
+                    json.loads(config_path.read_text(encoding="utf-8")),
+                    workspace=workspace,
+                    config_path=config_path,
+                ),
+                {
+                    "claude": FakeChatAdapter("Claude", []),
+                    "codex": FakeChatAdapter("Codex", []),
+                },
+            )
+            session = UISession(
+                run_id="live-worktree-setting",
+                task="live",
+                workspace=workspace,
+                notify=manager.publish,
+            )
+            session.status = "running"
+            session.bind_chat_engine(engine)
+            manager._reserve_session(session)
+            loaded = manager.get_settings()
+            values = loaded["values"]
+            values["worktree"] = True
+            manager.save_settings({
+                "workspace": str(workspace),
+                "revision": loaded["revision"],
+                "values": values,
+            })
+
+        self.assertTrue(engine.settings.worktree)
 
     def test_retry_reconciliation_removes_fast_server_reply_loading_bubble(self) -> None:
         node = shutil.which("node")
@@ -3128,6 +3244,8 @@ if (!keys.includes('msg-active-run-1-m-user-codex')) throw new Error('Codex load
         self.assertIn('id="settings-claude-model-order"', html)
         self.assertIn('id="settings-codex-model-order"', html)
         self.assertIn('id="settings-codex-reasoning-effort"', html)
+        self.assertIn('id="settings-claude-permission-mode"', html)
+        self.assertIn("Auto mode（原生自动判断）", html)
         self.assertIn('id="settings-group-chat-agent-a-identity"', html)
         self.assertIn('id="settings-group-chat-agent-b-identity"', html)
         self.assertLess(
