@@ -1149,17 +1149,15 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .settings-card-heading > small { color: var(--muted); font-size: 9px; text-align: right; }
 .settings-card-kicker { color: var(--pink); font-family: var(--mono); font-size: 9px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .settings-advanced { margin-top: 14px; border-top: 1px solid var(--line-soft); }
-.settings-advanced > summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 0 2px; cursor: pointer; color: var(--ink); font-size: 11px; font-weight: 750; list-style: none; }
+.settings-advanced > summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 10px 0 2px; cursor: default; color: var(--ink); font-size: 11px; font-weight: 750; list-style: none; }
 .settings-advanced > summary::-webkit-details-marker { display: none; }
-.settings-advanced > summary::after { content: '展开'; color: var(--muted); font-family: var(--mono); font-size: 9px; font-weight: 500; }
-.settings-advanced[open] > summary::after { content: '收起'; }
+.settings-advanced > summary::after { content: ''; }
 .settings-advanced > summary small { margin-left: auto; color: var(--muted); font-size: 9px; font-weight: 500; }
 .settings-advanced-body { padding-top: 11px; }
 .settings-guidance { margin-top: 16px; border-top: 1px solid var(--line-soft); }
-.settings-guidance > summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 0 2px; cursor: pointer; color: var(--ink); font-size: 11px; font-weight: 750; list-style: none; }
+.settings-guidance > summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 11px 0 2px; cursor: default; color: var(--ink); font-size: 11px; font-weight: 750; list-style: none; }
 .settings-guidance > summary::-webkit-details-marker { display: none; }
-.settings-guidance > summary::after { content: '展开'; color: var(--muted); font-family: var(--mono); font-size: 9px; font-weight: 500; }
-.settings-guidance[open] > summary::after { content: '收起'; }
+.settings-guidance > summary::after { content: ''; }
 .settings-guidance > summary small { margin-left: auto; color: var(--muted); font-size: 9px; font-weight: 500; }
 .settings-guidance-grid { display: grid; gap: 8px; padding-top: 11px; }
 .token-api-card { margin-bottom: 12px; }

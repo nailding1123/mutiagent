@@ -282,6 +282,15 @@ function renderDirectFileNotice() {
 }
 
 function bindEvents() {
+  // Settings sections are intentionally always visible. Keep the native
+  // <details> semantics for existing markup and accessibility, but immediately
+  // reopen them if a browser or keyboard interaction tries to collapse one.
+  document.querySelectorAll('.settings-guidance, .settings-advanced').forEach((section) => {
+    section.open = true;
+    section.addEventListener('toggle', () => {
+      if (!section.open) section.open = true;
+    });
+  });
   // Closing or navigating away from the last Web page releases the browser
   // client. The backend uses a short reload grace period, so a normal refresh
   // does not leave the service running forever or stop it mid-reconnect.

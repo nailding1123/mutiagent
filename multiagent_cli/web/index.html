@@ -264,7 +264,7 @@
                   <label><span>目标预算（估算 token）</span><input id="settings-context-compaction-target" data-context-compaction-setting type="number" min="1" step="1" required /></label>
                   <label><span>最近原文消息数</span><input id="settings-context-compaction-recent" data-context-compaction-setting type="number" min="1" max="100" step="1" required /></label>
                 </div>
-                <details class="settings-guidance">
+                <details class="settings-guidance" open>
                   <summary><span>协作行为说明</span><small>4 条固定规则</small></summary>
                   <div class="settings-guidance-grid">
                     <div class="setting-switch setting-static"><span class="setting-static-icon">@</span><span><strong>点名路由</strong><small>@Claude（Claude Code）、@Codex 或 @all 会覆盖默认响应者；@all 会同时通知双方，由各自的原生 Agent 判断是否需要修改。</small></span></div>
@@ -307,7 +307,7 @@
                     <label><span>群聊身份提示词</span><textarea id="settings-group-chat-agent-a-identity" rows="7" required></textarea></label>
                     <small>只用于群聊协作；路由由系统控制，是否读取或修改由 Claude Code 自行判断。</small>
                   </div>
-                  <details class="settings-advanced">
+                  <details class="settings-advanced" open>
                     <summary><span>高级运行参数</span><small>故障切换、超时、CLI 参数</small></summary>
                     <div class="settings-advanced-body">
                       <label><span>权限模式</span><select id="settings-claude-permission-mode"><option value="default">按任务选择（默认）</option><option value="auto">Auto mode（原生自动判断）</option><option value="acceptEdits">自动接受编辑</option><option value="plan">仅规划/只读</option><option value="manual">手动确认</option><option value="dontAsk">不主动询问</option></select><small>Auto mode 由 Claude Code 原生分类器决定哪些操作自动允许、哪些操作需要审批。</small></label>
@@ -332,7 +332,7 @@
                     <label><span>群聊身份提示词</span><textarea id="settings-group-chat-agent-b-identity" rows="7" required></textarea></label>
                     <small>只用于群聊协作；路由由系统控制，是否读取或修改由 Codex 自行判断。</small>
                   </div>
-                  <details class="settings-advanced">
+                  <details class="settings-advanced" open>
                     <summary><span>高级运行参数</span><small>故障切换、超时、CLI 参数</small></summary>
                     <div class="settings-advanced-body">
                       <label class="setting-switch compact-setting-switch"><input id="settings-codex-fallback" type="checkbox" /><span><strong>超时自动切换</strong><small>每个候选模型使用下方的单次超时。</small></span></label>
