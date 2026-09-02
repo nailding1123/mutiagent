@@ -329,6 +329,84 @@ class GroupChatTests(unittest.TestCase):
             self.assertIn("?? codex.txt", status)
             self.assertNotIn("A  codex.txt", status)
 
+    def test_isolated_agent_reply_is_persisted_before_main_writer_merge_finishes(self) -> None:
+        claude_started = threading.Event()
+        release_claude = threading.Event()
+        codex_states: list[dict[str, Any]] = []
+
+        class WritingAdapter(FakeAdapter):
+            def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:
+                self.calls.append({"prompt": prompt, **kwargs})
+                workspace = Path(kwargs["workspace"])
+                (workspace / f"{self.display_name.lower()}.txt").write_text(
+                    self.display_name,
+                    encoding="utf-8",
+                )
+                if self.display_name == "Claude":
+                    claude_started.set()
+                    release_claude.wait(2)
+                return next(self.results)
+
+        with tempfile.TemporaryDirectory() as directory:
+            repository = _git_repository(Path(directory))
+            engine = GroupChatEngine(
+                replace(settings(repository), worktree=True),
+                {
+                    "claude": WritingAdapter(
+                        "Claude", [AgentRunResult("Claude", "主工作区回复")]
+                    ),
+                    "codex": WritingAdapter(
+                        "Codex", [AgentRunResult("Codex", "隔离工作区回复")]
+                    ),
+                },  # type: ignore[arg-type]
+            )
+            worker = threading.Thread(
+                target=lambda: engine.ask("@Claude 执行：主工作区任务", reservation=engine.reserve("@Claude 执行：主工作区任务")),
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(claude_started.wait(1))
+            codex_reservation = engine.reserve("@Codex 执行：隔离工作区任务")
+            codex_worker = threading.Thread(
+                target=lambda: engine.ask(
+                    "@Codex 执行：隔离工作区任务",
+                    reservation=codex_reservation,
+                    on_state=codex_states.append,
+                ),
+                daemon=True,
+            )
+            codex_worker.start()
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline and not any(
+                any(
+                    item.get("sender") == "codex"
+                    and item.get("content") == "隔离工作区回复"
+                    for item in state.get("messages", [])
+                )
+                for state in codex_states
+            ):
+                time.sleep(0.01)
+            self.assertTrue(
+                any(
+                    any(
+                        item.get("sender") == "codex"
+                        and item.get("content") == "隔离工作区回复"
+                        for item in state.get("messages", [])
+                    )
+                    for state in codex_states
+                )
+            )
+            self.assertFalse(codex_worker.is_alive())
+            self.assertFalse((repository / "codex.txt").exists())
+            release_claude.set()
+            worker.join(2)
+            codex_worker.join(2)
+            self.assertFalse(worker.is_alive())
+            deadline = time.monotonic() + 1
+            while not (repository / "codex.txt").is_file() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue((repository / "codex.txt").is_file())
+
     def test_dual_agent_execution_creates_reviewable_candidates_without_touching_main(self) -> None:
         class WritingAdapter(FakeAdapter):
             def run(self, prompt: str, **kwargs: Any) -> AgentRunResult:

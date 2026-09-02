@@ -36,6 +36,45 @@ GROUP_CHAT_PROTOCOL = "multiagent.group_chat.v2"
 GROUP_CHAT_AGENTS = ("claude", "codex")
 MAX_GROUP_CHAT_MESSAGE_CHARS = 50_000
 
+
+class _DeferredWorkspaceRelease:
+    """Run an isolated Worktree merge without delaying the Agent reply."""
+
+    def __init__(self, finalize: Callable[[], dict[str, Any] | None]) -> None:
+        self._finalize = finalize
+        self._condition = threading.Condition()
+        self._result: dict[str, Any] | None = None
+        self._callback: Callable[[dict[str, Any] | None], None] | None = None
+
+    def start(self) -> None:
+        worker = threading.Thread(
+            target=self._run,
+            name="multiagent-worktree-release",
+            daemon=True,
+        )
+        worker.start()
+
+    def attach(self, callback: Callable[[dict[str, Any] | None], None]) -> None:
+        with self._condition:
+            if self._result is None:
+                self._callback = callback
+                return
+            result = self._result.get("changes")
+        callback(result)
+
+    def _run(self) -> None:
+        try:
+            changes = self._finalize()
+            result = {"changes": changes}
+        except BaseException as exc:
+            result = {"changes": None, "error": str(exc) or exc.__class__.__name__}
+        with self._condition:
+            self._result = result
+            callback = self._callback
+            changes = result.get("changes")
+        if callback is not None:
+            callback(changes)
+
 # 单调递增计数器，避免删除/编辑消息后出现位置派生 ID 碰撞
 _MESSAGE_ID_COUNTER = itertools.count(1)
 
@@ -1051,6 +1090,10 @@ class GroupChatEngine:
                     "session_id": sessions[agent],
                     "on_event": on_event,
                     "step_id": f"group_chat_turn_{turn}_{agent}",
+                    # The Web UI needs the Agent reply before a Worktree merge
+                    # can finish. Direct engine callers keep the historical
+                    # synchronous lease-release behavior.
+                    "defer_release": on_state is not None,
                 }
                 if comparison_mode:
                     future = executor.submit(
@@ -1071,8 +1114,17 @@ class GroupChatEngine:
             for future in as_completed(futures):
                 agent = futures[future]
                 state_after_candidate: dict[str, Any] | None = None
+                deferred_release: _DeferredWorkspaceRelease | None = None
+                deferred_callback: Callable[[dict[str, Any] | None], None] | None = None
                 try:
-                    result, changes = future.result()
+                    result_payload = future.result()
+                    if (
+                        isinstance(result_payload, tuple)
+                        and len(result_payload) == 3
+                    ):
+                        result, changes, deferred_release = result_payload
+                    else:
+                        result, changes = result_payload
                     results[agent] = result
                     changes_by_agent[agent] = changes
                     if comparison_mode and comparison is not None:
@@ -1086,6 +1138,37 @@ class GroupChatEngine:
                                     or "无法生成候选变更预览"
                                 )
                     state_after_candidate = commit_result(agent, result, changes)
+                    if deferred_release is not None:
+                        reply_to_id = reply_to or user_message["id"]
+
+                        def apply_deferred_changes(
+                            final_changes: dict[str, Any] | None,
+                            *,
+                            deferred_agent: str = agent,
+                            parent_id: str = reply_to_id,
+                        ) -> None:
+                            with self._lock:
+                                target_reply = next(
+                                    (
+                                        item
+                                        for item in reversed(self._state["messages"])
+                                        if item.get("sender") == deferred_agent
+                                        and item.get("role") == "assistant"
+                                        and item.get("reply_to") == parent_id
+                                    ),
+                                    None,
+                                )
+                                if target_reply is None:
+                                    return
+                                if final_changes is None:
+                                    target_reply.pop("changes", None)
+                                else:
+                                    target_reply["changes"] = final_changes
+                                state_after_merge = self.to_dict()
+                            if on_state is not None:
+                                on_state(state_after_merge)
+
+                        deferred_callback = apply_deferred_changes
                 except Exception as exc:
                     errors[agent] = str(exc) or exc.__class__.__name__
                     failure_reasons[agent] = _agent_failure_reason(exc)
@@ -1102,6 +1185,10 @@ class GroupChatEngine:
                     state_after_candidate = commit_failure(agent)
                 if on_state is not None and state_after_candidate is not None:
                     on_state(state_after_candidate)
+                if deferred_release is not None and deferred_callback is not None:
+                    # Attach after publishing the initial completed reply so a
+                    # very fast merge cannot emit its follow-up state first.
+                    deferred_release.attach(deferred_callback)
         reportable_changes = next(
             (changes_by_agent.get(agent) for agent in recipients if changes_by_agent.get(agent)),
             None,
@@ -1163,7 +1250,8 @@ class GroupChatEngine:
         session_id: str | None,
         on_event: Callable[[AgentEvent], None] | None,
         step_id: str,
-    ) -> tuple[AgentRunResult, dict[str, Any] | None]:
+        defer_release: bool = False,
+    ) -> tuple[AgentRunResult, dict[str, Any] | None, _DeferredWorkspaceRelease | None]:
         def notify_workspace_wait() -> None:
             if on_event is None:
                 return
@@ -1211,58 +1299,67 @@ class GroupChatEngine:
                 on_event=on_event,
                 step_id=step_id,
             )
-            if baseline is None:
-                changes = None
-            else:
-                raw_changes = summarize_workspace_changes(lease.workspace, baseline)
-                has_file_changes = _has_file_changes(raw_changes)
-                changes = (
-                    raw_changes
-                    if has_file_changes or raw_changes.get("available") is False
-                    else None
-                )
-            release = lease.release()
-            rollback = release.get("rollback")
-            if not lease_isolated and target_baseline is not None and release.get("merged", True):
-                save_rollback = getattr(
-                    self.workspace_coordinator,
-                    "save_rollback",
-                    None,
-                )
-                rollback = (
-                    save_rollback(
-                        lease_target_workspace,
-                        target_baseline,
-                        capture_change_baseline(lease_target_workspace),
-                        step_id,
+            raw_changes = (
+                summarize_workspace_changes(lease.workspace, baseline)
+                if baseline is not None
+                else None
+            )
+            has_file_changes = _has_file_changes(raw_changes)
+            changes = (
+                raw_changes
+                if raw_changes is not None
+                and (has_file_changes or raw_changes.get("available") is False)
+                else None
+            )
+
+            def finish_release() -> dict[str, Any] | None:
+                release = lease.release()
+                final_changes = dict(raw_changes) if has_file_changes and raw_changes else changes
+                rollback = release.get("rollback")
+                if not lease_isolated and target_baseline is not None and release.get("merged", True):
+                    save_rollback = getattr(
+                        self.workspace_coordinator,
+                        "save_rollback",
+                        None,
                     )
-                    if callable(save_rollback)
-                    else None
-                )
-            if isinstance(rollback, dict) and _has_file_changes(changes):
-                changes = dict(changes or {})
-                changes["rollback"] = rollback
-            if not release.get("merged", True):
-                # A failed lease cleanup/merge must not be presented as a code
-                # conflict when the native Agent produced no file diff. This
-                # can happen if the coordinator failed after a read-only turn
-                # or if a temporary workspace was removed without a patch.
-                # The Agent's successful answer remains valid; only a real
-                # file diff can have a meaningful merge conflict.
-                if not (baseline is not None and _has_file_changes(changes)):
-                    return result, changes
-                merge_error = str(release.get("error") or "隔离 Worktree 合并失败")
-                # The native Agent already completed successfully. A merge
-                # conflict is a workspace delivery problem, not a failed
-                # model response; preserve its answer and expose the precise
-                # recovery state in the change summary.
-                changes = dict(changes or {})
-                changes["merge_status"] = "conflict"
-                changes["merge_error"] = merge_error
-                return result, changes
-            return result, changes
+                    rollback = (
+                        save_rollback(
+                            lease_target_workspace,
+                            target_baseline,
+                            capture_change_baseline(lease_target_workspace),
+                            step_id,
+                        )
+                        if callable(save_rollback)
+                        else None
+                    )
+                if isinstance(rollback, dict) and _has_file_changes(final_changes):
+                    final_changes = dict(final_changes or {})
+                    final_changes["rollback"] = rollback
+                if not release.get("merged", True):
+                    # The native Agent completed successfully; a failed merge
+                    # is a delivery problem and must not hide its reply.
+                    if not (baseline is not None and _has_file_changes(final_changes)):
+                        return final_changes
+                    final_changes = dict(final_changes or {})
+                    final_changes["merge_status"] = "conflict"
+                    final_changes["merge_error"] = str(
+                        release.get("error") or "隔离 Worktree 合并失败"
+                    )
+                return final_changes
+
+            if lease_isolated and defer_release:
+                if has_file_changes and changes is not None:
+                    changes = dict(changes)
+                    changes["merge_status"] = "pending"
+                deferred = _DeferredWorkspaceRelease(finish_release)
+                deferred.start()
+                return result, changes, deferred
+            return result, finish_release(), None
         except BaseException:
-            lease.release()
+            if lease_isolated and defer_release:
+                _DeferredWorkspaceRelease(lambda: lease.release()).start()
+            else:
+                lease.release()
             raise
 
     def _run_comparison_agent(
@@ -1274,7 +1371,9 @@ class GroupChatEngine:
         on_event: Callable[[AgentEvent], None] | None,
         step_id: str,
         comparison: dict[str, Any] | None,
+        defer_release: bool = False,
     ) -> tuple[AgentRunResult, dict[str, Any] | None]:
+        del defer_release
         if comparison is None:
             raise BridgeError("A/B 对比任务缺少候选工作区")
         try:

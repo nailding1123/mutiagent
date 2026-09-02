@@ -3743,7 +3743,9 @@ function renderGroupChat(record, session) {
       : message.retry_of
       ? `${message.retry_mode === 'continue' ? '继续回复' : '重新生成'} · ${contextStatus}`
       : execution ? `目标工作区执行结果 · ${contextStatus}` : `群聊回复 · ${contextStatus}`;
-    const html = messageCard(
+    const html = recalled
+      ? recalledMessageMarkup(feedKey, message.created_at || '')
+      : messageCard(
       user ? '你' : agentName(sender),
       role,
       {
@@ -3781,7 +3783,7 @@ function renderGroupChat(record, session) {
         : optimistic
         ? message.delivery_status === 'accepted' ? '已发送' : '发送中'
         : execution ? (user ? '执行' : '执行结果') : (user ? '消息' : '回复'),
-    );
+      );
     return { key: feedKey, html, message };
   });
   entries.push(...messageEntries.map(({ key, html }) => ({ key, html })));
@@ -4094,6 +4096,12 @@ function updateFeedJumpButton() {
   el.feedJump.classList.toggle('hidden', isFeedNearBottom());
 }
 
+function recalledMessageMarkup(feedKey, createdAt = '') {
+  return `<div class="message-recalled-notice" data-feed-key="${escapeHtml(feedKey)}" role="status">
+    <span aria-hidden="true">↩</span><span>你撤回了一条消息</span>${createdAt ? `<time>${escapeHtml(formatEventTime(createdAt))}</time>` : ''}
+  </div>`;
+}
+
 function messageCard(name, role, result, agent, tag, details = false, highlight = false) {
   if (!result) return '';
   const speaker = ['user', 'claude', 'codex'].includes(agent) ? agent : 'system';
@@ -4188,13 +4196,18 @@ function changeSummaryMarkup(summary, rawKey, messageId = '') {
   const hasFileChanges = available && (fileCount > 0 || files.length > 0 || additions > 0 || deletions > 0);
   if (available && !hasFileChanges) return '';
   const mergeConflict = summary.merge_status === 'conflict' && hasFileChanges;
+  const mergePending = summary.merge_status === 'pending' && hasFileChanges;
   const title = mergeConflict
     ? 'Agent 已完成，修改未合并'
+    : mergePending
+    ? 'Agent 已完成，正在写入主工作区'
     : available
     ? fileCount ? `已修改 ${fileCount} 个文件` : '未检测到文件修改'
     : '无法生成变更预览';
   const mergeWarning = mergeConflict
     ? `<div class="change-warning">隔离工作区的修改与主工作区冲突，未覆盖现有文件。已保留恢复补丁。${summary.merge_error ? `<br>${escapeHtml(summary.merge_error)}` : ''}</div>`
+    : mergePending
+    ? '<div class="change-pending">Agent 回复已完成，正在等待主工作区空闲后自动合并。</div>'
     : '';
   const rollback = summary.rollback && typeof summary.rollback === 'object'
     ? summary.rollback : null;

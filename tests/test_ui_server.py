@@ -1607,6 +1607,33 @@ if (!keys.includes('msg-active-run-1-m-user-codex')) throw new Error('Codex load
         self.assertTrue(messages[1]["hidden"])
         self.assertTrue(messages[1]["recalled"])
 
+    def test_recalled_message_uses_lightweight_notice_instead_of_bubble(self) -> None:
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is required for the frontend recall test")
+        script_path = Path(ui_server.__file__).with_name("web") / "app.js"
+        harness = r"""
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[1], 'utf8');
+const start = source.indexOf('function recalledMessageMarkup');
+const end = source.indexOf('\nfunction messageCard', start);
+if (start < 0 || end < 0) throw new Error('recalledMessageMarkup was not found');
+function escapeHtml(value) { return String(value || ''); }
+function formatEventTime() { return '10:21:15'; }
+eval(source.slice(start, end));
+const html = recalledMessageMarkup('msg-m1', '2026-09-02T10:21:15Z');
+if (!html.includes('message-recalled-notice')) throw new Error('recall notice class missing');
+if (!html.includes('你撤回了一条消息')) throw new Error('recall notice text missing');
+if (html.includes('message-row')) throw new Error('recalled message still renders as a full bubble');
+"""
+        completed = subprocess.run(
+            [node, "-e", harness, str(script_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def test_recall_chat_message_stops_an_active_agent_turn(self) -> None:
         class BlockingAdapter(FakeChatAdapter):
             def __init__(self, name: str) -> None:
@@ -3389,6 +3416,8 @@ if (!keys.includes('msg-active-run-1-m-user-codex')) throw new Error('Codex load
         self.assertIn("data-message-retry", script)
         self.assertIn("data-message-context", script)
         self.assertIn("data-message-recall", script)
+        self.assertIn("function recalledMessageMarkup", script)
+        self.assertIn("message-recalled-notice", style)
         self.assertIn("function recallMessage", script)
         self.assertIn("function latestRecallableUserMessage", script)
         self.assertIn("event.key === 'Escape'", script)

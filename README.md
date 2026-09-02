@@ -106,6 +106,8 @@ multiagent -C /path/to/your-project
 
 ## 使用方式
 
+第一次使用可以先看：[快速上手说明](docs/QUICKSTART.md)。
+
 输入 `@` 可以选择 Agent。常用写法：
 
 ```text

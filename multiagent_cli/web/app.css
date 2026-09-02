@@ -682,6 +682,9 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .message-row.message-failed .markdown-body { color: var(--danger-ink); }
 .message-row.message-recalled .message-main { opacity: .72; }
 .message-row.message-recalled .markdown-body { color: var(--muted); font-style: italic; }
+.message-recalled-notice { display: flex; align-items: center; justify-content: center; gap: 6px; margin: 6px auto; color: var(--muted); font-size: 10px; line-height: 1.4; }
+.message-recalled-notice > span:first-child { color: var(--faint); font-size: 12px; }
+.message-recalled-notice time { color: var(--faint); font-family: var(--mono); font-size: 9px; }
 .reply-loading { display: flex; align-items: center; gap: 9px; min-height: 34px; margin-top: 7px; color: var(--muted); font-size: 11px; }
 .reply-loading-dots { display: inline-flex; align-items: center; gap: 4px; min-width: 34px; }
 .reply-loading-dots i { display: block; width: 7px; height: 7px; background: currentColor; border: 1px solid var(--ink); border-radius: 999px; animation: reply-bounce 1.1s ease-in-out infinite; }
@@ -768,6 +771,7 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .change-warning,
 .change-empty { padding: 9px 12px; color: var(--change-muted); font-size: 10px; }
 .change-warning { color: var(--change-warning); border-bottom: 1px solid var(--change-line); }
+.change-pending { padding: 9px 12px; color: var(--focus); border-bottom: 1px solid var(--change-line); font-size: 10px; }
 .change-actions { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-top: 1px solid var(--change-line); color: var(--change-muted); font-size: 10px; }
 .change-rollback-status { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-top: 1px solid var(--change-line); color: var(--change-add); font-size: 10px; }
 .change-action { min-height: 27px; padding: 0 8px; color: var(--change-ink); background: var(--change-action-bg); border: 1px solid var(--change-action-border); border-radius: 7px; cursor: pointer; font-family: var(--mono); font-size: 9px; }
