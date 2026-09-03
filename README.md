@@ -137,6 +137,8 @@ multiagent -C /path/to/your-project
 .multiagent.json
 ```
 
+该文件是本机配置，不属于项目源码。MultiAgent 会将它加入仓库本地的 `.git/info/exclude`，不会修改项目的共享 `.gitignore`，因此不会再显示为未跟踪文件。
+
 常用设置包括：
 
 - 默认响应者：Claude、Codex 或双方；

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from multiagent_cli.bridge_config import (
     ConfigError,
+    ensure_local_config_ignored,
     _split_command_text,
     _user_config_candidates,
     find_config_path,
@@ -239,6 +240,31 @@ class BridgeConfigTests(unittest.TestCase):
             legacy = Path(directory) / ".mutiagent.json"
             legacy.write_text("{}", encoding="utf-8")
             self.assertEqual(find_config_path(None, directory), legacy.resolve())
+
+    def test_local_project_config_is_added_to_git_info_exclude(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = Path(directory)
+            import subprocess
+
+            subprocess.run(["git", "init", "-q"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repository, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repository, check=True)
+            (repository / "tracked.txt").write_text("base", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repository, check=True)
+            subprocess.run(["git", "commit", "-qm", "initial"], cwd=repository, check=True)
+            (repository / ".multiagent.json").write_text("{}", encoding="utf-8")
+
+            self.assertTrue(ensure_local_config_ignored(repository))
+            status = subprocess.run(
+                ["git", "status", "--short"],
+                cwd=repository,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            self.assertNotIn(".multiagent.json", status)
+            excluded = repository / ".git" / "info" / "exclude"
+            self.assertIn(".multiagent.json", excluded.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

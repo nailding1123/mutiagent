@@ -28,6 +28,7 @@ from urllib.request import Request, urlopen
 from . import __version__
 from .bridge_config import (
     ConfigError,
+    ensure_local_config_ignored,
     find_config_path,
     load_bridge_config,
     resolve_bridge_settings,
@@ -930,6 +931,7 @@ class UISessionManager:
             except ValueError as exc:
                 raise UIError(str(exc)) from exc
         save_path = workspace / PROJECT_CONFIG_NAME
+        ensure_local_config_ignored(workspace)
         expected_revision = _optional_text(payload.get("revision"))
         current_revision = _file_revision(save_path)
         if expected_revision != current_revision:
@@ -1037,6 +1039,7 @@ class UISessionManager:
                 raise UIError("界面开关必须是布尔值")
 
         save_path = workspace / PROJECT_CONFIG_NAME
+        ensure_local_config_ignored(workspace)
         try:
             if save_path.is_file():
                 merged = dict(load_bridge_config(save_path))
@@ -1126,6 +1129,10 @@ class UISessionManager:
         workspace = Path(workspace_text or self.default_workspace).expanduser().resolve()
         if not workspace.is_dir():
             raise UIError(f"工作区不是有效目录：{workspace}")
+        # Project-local settings are machine-specific. Keep an existing config
+        # out of Git status before resolving it; saving settings handles the
+        # create path as well.
+        ensure_local_config_ignored(workspace)
 
         # Validate the A/B prerequisite before resolving native CLI paths. In
         # CI or a fresh installation the CLIs may be unavailable, but an
@@ -2581,6 +2588,10 @@ def serve_ui(
         if not quiet:
             print(f"错误：工作区不是有效目录：{workspace}")
         return 2
+    # Register the project-local config as a machine-only Git exclude as soon
+    # as the workspace is opened, even before the user opens Settings or starts
+    # a task.
+    ensure_local_config_ignored(workspace)
     if port < 1 or port > 65535:
         if not quiet:
             print("错误：UI 端口必须在 1 到 65535 之间")

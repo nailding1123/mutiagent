@@ -4,6 +4,7 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,88 @@ CLAUDE_PERMISSION_MODES = {"auto", "acceptEdits", "plan", "manual", "dontAsk"}
 
 class ConfigError(ValueError):
     """Invalid or incomplete bridge configuration."""
+
+
+def ensure_local_config_ignored(workspace: str | Path) -> bool:
+    """Keep the project-local MultiAgent config out of Git status.
+
+    The config belongs to the user's machine (it can contain executable paths,
+    model choices and local service settings), so add an exact path to the
+    repository's local ``.git/info/exclude`` instead of changing the project's
+    shareable ``.gitignore``. Tracked files are left untouched.
+    """
+
+    workspace_path = Path(workspace).expanduser().resolve()
+    if not workspace_path.is_dir():
+        return False
+    config_path = workspace_path / ".multiagent.json"
+    try:
+        git_dir_result = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            cwd=workspace_path,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        if git_dir_result.returncode != 0 or not git_dir_result.stdout.strip():
+            return False
+        git_root_result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=workspace_path,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        if git_root_result.returncode != 0 or not git_root_result.stdout.strip():
+            return False
+        repository = Path(git_root_result.stdout.strip()).expanduser().resolve()
+        relative_name = config_path.relative_to(repository).as_posix()
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", relative_name],
+            cwd=repository,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        if tracked.returncode == 0:
+            return False
+        ignored = subprocess.run(
+            ["git", "check-ignore", "--no-index", "-q", "--", relative_name],
+            cwd=repository,
+            check=False,
+            timeout=5,
+        )
+        if ignored.returncode == 0:
+            return True
+        raw_git_dir = Path(git_dir_result.stdout.strip())
+        git_dir = raw_git_dir if raw_git_dir.is_absolute() else repository / raw_git_dir
+        exclude = git_dir.resolve() / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude.read_text(encoding="utf-8") if exclude.is_file() else ""
+        lines = existing.splitlines()
+        if relative_name in lines:
+            return True
+        prefix = "" if not existing or existing.endswith("\n") else "\n"
+        exclude.write_text(
+            existing
+            + prefix
+            + "# MultiAgent local project configuration\n"
+            + relative_name
+            + "\n",
+            encoding="utf-8",
+        )
+        return True
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+        return False
 
 
 def find_config_path(
